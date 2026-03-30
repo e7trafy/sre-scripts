@@ -552,7 +552,8 @@ declare -A STEP_REGISTRY=(
     [6]="stack/06-node.sh"
     [7]="tuning/07-tune.sh"
     [8]="vhost/08-vhost.sh"
-    [9]="ssl/09-ssl.sh"
+    [9]="migrate/09-migrate-cpanel.sh"
+    [10]="ssl/10-ssl.sh"
 )
 
 declare -A STEP_NAMES=(
@@ -564,7 +565,8 @@ declare -A STEP_NAMES=(
     [6]="Node.js"
     [7]="Performance Tuning"
     [8]="Virtual Host"
-    [9]="SSL Certificate"
+    [9]="Migrate from cPanel"
+    [10]="SSL Certificate"
 )
 
 _is_step_skipped() {
@@ -572,7 +574,14 @@ _is_step_skipped() {
     case "$step" in
         5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" ]] && return 0 ;;
         6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
+        9) return 0 ;; # Migration is optional, always show as available but skip in auto-sequence
     esac
+    return 1
+}
+
+_is_step_optional() {
+    local step="$1"
+    [[ "$step" == "9" ]] && return 0
     return 1
 }
 
@@ -613,7 +622,11 @@ recommend_next_step() {
             color="${_NC}"
         fi
 
-        if _is_step_skipped "$s"; then
+        if _is_step_optional "$s"; then
+            marker="○ "
+            color="${_NC}"
+            suffix=" (optional)"
+        elif _is_step_skipped "$s"; then
             marker="- "
             color="${_NC}"
             suffix=" (skipped)"

@@ -1,6 +1,6 @@
 #!/bin/bash
 ################################################################################
-# SRE Helpers - Step 9: SSL Certificate Setup
+# SRE Helpers - Step 10: SSL Certificate Setup
 # Obtains Let's Encrypt certificate via Certbot and configures HTTPS.
 ################################################################################
 
@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../common/lib.sh
 source "${SCRIPT_DIR}/common/lib.sh"
 
-CURRENT_STEP=9
+CURRENT_STEP=10
 
 SSL_DOMAIN=""
 SSL_EMAIL=""
@@ -40,7 +40,7 @@ EOF
 
 # Parse script-specific args
 _raw_args=("$@")
-sre_parse_args "09-ssl.sh" "${_raw_args[@]}"
+sre_parse_args "10-ssl.sh" "${_raw_args[@]}"
 
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
