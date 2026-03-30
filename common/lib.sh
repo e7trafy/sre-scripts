@@ -567,38 +567,70 @@ declare -A STEP_NAMES=(
     [9]="SSL Certificate"
 )
 
+_is_step_skipped() {
+    local step="$1"
+    case "$step" in
+        5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" ]] && return 0 ;;
+        6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
+    esac
+    return 1
+}
+
 recommend_next_step() {
     local current_step="$1"
-    local next_step=$((current_step + 1))
 
-    # Skip optional steps based on config
+    # Find next non-skipped step
+    local next_step=$((current_step + 1))
     while [[ -n "${STEP_REGISTRY[$next_step]:-}" ]]; do
-        case "$next_step" in
-            5) # Database: skip if none
-                local db_engine
-                db_engine=$(config_get "SRE_DB_ENGINE" "none")
-                [[ "$db_engine" == "none" ]] && next_step=$((next_step + 1)) && continue
-                ;;
-            6) # Node: skip if not selected
-                local node_ver
-                node_ver=$(config_get "SRE_NODE_VERSION" "")
-                [[ -z "$node_ver" ]] && next_step=$((next_step + 1)) && continue
-                ;;
-        esac
+        _is_step_skipped "$next_step" && next_step=$((next_step + 1)) && continue
         break
     done
 
-    local next_script="${STEP_REGISTRY[$next_step]:-}"
     echo ""
-    if [[ -n "$next_script" ]]; then
-        echo -e "${_GREEN}═══════════════════════════════════════════════════════${_NC}"
-        echo -e "${_GREEN}  NEXT STEP: ${STEP_NAMES[$next_step]:-Step $next_step}${_NC}"
-        echo -e "${_GREEN}  Run: sudo bash ${SRE_SCRIPTS_DIR}/${next_script}${_NC}"
-        echo -e "${_GREEN}═══════════════════════════════════════════════════════${_NC}"
+    echo -e "${_BLUE}═══════════════════════════════════════════════════════${_NC}"
+    echo -e "${_BLUE}  PROVISIONING STEPS${_NC}"
+    echo -e "${_BLUE}═══════════════════════════════════════════════════════${_NC}"
+
+    local s
+    for s in $(echo "${!STEP_REGISTRY[@]}" | tr ' ' '\n' | sort -n); do
+        local marker="  "
+        local color="${_NC}"
+        local suffix=""
+
+        if (( s < current_step )); then
+            marker="✓ "
+            color="${_GREEN}"
+        elif (( s == current_step )); then
+            marker="● "
+            color="${_GREEN}"
+            suffix=" (done)"
+        elif (( s == next_step )); then
+            marker="→ "
+            color="${_YELLOW}"
+            suffix=" ← NEXT"
+        else
+            marker="  "
+            color="${_NC}"
+        fi
+
+        if _is_step_skipped "$s"; then
+            marker="- "
+            color="${_NC}"
+            suffix=" (skipped)"
+        fi
+
+        echo -e "${color}  ${marker}Step ${s}: ${STEP_NAMES[$s]:-Step $s}${suffix}${_NC}"
+        echo -e "${color}         sudo bash ${SRE_SCRIPTS_DIR}/${STEP_REGISTRY[$s]}${_NC}"
+    done
+
+    echo -e "${_BLUE}═══════════════════════════════════════════════════════${_NC}"
+
+    if [[ -n "${STEP_REGISTRY[$next_step]:-}" ]]; then
+        echo ""
+        echo -e "${_YELLOW}  Run next: sudo bash ${SRE_SCRIPTS_DIR}/${STEP_REGISTRY[$next_step]}${_NC}"
     else
-        echo -e "${_GREEN}═══════════════════════════════════════════════════════${_NC}"
-        echo -e "${_GREEN}  SERVER PROVISIONING COMPLETE${_NC}"
-        echo -e "${_GREEN}═══════════════════════════════════════════════════════${_NC}"
+        echo ""
+        echo -e "${_GREEN}  ALL STEPS COMPLETE${_NC}"
     fi
     echo ""
 }

@@ -88,7 +88,7 @@ else
     if [[ "$SRE_DRY_RUN" != "true" ]]; then
         curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
         chmod +x /usr/local/bin/composer
-        sre_success "Composer $(composer --version 2>/dev/null | head -1) installed"
+        sre_success "Composer installed to /usr/local/bin/composer"
     else
         sre_info "[DRY-RUN] Would install Composer to /usr/local/bin/composer"
     fi
