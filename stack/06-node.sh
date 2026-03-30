@@ -82,7 +82,7 @@ fi
 sre_header "Composer Installation"
 
 if command -v composer &>/dev/null; then
-    sre_skipped "Composer already installed: $(composer --version 2>/dev/null | head -1)"
+    sre_skipped "Composer already installed"
 else
     sre_info "Installing Composer..."
     if [[ "$SRE_DRY_RUN" != "true" ]]; then
