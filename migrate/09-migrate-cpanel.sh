@@ -285,18 +285,51 @@ sre_header "Syncing Files from Source"
 
 sre_info "Syncing: ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_PATH}/ -> ${local_root}/"
 
+# Ask about file exclusions
+rsync_excludes=()
+transfer_mode=$(prompt_choice "File transfer mode:" "smart-exclude" "transfer-all" "custom-exclude")
+
+case "$transfer_mode" in
+    smart-exclude)
+        rsync_excludes=(
+            --exclude='.git'
+            --exclude='node_modules'
+            --exclude='vendor'
+            --exclude='.env'
+            --exclude='storage/logs/*'
+            --exclude='storage/framework/cache/*'
+            --exclude='storage/framework/sessions/*'
+            --exclude='storage/framework/views/*'
+            --exclude='.DS_Store'
+            --exclude='Thumbs.db'
+            --exclude='*.log'
+        )
+        sre_info "Excluding: .git, node_modules, vendor, .env, cache/logs"
+        ;;
+    transfer-all)
+        sre_info "Transferring ALL files (no exclusions)"
+        ;;
+    custom-exclude)
+        sre_info "Enter files/directories to exclude (one per line, empty line to finish):"
+        while true; do
+            read -r -p "  Exclude: " exc_entry
+            [[ -z "$exc_entry" ]] && break
+            rsync_excludes+=("--exclude=${exc_entry}")
+            sre_info "  Added exclusion: $exc_entry"
+        done
+        if [[ ${#rsync_excludes[@]} -eq 0 ]]; then
+            sre_info "No exclusions set, transferring all files"
+        else
+            sre_info "Total exclusions: ${#rsync_excludes[@]}"
+        fi
+        ;;
+esac
+
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
     mkdir -p "$local_root"
 
     rsync -avz --progress \
-        --exclude='.git' \
-        --exclude='node_modules' \
-        --exclude='vendor' \
-        --exclude='.env' \
-        --exclude='storage/logs/*' \
-        --exclude='storage/framework/cache/*' \
-        --exclude='storage/framework/sessions/*' \
-        --exclude='storage/framework/views/*' \
+        "${rsync_excludes[@]}" \
         -e "ssh -p ${MIG_SOURCE_PORT}" \
         "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_PATH}/" \
         "${local_root}/"
@@ -304,7 +337,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
     sre_success "Files synced successfully"
 else
     sre_info "[DRY-RUN] Would rsync from ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_PATH}/ to ${local_root}/"
-    sre_info "[DRY-RUN] Excluding: .git, node_modules, vendor, .env, cache/logs"
+    if [[ ${#rsync_excludes[@]} -gt 0 ]]; then
+        sre_info "[DRY-RUN] Excludes: ${rsync_excludes[*]}"
+    fi
 fi
 
 ################################################################################
@@ -562,20 +597,104 @@ MOODLE_CONFIG
             ;;
     esac
 
-    # Fix permissions
-    sre_header "Fixing Permissions"
-    chown -R www-data:www-data "/var/www/${MIG_DOMAIN}"
+    # Fix permissions using POSIX ACLs
+    sre_header "Fixing Permissions (POSIX ACL)"
+
+    # Ensure acl package is installed
+    if ! command -v setfacl &>/dev/null; then
+        sre_info "Installing ACL utilities..."
+        pkg_install acl
+    fi
+
+    project_dir="/var/www/${MIG_DOMAIN}"
+
+    # Base ownership: www-data owns everything
+    chown -R www-data:www-data "$project_dir"
     sre_success "Ownership set to www-data:www-data"
 
-    if [[ "$MIG_PROJECT_TYPE" == "laravel" ]]; then
-        chmod -R 775 "${local_root}/storage" "${local_root}/bootstrap/cache" 2>/dev/null || true
-        sre_success "Laravel storage/cache permissions set to 775"
-    fi
+    # Base permissions: directories 755, files 644
+    find "$project_dir" -type d -exec chmod 755 {} \;
+    find "$project_dir" -type f -exec chmod 644 {} \;
+    sre_success "Base permissions: dirs=755, files=644"
 
-    if [[ "$MIG_PROJECT_TYPE" == "moodle" ]]; then
-        chmod -R 775 "$moodledata_dir" 2>/dev/null || true
-        sre_success "Moodledata permissions set to 775"
-    fi
+    # Default ACL: new files/dirs inherit www-data ownership
+    setfacl -R -m d:u:www-data:rwX "$project_dir"
+    setfacl -R -m u:www-data:rwX "$project_dir"
+    sre_success "Default ACL: www-data has rwX on all files and directories"
+
+    # Grant the current deploy user (root) full access via ACL
+    setfacl -R -m d:u:root:rwX "$project_dir"
+    setfacl -R -m u:root:rwX "$project_dir"
+    sre_info "ACL: root has full access"
+
+    # Project-type-specific writable directories
+    case "$MIG_PROJECT_TYPE" in
+        laravel)
+            writable_dirs=(
+                "${local_root}/storage"
+                "${local_root}/bootstrap/cache"
+            )
+            for wd in "${writable_dirs[@]}"; do
+                if [[ -d "$wd" ]]; then
+                    # Group writable + sticky for writable dirs
+                    chmod -R 775 "$wd"
+                    # ACL: www-data gets rwx on existing + new files
+                    setfacl -R -m u:www-data:rwX "$wd"
+                    setfacl -R -m d:u:www-data:rwX "$wd"
+                    # ACL: group www-data also gets rwx
+                    setfacl -R -m g:www-data:rwX "$wd"
+                    setfacl -R -m d:g:www-data:rwX "$wd"
+                fi
+            done
+            sre_success "Laravel writable dirs (storage, bootstrap/cache): ACL rwX for www-data"
+
+            # .env must be readable by www-data only
+            if [[ -f "${local_root}/.env" ]]; then
+                chmod 640 "${local_root}/.env"
+                setfacl -m u:www-data:r-- "${local_root}/.env"
+                sre_success ".env: owner rw, www-data read-only"
+            fi
+            ;;
+
+        moodle)
+            moodledata_dir="/var/www/${MIG_DOMAIN}/moodledata"
+            if [[ -d "$moodledata_dir" ]]; then
+                chmod -R 775 "$moodledata_dir"
+                setfacl -R -m u:www-data:rwX "$moodledata_dir"
+                setfacl -R -m d:u:www-data:rwX "$moodledata_dir"
+                setfacl -R -m g:www-data:rwX "$moodledata_dir"
+                setfacl -R -m d:g:www-data:rwX "$moodledata_dir"
+                sre_success "Moodledata: ACL rwX for www-data"
+            fi
+
+            # config.php must be readable by www-data only
+            if [[ -f "${local_root}/config.php" ]]; then
+                chmod 640 "${local_root}/config.php"
+                setfacl -m u:www-data:r-- "${local_root}/config.php"
+                sre_success "config.php: owner rw, www-data read-only"
+            fi
+            ;;
+
+        nuxt)
+            # .nuxt and .output dirs need write access
+            for wd in "${local_root}/.nuxt" "${local_root}/.output" "${local_root}/node_modules"; do
+                if [[ -d "$wd" ]]; then
+                    setfacl -R -m u:www-data:rwX "$wd"
+                    setfacl -R -m d:u:www-data:rwX "$wd"
+                fi
+            done
+            sre_success "Nuxt build dirs: ACL rwX for www-data"
+            ;;
+
+        vue)
+            # dist is static, read-only for www-data is fine (already set above)
+            sre_success "Vue dist: read-only for www-data (static files)"
+            ;;
+    esac
+
+    # Verify ACLs
+    sre_info "ACL summary for $project_dir:"
+    getfacl "$project_dir" 2>/dev/null | grep -E "^(user|group|default)" | head -10
 
     # Reload web server
     case "$web_server" in
