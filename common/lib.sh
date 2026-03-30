@@ -434,10 +434,10 @@ prompt_choice() {
     fi
 
     local i
-    echo ""
-    echo -e "${_BLUE}${prompt_text}${_NC}"
+    echo "" >&2
+    echo -e "${_BLUE}${prompt_text}${_NC}" >&2
     for i in "${!options[@]}"; do
-        echo "  $((i + 1))) ${options[$i]}"
+        echo "  $((i + 1))) ${options[$i]}" >&2
     done
 
     while true; do
@@ -446,7 +446,7 @@ prompt_choice() {
             echo "${options[$((choice - 1))]}"
             return 0
         fi
-        echo "Invalid choice. Please enter a number between 1 and ${#options[@]}."
+        echo "Invalid choice. Please enter a number between 1 and ${#options[@]}." >&2
     done
 }
 
