@@ -554,6 +554,7 @@ declare -A STEP_REGISTRY=(
     [8]="vhost/08-vhost.sh"
     [9]="migrate/09-migrate-cpanel.sh"
     [10]="ssl/10-ssl.sh"
+    [11]="server/11-ssh-keys.sh"
 )
 
 declare -A STEP_NAMES=(
@@ -567,6 +568,7 @@ declare -A STEP_NAMES=(
     [8]="Virtual Host"
     [9]="Migrate from cPanel"
     [10]="SSL Certificate"
+    [11]="SSH Key Setup"
 )
 
 _is_step_skipped() {
@@ -574,14 +576,14 @@ _is_step_skipped() {
     case "$step" in
         5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" ]] && return 0 ;;
         6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
-        9) return 0 ;; # Migration is optional, always show as available but skip in auto-sequence
+        9|11) return 0 ;; # Migration and SSH keys are optional
     esac
     return 1
 }
 
 _is_step_optional() {
     local step="$1"
-    [[ "$step" == "9" ]] && return 0
+    [[ "$step" == "9" || "$step" == "11" ]] && return 0
     return 1
 }
 
