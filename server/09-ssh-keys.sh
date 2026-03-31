@@ -1,6 +1,6 @@
 #!/bin/bash
 ################################################################################
-# SRE Helpers - Step 11: SSH Key Setup (Optional)
+# SRE Helpers - Step 9: SSH Key Setup (Optional)
 # Generates or imports SSH key pairs and copies public keys to remote servers.
 # Useful before running migration (step 9) to enable passwordless SSH.
 ################################################################################
@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../common/lib.sh
 source "${SCRIPT_DIR}/common/lib.sh"
 
-CURRENT_STEP=11
+CURRENT_STEP=9
 
 SSH_USER=""
 SSH_KEY_TYPE="ed25519"
@@ -24,7 +24,7 @@ sre_show_help() {
     cat <<EOF
 Usage: sudo bash $0 [OPTIONS]
 
-Step 11: SSH Key Setup (Optional)
+Step 9: SSH Key Setup (Optional)
   Generate or import SSH key pairs for this server and optionally
   copy the public key to remote servers for passwordless access.
 
@@ -56,7 +56,7 @@ EOF
 
 # Parse script-specific args
 _raw_args=("$@")
-sre_parse_args "11-ssh-keys.sh" "${_raw_args[@]}"
+sre_parse_args "09-ssh-keys.sh" "${_raw_args[@]}"
 
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
@@ -73,7 +73,7 @@ done
 
 require_root
 
-sre_header "Step 11: SSH Key Setup"
+sre_header "Step 9: SSH Key Setup"
 
 ################################################################################
 # Select mode

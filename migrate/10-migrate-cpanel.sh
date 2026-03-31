@@ -1,6 +1,6 @@
 #!/bin/bash
 ################################################################################
-# SRE Helpers - Step 9: Migrate from cPanel/WHM Server
+# SRE Helpers - Step 10: Migrate from cPanel/WHM Server
 # Migrates a project from a cPanel/WHM server to a configured vhost.
 # Handles: file rsync, database creation, database import, post-migration setup.
 # Saves state per domain for re-runs.
@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../common/lib.sh
 source "${SCRIPT_DIR}/common/lib.sh"
 
-CURRENT_STEP=9
+CURRENT_STEP=10
 
 MIG_SOURCE_HOST=""
 MIG_SOURCE_USER=""
@@ -30,7 +30,7 @@ sre_show_help() {
     cat <<EOF
 Usage: sudo bash $0 [OPTIONS]
 
-Step 9: Migrate from cPanel/WHM Server
+Step 10: Migrate from cPanel/WHM Server
   Migrates a website from a cPanel/WHM server to a local vhost.
   Saves all entered data per domain so re-runs use previous values.
 
@@ -115,7 +115,7 @@ mig_load_state() {
 ################################################################################
 
 _raw_args=("$@")
-sre_parse_args "09-migrate-cpanel.sh" "${_raw_args[@]}"
+sre_parse_args "10-migrate-cpanel.sh" "${_raw_args[@]}"
 
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
@@ -133,7 +133,7 @@ done
 
 require_root
 
-sre_header "Step 9: Migrate from cPanel/WHM Server"
+sre_header "Step 10: Migrate from cPanel/WHM Server"
 
 config_load || { sre_error "Config not found. Run step 1 first."; exit 2; }
 
@@ -540,6 +540,7 @@ fi
 
 sre_header "Post-Migration Setup"
 
+if prompt_yesno "Run post-migration setup? (composer install, config, permissions)" "yes"; then
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
     case "$MIG_PROJECT_TYPE" in
         laravel)
@@ -758,6 +759,11 @@ MOODLE_CONFIG
     sre_success "Web server reloaded"
 else
     sre_info "[DRY-RUN] Would configure $MIG_PROJECT_TYPE and fix permissions"
+fi
+else
+    sre_skipped "Post-migration setup (user skipped)"
+    sre_info "You can re-run with post-setup later:"
+    sre_info "  sudo bash $0 --domain $MIG_DOMAIN --mode full"
 fi
 
 # Save final state
