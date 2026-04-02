@@ -468,23 +468,79 @@ if [[ "$needs_db" == "true" ]]; then
 
         case "$db_engine" in
             mariadb|mysql)
-                ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
-                    "mysqldump -u '${MIG_SOURCE_DB_USER}' -p'${MIG_SOURCE_DB_PASS}' '${MIG_SOURCE_DB_NAME}' --single-transaction --quick 2>/dev/null" \
-                    > "$dump_file"
+                sre_info "Testing SSH connection to source server..."
+                ssh_test_out=$(ssh -p "$MIG_SOURCE_PORT" -o ConnectTimeout=10 \
+                    "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" "echo SSH_OK" 2>&1)
+                ssh_test_rc=$?
+                if [[ $ssh_test_rc -ne 0 ]] || [[ "$ssh_test_out" != *"SSH_OK"* ]]; then
+                    sre_error "Cannot connect to source server via SSH (exit: $ssh_test_rc)"
+                    sre_error "SSH output: $ssh_test_out"
+                    sre_error "Fix: ssh-copy-id -p ${MIG_SOURCE_PORT} ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}"
+                    exit 1
+                fi
+                sre_success "SSH connection OK"
 
-                if [[ ! -s "$dump_file" ]]; then
-                    sre_error "Database dump is empty or failed."
-                    sre_error "This could mean:"
-                    sre_error "  1. Wrong source DB credentials"
-                    sre_error "  2. SSH password auth required (use key-based auth instead)"
+                sre_info "Verifying mysqldump on source server..."
+                mysqldump_path=$(ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+                    "command -v mysqldump 2>/dev/null || which mysqldump 2>/dev/null || echo NOT_FOUND")
+                if [[ "$mysqldump_path" == "NOT_FOUND" ]] || [[ -z "$mysqldump_path" ]]; then
+                    sre_error "mysqldump not found on source server."
+                    sre_error "Install it: apt install mysql-client  OR  yum install mysql"
+                    exit 1
+                fi
+                sre_success "mysqldump found at: $mysqldump_path"
+
+                sre_info "Dumping database from source (errors shown live)..."
+                # Write a remote script with credentials via a my.cnf defaults file
+                # to avoid ALL shell escaping issues with special chars in passwords
+                dump_err_file="/tmp/mysqldump_err_$$.txt"
+                remote_cnf="/tmp/.my_dump_$$.cnf"
+                remote_script="/tmp/do_dump_$$.sh"
+
+                # Upload a temp my.cnf with credentials (no shell escaping needed)
+                ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+                    "cat > '$remote_cnf'" <<EOF
+[client]
+user=${MIG_SOURCE_DB_USER}
+password=${MIG_SOURCE_DB_PASS}
+EOF
+
+                # Upload a dump script that uses the cnf file
+                ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+                    "cat > '$remote_script'" <<SCRIPT
+#!/bin/bash
+mysqldump --defaults-extra-file='$remote_cnf' \
+    '${MIG_SOURCE_DB_NAME}' --single-transaction --quick
+rc=\$?
+rm -f '$remote_cnf'
+exit \$rc
+SCRIPT
+
+                set +e
+                ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+                    "bash '$remote_script'; rm -f '$remote_script'" \
+                    > "$dump_file" 2>"$dump_err_file"
+                dump_rc=$?
+                set -e
+
+                # Always show stderr if non-empty
+                if [[ -s "$dump_err_file" ]]; then
+                    sre_warning "Remote mysqldump messages:"
+                    cat "$dump_err_file" >&2
+                fi
+                rm -f "$dump_err_file"
+
+                if [[ $dump_rc -ne 0 ]] || [[ ! -s "$dump_file" ]]; then
+                    dump_bytes=$(wc -c < "$dump_file" 2>/dev/null || echo 0)
+                    sre_error "Database dump failed (exit: $dump_rc, bytes: $dump_bytes)"
                     sre_error ""
-                    sre_error "To fix SSH auth, run on THIS server:"
-                    sre_error "  ssh-copy-id -p ${MIG_SOURCE_PORT} ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}"
+                    sre_error "Verify credentials on SOURCE server:"
+                    sre_error "  mysql -u ${MIG_SOURCE_DB_USER} -p'<pass>' ${MIG_SOURCE_DB_NAME} -e 'SELECT 1;'"
                     sre_error ""
-                    sre_error "Or dump manually on the SOURCE server and scp the file:"
-                    sre_error "  # On source: mysqldump -u ${MIG_SOURCE_DB_USER} -p ${MIG_SOURCE_DB_NAME} > /tmp/dump.sql"
-                    sre_error "  # On this server: scp -P ${MIG_SOURCE_PORT} ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:/tmp/dump.sql ${dump_file}"
-                    sre_error "  # Then import: ${mysql_cmd} ${MIG_DB_NAME} < ${dump_file}"
+                    sre_error "Manual fallback:"
+                    sre_error "  # On source:  mysqldump -u ${MIG_SOURCE_DB_USER} -p ${MIG_SOURCE_DB_NAME} > /tmp/dump.sql"
+                    sre_error "  # Copy here:  scp -P ${MIG_SOURCE_PORT} ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:/tmp/dump.sql ${dump_file}"
+                    sre_error "  # Import:     ${mysql_cmd} ${MIG_DB_NAME} < ${dump_file}"
                     rm -f "$dump_file"
                     exit 1
                 fi
@@ -498,12 +554,22 @@ if [[ "$needs_db" == "true" ]]; then
                 ;;
 
             postgresql)
-                ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
-                    "PGPASSWORD='${MIG_SOURCE_DB_PASS}' pg_dump -U '${MIG_SOURCE_DB_USER}' '${MIG_SOURCE_DB_NAME}' 2>/dev/null" \
-                    > "$dump_file"
+                sre_info "Testing SSH connection to source server..."
+                if ! ssh -p "$MIG_SOURCE_PORT" -o ConnectTimeout=10 -o BatchMode=yes \
+                        "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" "echo SSH_OK" 2>&1 | grep -q "SSH_OK"; then
+                    sre_error "Cannot connect to source server via SSH."
+                    exit 1
+                fi
+                sre_success "SSH connection OK"
 
-                if [[ ! -s "$dump_file" ]]; then
-                    sre_error "Database dump is empty or failed."
+                sre_info "Dumping PostgreSQL database from source..."
+                { ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+                    "PGPASSWORD='${MIG_SOURCE_DB_PASS}' pg_dump -U '${MIG_SOURCE_DB_USER}' '${MIG_SOURCE_DB_NAME}'" \
+                    > "$dump_file"; } 2>&1
+                dump_rc=${PIPESTATUS[0]:-$?}
+
+                if [[ $dump_rc -ne 0 ]] || [[ ! -s "$dump_file" ]]; then
+                    sre_error "PostgreSQL dump failed (exit: $dump_rc)"
                     rm -f "$dump_file"
                     exit 1
                 fi
