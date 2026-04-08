@@ -454,9 +454,13 @@ if [[ "$do_rsync" == "true" ]]; then
             sre_success "Moodledata synced to: $moodledata_dir"
         fi
 
-        # Always fix ownership immediately after rsync — source UIDs won't exist on this server
+        # Quick ownership fix — source UIDs won't exist on this server
+        # Full permissions are applied in the dedicated section below
         sre_info "Fixing file ownership (source UIDs replaced with www-data)..."
         chown -R www-data:www-data "/var/www/${MIG_DOMAIN}"
+        if [[ -n "${moodledata_dir:-}" ]] && [[ -d "${moodledata_dir:-}" ]]; then
+            chown -R www-data:www-data "$moodledata_dir"
+        fi
         sre_success "Ownership set: www-data:www-data on /var/www/${MIG_DOMAIN}"
     else
         sre_info "[DRY-RUN] Would rsync files to $local_root"
@@ -788,84 +792,6 @@ MOODLE_CONFIG
             ;;
     esac
 
-    # Fix permissions using POSIX ACLs
-    sre_header "Fixing Permissions (POSIX ACL)"
-
-    if ! command -v setfacl &>/dev/null; then
-        sre_info "Installing ACL utilities..."
-        pkg_install acl
-    fi
-
-    project_dir="/var/www/${MIG_DOMAIN}"
-
-    # Base ownership
-    chown -R www-data:www-data "$project_dir"
-    sre_success "Ownership: www-data:www-data"
-
-    # Base permissions
-    find "$project_dir" -type d -exec chmod 755 {} \;
-    find "$project_dir" -type f -exec chmod 644 {} \;
-    sre_success "Base: dirs=755, files=644"
-
-    # Default ACLs for inheritance
-    setfacl -R -m d:u:www-data:rwX "$project_dir"
-    setfacl -R -m u:www-data:rwX "$project_dir"
-    setfacl -R -m d:u:root:rwX "$project_dir"
-    setfacl -R -m u:root:rwX "$project_dir"
-    sre_success "Default ACL: www-data + root have rwX"
-
-    # Project-type-specific
-    case "$MIG_PROJECT_TYPE" in
-        laravel)
-            for wd in "${local_root}/storage" "${local_root}/bootstrap/cache"; do
-                if [[ -d "$wd" ]]; then
-                    chmod -R 775 "$wd"
-                    setfacl -R -m u:www-data:rwX "$wd"
-                    setfacl -R -m d:u:www-data:rwX "$wd"
-                    setfacl -R -m g:www-data:rwX "$wd"
-                    setfacl -R -m d:g:www-data:rwX "$wd"
-                fi
-            done
-            sre_success "Laravel: storage + bootstrap/cache ACL rwX"
-
-            if [[ -f "${local_root}/.env" ]]; then
-                chmod 640 "${local_root}/.env"
-                setfacl -m u:www-data:r-- "${local_root}/.env"
-                sre_success ".env: 640, www-data read-only"
-            fi
-            ;;
-
-        moodle)
-            if [[ -d "$moodledata_dir" ]]; then
-                chmod -R 775 "$moodledata_dir"
-                setfacl -R -m u:www-data:rwX "$moodledata_dir"
-                setfacl -R -m d:u:www-data:rwX "$moodledata_dir"
-                setfacl -R -m g:www-data:rwX "$moodledata_dir"
-                setfacl -R -m d:g:www-data:rwX "$moodledata_dir"
-                sre_success "Moodledata: ACL rwX"
-            fi
-            if [[ -f "${local_root}/config.php" ]]; then
-                chmod 640 "${local_root}/config.php"
-                setfacl -m u:www-data:r-- "${local_root}/config.php"
-                sre_success "config.php: 640, www-data read-only"
-            fi
-            ;;
-
-        nuxt)
-            for wd in "${local_root}/.nuxt" "${local_root}/.output" "${local_root}/node_modules"; do
-                [[ -d "$wd" ]] && setfacl -R -m u:www-data:rwX "$wd" && setfacl -R -m d:u:www-data:rwX "$wd"
-            done
-            sre_success "Nuxt build dirs: ACL rwX"
-            ;;
-
-        vue)
-            sre_success "Vue: static files, read-only OK"
-            ;;
-    esac
-
-    sre_info "ACL summary:"
-    getfacl "$project_dir" 2>/dev/null | grep -E "^(user|group|default)" | head -10
-
     # Reload web server
     case "$web_server" in
         nginx) svc_reload nginx ;;
@@ -878,12 +804,133 @@ MOODLE_CONFIG
     esac
     sre_success "Web server reloaded"
 else
-    sre_info "[DRY-RUN] Would configure $MIG_PROJECT_TYPE and fix permissions"
+    sre_info "[DRY-RUN] Would configure $MIG_PROJECT_TYPE"
 fi
 else
     sre_skipped "Post-migration setup (user skipped)"
     sre_info "You can re-run with post-setup later:"
     sre_info "  sudo bash $0 --domain $MIG_DOMAIN --mode full"
+fi
+
+################################################################################
+# FIX PERMISSIONS — always runs after migration (not optional)
+################################################################################
+
+sre_header "Fix Permissions"
+
+if [[ "$SRE_DRY_RUN" != "true" ]]; then
+
+    if ! command -v setfacl &>/dev/null; then
+        sre_info "Installing ACL utilities..."
+        pkg_install acl
+    fi
+
+    project_dir="/var/www/${MIG_DOMAIN}"
+
+    # ── Base ownership ────────────────────────────────────────────────────────
+    sre_info "Setting ownership: www-data:www-data on $project_dir"
+    chown -R www-data:www-data "$project_dir"
+    sre_success "Ownership: www-data:www-data on $project_dir"
+
+    # ── Base permissions ──────────────────────────────────────────────────────
+    find "$project_dir" -type d -exec chmod 755 {} \;
+    find "$project_dir" -type f -exec chmod 644 {} \;
+    sre_success "Base: dirs=755, files=644"
+
+    # ── Default ACLs for inheritance ──────────────────────────────────────────
+    setfacl -R -m d:u:www-data:rwX "$project_dir"
+    setfacl -R -m u:www-data:rwX "$project_dir"
+    setfacl -R -m d:u:root:rwX "$project_dir"
+    setfacl -R -m u:root:rwX "$project_dir"
+    sre_success "Default ACL: www-data + root have rwX"
+
+    # ── Executable scripts / binaries ─────────────────────────────────────────
+    # Restore execute bit for common script/binary patterns that chmod 644 removed
+    for pattern in "*.sh" "artisan"; do
+        find "$project_dir" -name "$pattern" -type f -exec chmod 755 {} \; 2>/dev/null || true
+    done
+    # Composer/npm vendor binaries
+    for bin_dir in "${local_root}/vendor/bin" "${local_root}/node_modules/.bin"; do
+        if [[ -d "$bin_dir" ]]; then
+            find "$bin_dir" -type f -exec chmod 755 {} \;
+        fi
+    done
+
+    # ── Project-type-specific ─────────────────────────────────────────────────
+    case "$MIG_PROJECT_TYPE" in
+        laravel)
+            # Writable dirs: storage + bootstrap/cache
+            for wd in "${local_root}/storage" "${local_root}/bootstrap/cache"; do
+                if [[ -d "$wd" ]]; then
+                    chmod -R 775 "$wd"
+                    setfacl -R -m u:www-data:rwX "$wd"
+                    setfacl -R -m d:u:www-data:rwX "$wd"
+                    setfacl -R -m g:www-data:rwX "$wd"
+                    setfacl -R -m d:g:www-data:rwX "$wd"
+                fi
+            done
+            sre_success "Laravel: storage + bootstrap/cache → 775, ACL rwX"
+
+            # .env: sensitive — only www-data read
+            if [[ -f "${local_root}/.env" ]]; then
+                chmod 640 "${local_root}/.env"
+                setfacl -m u:www-data:r-- "${local_root}/.env"
+                sre_success ".env: 640, www-data read-only"
+            fi
+
+            # artisan must be executable
+            [[ -f "${local_root}/artisan" ]] && chmod 755 "${local_root}/artisan"
+            ;;
+
+        moodle)
+            # moodledata: writable by web server
+            if [[ -n "${moodledata_dir:-}" ]] && [[ -d "$moodledata_dir" ]]; then
+                chown -R www-data:www-data "$moodledata_dir"
+                chmod -R 775 "$moodledata_dir"
+                setfacl -R -m u:www-data:rwX "$moodledata_dir"
+                setfacl -R -m d:u:www-data:rwX "$moodledata_dir"
+                setfacl -R -m g:www-data:rwX "$moodledata_dir"
+                setfacl -R -m d:g:www-data:rwX "$moodledata_dir"
+                sre_success "Moodledata ($moodledata_dir): 775, ACL rwX"
+            fi
+
+            # config.php: sensitive — only www-data read
+            if [[ -f "${local_root}/config.php" ]]; then
+                chmod 640 "${local_root}/config.php"
+                setfacl -m u:www-data:r-- "${local_root}/config.php"
+                sre_success "config.php: 640, www-data read-only"
+            fi
+
+            # Moodle cache/temp dirs
+            for wd in "${local_root}/localcache" "${local_root}/cache" "${local_root}/temp"; do
+                if [[ -d "$wd" ]]; then
+                    chmod -R 775 "$wd"
+                    setfacl -R -m u:www-data:rwX "$wd"
+                    setfacl -R -m d:u:www-data:rwX "$wd"
+                fi
+            done
+            ;;
+
+        nuxt)
+            for wd in "${local_root}/.nuxt" "${local_root}/.output" "${local_root}/node_modules"; do
+                if [[ -d "$wd" ]]; then
+                    setfacl -R -m u:www-data:rwX "$wd"
+                    setfacl -R -m d:u:www-data:rwX "$wd"
+                fi
+            done
+            sre_success "Nuxt build dirs: ACL rwX"
+            ;;
+
+        vue)
+            sre_success "Vue: static files, read-only OK"
+            ;;
+    esac
+
+    sre_info "ACL summary for $project_dir:"
+    getfacl "$project_dir" 2>/dev/null | grep -E "^(user|group|default)" | head -10
+
+else
+    sre_info "[DRY-RUN] Would fix permissions on /var/www/${MIG_DOMAIN}"
 fi
 
 # Save final state

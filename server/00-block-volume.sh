@@ -4,9 +4,14 @@
 # Optional pre-step. Detects attached block volumes and mounts them.
 #
 # Scenarios:
+#   3+ volumes found:
+#     - User assigns each volume to: db, appdata, /var
+#     - triple: all three roles assigned
 #   2 volumes found:
-#     - Smaller  → /u02/mysql    (MariaDB datadir)
-#     - Larger   → /u02/appdata  (moodledata, Laravel storage)
+#     - Smaller  → /u02/mysql    (MariaDB datadir, always)
+#     - Larger   → user picks:
+#         dual_appdata: /u02/appdata  (moodledata, Laravel storage)
+#         dual_var:     /var          (OS data, logs, packages)
 #   1 volume found:
 #     - Migrates existing /var → volume, mounts as /var
 #
@@ -90,8 +95,9 @@ Step 00: Oracle Block Volume Setup (Optional)
 
   Auto-detects attached block volumes and mounts them.
 
-  2 volumes → /u02/mysql (DB) + /u02/appdata (app data)
-  1 volume  → /var (migrates existing data safely)
+  3+ volumes → you assign each to: db (/u02/mysql), appdata (/u02/appdata), var (/var)
+  2 volumes  → smaller auto → db, larger → you pick: appdata OR /var
+  1 volume   → /var (migrates existing data safely)
 
 Options:
   --db-device   <dev>   Force device for DB volume  (e.g. /dev/sdb)
@@ -226,74 +232,177 @@ done
 # Decide scenario
 ################################################################################
 
-SCENARIO=""
+SCENARIO=""   # triple | dual_appdata | dual_var | single
 DB_DEV=""
-APP_DEV=""
-VAR_DEV=""
+APP_DEV=""    # used when SCENARIO has appdata (dual_appdata, triple)
+VAR_DEV=""    # used when SCENARIO has /var (dual_var, single, triple)
 
-if [[ ${#candidate_devices[@]} -ge 2 ]]; then
-    SCENARIO="dual"
+# Helper: let user pick a device for a given role from remaining devices
+_pick_device() {
+    local role_label="$1"
+    shift
+    local available=("$@")
 
-    if [[ -n "$FORCE_DB_DEV" && -n "$FORCE_APP_DEV" ]]; then
-        DB_DEV="$FORCE_DB_DEV"
-        APP_DEV="$FORCE_APP_DEV"
-    else
-        # Sort by size ascending: smaller = DB, larger = app
-        sorted=()
-        while IFS= read -r dev; do
-            sorted+=("$dev")
-        done < <(
-            for d in "${candidate_devices[@]}"; do
-                echo "$(dev_size_bytes "$d") $d"
-            done | sort -n | awk '{print $2}'
-        )
-
-        DB_DEV="${sorted[0]}"
-        APP_DEV="${sorted[${#sorted[@]}-1]}"
-
-        sre_info ""
-        sre_info "Auto-assigned:"
-        sre_info "  DB  volume (smaller): $DB_DEV  ($(dev_size_human "$DB_DEV"))"
-        sre_info "  App volume (larger):  $APP_DEV ($(dev_size_human "$APP_DEV"))"
-
-        if ! prompt_yesno "Use this assignment?" "yes"; then
-            DB_DEV=$(prompt_choice  "Select device for MariaDB (/u02/mysql):"   "${candidate_devices[@]}")
-            APP_DEV=$(prompt_choice "Select device for app data (/u02/appdata):" "${candidate_devices[@]}")
-        fi
+    if [[ ${#available[@]} -eq 1 ]]; then
+        echo "${available[0]}"
+        return 0
     fi
 
-    # Safety: refuse if either device is the root disk
-    for dev in "$DB_DEV" "$APP_DEV"; do
-        if is_root_disk "$dev"; then
-            sre_error "SAFETY: $dev appears to be the root disk. Refusing to proceed."
-            exit 1
-        fi
-        if [[ ! -b "$dev" ]]; then
-            sre_error "Device not found: $dev"
-            exit 1
-        fi
+    local choices=()
+    for dev in "${available[@]}"; do
+        choices+=("$dev  ($(dev_size_human "$dev"))")
     done
 
-    if [[ "$DB_DEV" == "$APP_DEV" ]]; then
-        sre_error "DB device and app device cannot be the same."
-        exit 1
+    local picked
+    picked=$(prompt_choice "Which volume for ${role_label}?" "${choices[@]}")
+    # Extract device path (first field before spaces)
+    echo "$picked" | awk '{print $1}'
+}
+
+if [[ ${#candidate_devices[@]} -ge 3 ]]; then
+    ############################################################################
+    # 3+ volumes: user assigns each to db / appdata / /var
+    ############################################################################
+
+    # Sort by size ascending for display
+    sorted=()
+    while IFS= read -r dev; do
+        sorted+=("$dev")
+    done < <(
+        for d in "${candidate_devices[@]}"; do
+            echo "$(dev_size_bytes "$d") $d"
+        done | sort -n | awk '{print $2}'
+    )
+
+    sre_info ""
+    sre_info "Detected ${#sorted[@]} volumes (sorted by size):"
+    for dev in "${sorted[@]}"; do
+        sre_info "  $dev  $(dev_size_human "$dev")"
+    done
+    echo ""
+
+    sre_info "Assign each volume to a role:"
+    echo ""
+
+    # 1. Pick DB volume (or use forced)
+    if [[ -n "$FORCE_DB_DEV" ]]; then
+        DB_DEV="$FORCE_DB_DEV"
+        sre_info "DB device forced: $DB_DEV"
+    else
+        DB_DEV=$(_pick_device "MariaDB database (/u02/mysql)" "${sorted[@]}")
     fi
+
+    # Remove DB_DEV from remaining
+    remaining=()
+    for dev in "${sorted[@]}"; do
+        [[ "$dev" != "$DB_DEV" ]] && remaining+=("$dev")
+    done
+
+    # 2. Pick appdata volume (or use forced)
+    if [[ -n "$FORCE_APP_DEV" ]]; then
+        APP_DEV="$FORCE_APP_DEV"
+        sre_info "App device forced: $APP_DEV"
+    else
+        APP_DEV=$(_pick_device "app data (/u02/appdata — moodledata, Laravel storage)" "${remaining[@]}")
+    fi
+
+    # Remove APP_DEV from remaining
+    remaining2=()
+    for dev in "${remaining[@]}"; do
+        [[ "$dev" != "$APP_DEV" ]] && remaining2+=("$dev")
+    done
+
+    # 3. Pick /var volume (or use forced)
+    if [[ -n "$FORCE_VAR_DEV" ]]; then
+        VAR_DEV="$FORCE_VAR_DEV"
+        sre_info "Var device forced: $VAR_DEV"
+    else
+        VAR_DEV=$(_pick_device "/var (OS data, logs, packages)" "${remaining2[@]}")
+    fi
+
+    SCENARIO="triple"
+    sre_info ""
+    sre_info "Assignment:"
+    sre_info "  DB:      $DB_DEV  ($(dev_size_human "$DB_DEV"))  → /u02/mysql"
+    sre_info "  Appdata: $APP_DEV ($(dev_size_human "$APP_DEV")) → /u02/appdata"
+    sre_info "  /var:    $VAR_DEV ($(dev_size_human "$VAR_DEV")) → /var"
+
+elif [[ ${#candidate_devices[@]} -eq 2 ]]; then
+    ############################################################################
+    # 2 volumes: smaller = DB, larger = user picks appdata or /var
+    ############################################################################
+
+    sorted=()
+    while IFS= read -r dev; do
+        sorted+=("$dev")
+    done < <(
+        for d in "${candidate_devices[@]}"; do
+            echo "$(dev_size_bytes "$d") $d"
+        done | sort -n | awk '{print $2}'
+    )
+
+    if [[ -n "$FORCE_DB_DEV" ]]; then
+        DB_DEV="$FORCE_DB_DEV"
+    else
+        DB_DEV="${sorted[0]}"
+    fi
+
+    larger_dev="${sorted[1]}"
+
+    sre_info ""
+    sre_info "Detected volumes:"
+    sre_info "  Smaller → MariaDB DB:  $DB_DEV  ($(dev_size_human "$DB_DEV"))"
+    sre_info "  Larger  → your choice: $larger_dev ($(dev_size_human "$larger_dev"))"
+    echo ""
+
+    larger_use=$(prompt_choice \
+        "How should the larger volume ($larger_dev, $(dev_size_human "$larger_dev")) be used?" \
+        "appdata — mount as /u02/appdata (moodledata, Laravel storage)" \
+        "var     — mount as /var (OS data, logs, packages)")
+
+    case "$larger_use" in
+        appdata*)
+            SCENARIO="dual_appdata"
+            APP_DEV="${FORCE_APP_DEV:-$larger_dev}"
+            sre_info "Larger volume will be mounted as /u02/appdata"
+            ;;
+        var*)
+            SCENARIO="dual_var"
+            VAR_DEV="${FORCE_VAR_DEV:-$larger_dev}"
+            sre_info "Larger volume will be mounted as /var"
+            ;;
+    esac
 
 elif [[ ${#candidate_devices[@]} -eq 1 ]]; then
     SCENARIO="single"
     VAR_DEV="${FORCE_VAR_DEV:-${candidate_devices[0]}}"
-
-    if is_root_disk "$VAR_DEV"; then
-        sre_error "SAFETY: $VAR_DEV appears to be the root disk. Refusing to proceed."
-        exit 1
-    fi
-    if [[ ! -b "$VAR_DEV" ]]; then
-        sre_error "Device not found: $VAR_DEV"
-        exit 1
-    fi
-
-    sre_info "Single volume scenario: $VAR_DEV → /var"
+    sre_info "Single volume: $VAR_DEV → /var"
 fi
+
+# Safety checks — validate all assigned devices
+for dev in "${DB_DEV:-}" "${APP_DEV:-}" "${VAR_DEV:-}"; do
+    [[ -z "$dev" ]] && continue
+    if is_root_disk "$dev"; then
+        sre_error "SAFETY: $dev appears to be the root disk. Refusing to proceed."
+        exit 1
+    fi
+    if [[ ! -b "$dev" ]]; then
+        sre_error "Device not found: $dev"
+        exit 1
+    fi
+done
+
+# No two roles can share the same device
+_check_dup() {
+    local a="$1" b="$2" label="$3"
+    if [[ -n "$a" && -n "$b" && "$a" == "$b" ]]; then
+        sre_error "$label cannot use the same device ($a)."
+        exit 1
+    fi
+}
+_check_dup "$DB_DEV"  "$APP_DEV" "DB and appdata"
+_check_dup "$DB_DEV"  "$VAR_DEV" "DB and /var"
+_check_dup "$APP_DEV" "$VAR_DEV" "Appdata and /var"
 
 sre_info "Scenario: $SCENARIO"
 state_set "SCENARIO" "$SCENARIO"
@@ -428,10 +537,10 @@ mount_volume() {
 }
 
 ################################################################################
-# SCENARIO: DUAL — two volumes
+# SCENARIO: DUAL_APPDATA — DB (small) + /u02/appdata (large)
 ################################################################################
 
-setup_dual() {
+setup_dual_appdata() {
     ############################################################################
     # Phase 1: Format volumes
     ############################################################################
@@ -680,6 +789,509 @@ AAEOF
 }
 
 ################################################################################
+# SCENARIO: DUAL_VAR — DB (small) + /var (large)
+################################################################################
+
+setup_dual_var() {
+    ############################################################################
+    # Phase 1: Format volumes
+    ############################################################################
+
+    sre_header "Phase 1: Format Volumes"
+
+    sre_info "DB  volume: $DB_DEV → $U02_MYSQL"
+    sre_info "Var volume: $VAR_DEV → /var"
+    sre_info ""
+    sre_warning "This will format both devices. All data on them will be erased."
+    sre_warning "  DB  device: $DB_DEV ($(dev_size_human "$DB_DEV"))"
+    sre_warning "  Var device: $VAR_DEV ($(dev_size_human "$VAR_DEV"))"
+    echo ""
+
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        if ! prompt_yesno "Proceed?" "no"; then
+            sre_info "Aborted by user."
+            exit 0
+        fi
+    fi
+
+    format_volume "$DB_DEV"  "u02_mysql"
+    format_volume "$VAR_DEV" "var_vol"
+
+    ############################################################################
+    # Phase 2: Mount DB volume
+    ############################################################################
+
+    sre_header "Phase 2: Mount DB Volume"
+
+    db_part=$(get_part "u02_mysql" "$DB_DEV")
+    [[ -z "$db_part" ]] && { sre_error "Cannot find partition on $DB_DEV"; exit 1; }
+
+    mount_volume "$db_part" "$U02_MYSQL" "u02_mysql"
+
+    ############################################################################
+    # Phase 3: Configure MariaDB datadir on block volume
+    # (Same logic as dual_appdata — reuse the MariaDB section)
+    ############################################################################
+
+    sre_header "Phase 3: Configure MariaDB Datadir → ${U02_MYSQL}"
+
+    if phase_done "MARIADB_MOVED"; then
+        sre_skipped "MariaDB datadir already configured on block volume"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        if command -v mysqld &>/dev/null || command -v mariadbd &>/dev/null \
+                || systemctl list-unit-files "${MARIADB_SVC}.service" &>/dev/null 2>&1; then
+            sre_info "[DRY-RUN] MariaDB IS installed — would stop, rsync datadir, update config, restart"
+        else
+            sre_info "[DRY-RUN] MariaDB NOT installed — would pre-create ${U02_MYSQL} and drop config override"
+        fi
+    else
+        mariadb_installed=false
+        if command -v mysqld &>/dev/null || command -v mariadbd &>/dev/null; then
+            mariadb_installed=true
+        elif systemctl list-unit-files "${MARIADB_SVC}.service" &>/dev/null 2>&1; then
+            mariadb_installed=true
+        fi
+
+        local override_dir=""
+        for conf_dir in \
+            "/etc/mysql/mariadb.conf.d" \
+            "/etc/mysql/mysql.conf.d" \
+            "/etc/my.cnf.d"; do
+            if [[ -d "$conf_dir" ]]; then
+                override_dir="$conf_dir"
+                break
+            fi
+        done
+
+        if [[ -z "$override_dir" ]]; then
+            override_dir="/etc/mysql/mariadb.conf.d"
+            mkdir -p "$override_dir"
+            sre_info "Created conf dir (MariaDB not yet installed): $override_dir"
+        fi
+
+        local override_conf="${override_dir}/99-sre-datadir.cnf"
+
+        if [[ ! -f "$override_conf" ]]; then
+            cat > "$override_conf" <<DBCONF
+# sre-helpers step 00 — datadir on block volume
+# Written before MariaDB install so the installer uses /u02/mysql directly.
+[mysqld]
+datadir = ${U02_MYSQL}
+DBCONF
+            sre_success "Wrote datadir override: $override_conf"
+            _log "INFO" "wrote mariadb override conf=${override_conf} datadir=${U02_MYSQL}"
+        else
+            sre_skipped "Datadir override already exists: $override_conf"
+        fi
+
+        if [[ "$mariadb_installed" == "false" ]]; then
+            sre_info "MariaDB is NOT installed yet."
+            sre_info "Pre-creating ${U02_MYSQL} with correct ownership for installer..."
+
+            if ! id mysql &>/dev/null; then
+                useradd --system --no-create-home --shell /usr/sbin/nologin mysql 2>/dev/null \
+                    && sre_success "Created system user: mysql" \
+                    || sre_info "mysql user already exists"
+            fi
+
+            mkdir -p "${U02_MYSQL}"
+            chown mysql:mysql "${U02_MYSQL}"
+            chmod 750 "${U02_MYSQL}"
+            sre_success "Pre-created ${U02_MYSQL} (mysql:mysql 750)"
+            sre_success "MariaDB installer (step 5) will write directly to ${U02_MYSQL}"
+        else
+            sre_info "MariaDB IS installed — migrating existing datadir..."
+
+            if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
+                sre_info "Stopping MariaDB..."
+                systemctl stop "$MARIADB_SVC"
+                sre_success "MariaDB stopped"
+            fi
+
+            if [[ -d "$MARIADB_DATADIR_DEFAULT" ]] && \
+               [[ -n "$(ls -A "$MARIADB_DATADIR_DEFAULT" 2>/dev/null)" ]]; then
+                sre_info "Copying ${MARIADB_DATADIR_DEFAULT} → ${U02_MYSQL} ..."
+                rsync -aHAX --numeric-ids --info=progress2 \
+                    "${MARIADB_DATADIR_DEFAULT}/" "${U02_MYSQL}/"
+                sre_success "MariaDB data copied to block volume"
+            else
+                sre_info "Default datadir empty or missing — nothing to copy"
+            fi
+
+            chown -R mysql:mysql "${U02_MYSQL}"
+            chmod 750 "${U02_MYSQL}"
+            sre_success "Ownership: mysql:mysql on ${U02_MYSQL}"
+
+            local mariadb_conf=""
+            for conf_path in \
+                "/etc/mysql/mariadb.conf.d/50-server.cnf" \
+                "/etc/mysql/mysql.conf.d/mysqld.cnf" \
+                "/etc/my.cnf.d/mariadb-server.cnf" \
+                "/etc/my.cnf"; do
+                if [[ -f "$conf_path" ]]; then
+                    mariadb_conf="$conf_path"
+                    break
+                fi
+            done
+
+            if [[ -n "$mariadb_conf" ]]; then
+                cp "$mariadb_conf" "${mariadb_conf}.bak.$(date +%Y%m%d%H%M%S)"
+                if grep -q "^datadir" "$mariadb_conf"; then
+                    sed -i "s|^datadir.*|datadir = ${U02_MYSQL}|" "$mariadb_conf"
+                else
+                    sed -i "/^\[mysqld\]/a datadir = ${U02_MYSQL}" "$mariadb_conf"
+                fi
+                sre_success "Updated: $mariadb_conf"
+            fi
+
+            if [[ "$SRE_OS_FAMILY" == "debian" ]] && command -v aa-status &>/dev/null; then
+                local apparmor_local="/etc/apparmor.d/local/usr.sbin.mysqld"
+                mkdir -p /etc/apparmor.d/local
+                touch "$apparmor_local"
+                sed -i '/# sre-helpers/d' "$apparmor_local" 2>/dev/null || true
+                cat >> "$apparmor_local" <<AAEOF
+# sre-helpers step 00
+${U02_MYSQL}/ r,
+${U02_MYSQL}/** rwk,
+AAEOF
+                apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld 2>/dev/null \
+                    && sre_success "AppArmor profile reloaded" \
+                    || sre_warning "AppArmor reload failed — check manually"
+            fi
+
+            sre_info "Starting MariaDB..."
+            systemctl start "$MARIADB_SVC"
+            sleep 3
+
+            if systemctl is-active --quiet "$MARIADB_SVC"; then
+                sre_success "MariaDB started successfully with block volume datadir"
+            else
+                sre_error "MariaDB failed to start. Check: journalctl -u ${MARIADB_SVC} -n 50"
+                exit 1
+            fi
+        fi
+
+        mark_done "MARIADB_MOVED"
+    fi
+
+    ############################################################################
+    # Phase 4: Migrate /var to large volume
+    # (Same logic as setup_single but using VAR_DEV)
+    ############################################################################
+
+    sre_header "Phase 4: Mount Large Volume as /var"
+
+    local var_part
+    var_part=$(get_part "var_vol" "$VAR_DEV")
+    [[ -z "$var_part" ]] && { sre_error "Cannot find partition on $VAR_DEV"; exit 1; }
+
+    local var_mp
+    var_mp=$(findmnt -n -o SOURCE /var 2>/dev/null || true)
+
+    if [[ "$(dev_mountpoint "$var_part")" == "/var" ]]; then
+        sre_skipped "$VAR_DEV already mounted at /var"
+    else
+        var_has_data=false
+        [[ -n "$(ls -A /var 2>/dev/null)" ]] && var_has_data=true
+
+        if [[ "$var_has_data" == "true" ]] && ! phase_done "VAR_MIGRATED"; then
+            sre_info "Migrating /var data to block volume..."
+
+            local tmp_mount="/mnt/sre_var_$$"
+            mkdir -p "$tmp_mount"
+            mount -o defaults,noatime "$var_part" "$tmp_mount"
+
+            sre_info "Copying /var → $tmp_mount ..."
+            rsync -aHAXx --numeric-ids --info=progress2 /var/ "$tmp_mount/"
+            sre_success "Migration complete"
+
+            umount "$tmp_mount"
+            rmdir "$tmp_mount"
+            mark_done "VAR_MIGRATED"
+        fi
+
+        if ! phase_done "VAR_MOUNTED"; then
+            sre_info "Mounting $var_part at /var ..."
+            mount -o defaults,noatime "$var_part" /var
+            findmnt -n /var >/dev/null || { sre_error "Mount verification failed for /var"; exit 1; }
+            sre_success "Mounted: $var_part → /var"
+            mark_done "VAR_MOUNTED"
+        fi
+
+        local uuid
+        uuid=$(dev_uuid "$var_part")
+        add_fstab "$uuid" "/var"
+    fi
+}
+
+################################################################################
+# SCENARIO: TRIPLE — three volumes: DB + appdata + /var
+################################################################################
+
+setup_triple() {
+    ############################################################################
+    # Phase 1: Format all volumes
+    ############################################################################
+
+    sre_header "Phase 1: Format Volumes"
+
+    sre_info "DB      volume: $DB_DEV  ($(dev_size_human "$DB_DEV"))  → $U02_MYSQL"
+    sre_info "Appdata volume: $APP_DEV ($(dev_size_human "$APP_DEV")) → $U02_APPDATA"
+    sre_info "/var    volume: $VAR_DEV ($(dev_size_human "$VAR_DEV")) → /var"
+    sre_info ""
+    sre_warning "This will format ALL THREE devices. All data on them will be erased."
+    echo ""
+
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        if ! prompt_yesno "Proceed?" "no"; then
+            sre_info "Aborted by user."
+            exit 0
+        fi
+    fi
+
+    format_volume "$DB_DEV"  "u02_mysql"
+    format_volume "$APP_DEV" "u02_appdata"
+    format_volume "$VAR_DEV" "var_vol"
+
+    ############################################################################
+    # Phase 2: Mount DB + appdata volumes
+    ############################################################################
+
+    sre_header "Phase 2: Mount DB + Appdata Volumes"
+
+    db_part=$(get_part "u02_mysql" "$DB_DEV")
+    app_part=$(get_part "u02_appdata" "$APP_DEV")
+
+    [[ -z "$db_part" ]]  && { sre_error "Cannot find partition on $DB_DEV";  exit 1; }
+    [[ -z "$app_part" ]] && { sre_error "Cannot find partition on $APP_DEV"; exit 1; }
+
+    mount_volume "$db_part"  "$U02_MYSQL"   "u02_mysql"
+    mount_volume "$app_part" "$U02_APPDATA" "u02_appdata"
+
+    ############################################################################
+    # Phase 3: Configure MariaDB datadir
+    # (identical to dual_appdata Phase 3)
+    ############################################################################
+
+    sre_header "Phase 3: Configure MariaDB Datadir → ${U02_MYSQL}"
+
+    if phase_done "MARIADB_MOVED"; then
+        sre_skipped "MariaDB datadir already configured on block volume"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        if command -v mysqld &>/dev/null || command -v mariadbd &>/dev/null \
+                || systemctl list-unit-files "${MARIADB_SVC}.service" &>/dev/null 2>&1; then
+            sre_info "[DRY-RUN] MariaDB IS installed — would stop, rsync datadir, update config, restart"
+        else
+            sre_info "[DRY-RUN] MariaDB NOT installed — would pre-create ${U02_MYSQL} and drop config override"
+        fi
+    else
+        mariadb_installed=false
+        if command -v mysqld &>/dev/null || command -v mariadbd &>/dev/null; then
+            mariadb_installed=true
+        elif systemctl list-unit-files "${MARIADB_SVC}.service" &>/dev/null 2>&1; then
+            mariadb_installed=true
+        fi
+
+        local override_dir=""
+        for conf_dir in \
+            "/etc/mysql/mariadb.conf.d" \
+            "/etc/mysql/mysql.conf.d" \
+            "/etc/my.cnf.d"; do
+            if [[ -d "$conf_dir" ]]; then
+                override_dir="$conf_dir"
+                break
+            fi
+        done
+
+        if [[ -z "$override_dir" ]]; then
+            override_dir="/etc/mysql/mariadb.conf.d"
+            mkdir -p "$override_dir"
+            sre_info "Created conf dir (MariaDB not yet installed): $override_dir"
+        fi
+
+        local override_conf="${override_dir}/99-sre-datadir.cnf"
+
+        if [[ ! -f "$override_conf" ]]; then
+            cat > "$override_conf" <<DBCONF
+# sre-helpers step 00 — datadir on block volume
+[mysqld]
+datadir = ${U02_MYSQL}
+DBCONF
+            sre_success "Wrote datadir override: $override_conf"
+        else
+            sre_skipped "Datadir override already exists: $override_conf"
+        fi
+
+        if [[ "$mariadb_installed" == "false" ]]; then
+            sre_info "MariaDB is NOT installed yet."
+            sre_info "Pre-creating ${U02_MYSQL} with correct ownership for installer..."
+
+            if ! id mysql &>/dev/null; then
+                useradd --system --no-create-home --shell /usr/sbin/nologin mysql 2>/dev/null \
+                    && sre_success "Created system user: mysql" \
+                    || sre_info "mysql user already exists"
+            fi
+
+            mkdir -p "${U02_MYSQL}"
+            chown mysql:mysql "${U02_MYSQL}"
+            chmod 750 "${U02_MYSQL}"
+            sre_success "Pre-created ${U02_MYSQL} (mysql:mysql 750)"
+            sre_success "MariaDB installer (step 5) will write directly to ${U02_MYSQL}"
+        else
+            sre_info "MariaDB IS installed — migrating existing datadir..."
+
+            if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
+                sre_info "Stopping MariaDB..."
+                systemctl stop "$MARIADB_SVC"
+                sre_success "MariaDB stopped"
+            fi
+
+            if [[ -d "$MARIADB_DATADIR_DEFAULT" ]] && \
+               [[ -n "$(ls -A "$MARIADB_DATADIR_DEFAULT" 2>/dev/null)" ]]; then
+                sre_info "Copying ${MARIADB_DATADIR_DEFAULT} → ${U02_MYSQL} ..."
+                rsync -aHAX --numeric-ids --info=progress2 \
+                    "${MARIADB_DATADIR_DEFAULT}/" "${U02_MYSQL}/"
+                sre_success "MariaDB data copied to block volume"
+            else
+                sre_info "Default datadir empty or missing — nothing to copy"
+            fi
+
+            chown -R mysql:mysql "${U02_MYSQL}"
+            chmod 750 "${U02_MYSQL}"
+            sre_success "Ownership: mysql:mysql on ${U02_MYSQL}"
+
+            local mariadb_conf=""
+            for conf_path in \
+                "/etc/mysql/mariadb.conf.d/50-server.cnf" \
+                "/etc/mysql/mysql.conf.d/mysqld.cnf" \
+                "/etc/my.cnf.d/mariadb-server.cnf" \
+                "/etc/my.cnf"; do
+                if [[ -f "$conf_path" ]]; then
+                    mariadb_conf="$conf_path"
+                    break
+                fi
+            done
+
+            if [[ -n "$mariadb_conf" ]]; then
+                cp "$mariadb_conf" "${mariadb_conf}.bak.$(date +%Y%m%d%H%M%S)"
+                if grep -q "^datadir" "$mariadb_conf"; then
+                    sed -i "s|^datadir.*|datadir = ${U02_MYSQL}|" "$mariadb_conf"
+                else
+                    sed -i "/^\[mysqld\]/a datadir = ${U02_MYSQL}" "$mariadb_conf"
+                fi
+                sre_success "Updated: $mariadb_conf"
+            fi
+
+            if [[ "$SRE_OS_FAMILY" == "debian" ]] && command -v aa-status &>/dev/null; then
+                local apparmor_local="/etc/apparmor.d/local/usr.sbin.mysqld"
+                mkdir -p /etc/apparmor.d/local
+                touch "$apparmor_local"
+                sed -i '/# sre-helpers/d' "$apparmor_local" 2>/dev/null || true
+                cat >> "$apparmor_local" <<AAEOF
+# sre-helpers step 00
+${U02_MYSQL}/ r,
+${U02_MYSQL}/** rwk,
+AAEOF
+                apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld 2>/dev/null \
+                    && sre_success "AppArmor profile reloaded" \
+                    || sre_warning "AppArmor reload failed — check manually"
+            fi
+
+            sre_info "Starting MariaDB..."
+            systemctl start "$MARIADB_SVC"
+            sleep 3
+
+            if systemctl is-active --quiet "$MARIADB_SVC"; then
+                sre_success "MariaDB started successfully with block volume datadir"
+            else
+                sre_error "MariaDB failed to start. Check: journalctl -u ${MARIADB_SVC} -n 50"
+                exit 1
+            fi
+        fi
+
+        mark_done "MARIADB_MOVED"
+    fi
+
+    ############################################################################
+    # Phase 4: Setup app data directory
+    ############################################################################
+
+    sre_header "Phase 4: Setup App Data Directory"
+
+    if phase_done "APPDATA_SETUP"; then
+        sre_skipped "App data directories already set up"
+    else
+        if [[ "$SRE_DRY_RUN" == "true" ]]; then
+            sre_info "[DRY-RUN] Would create ${MOODLEDATA_DIR} and set www-data permissions"
+        else
+            mkdir -p "$MOODLEDATA_DIR"
+            chown -R www-data:www-data "$MOODLEDATA_DIR"
+            chmod 770 "$MOODLEDATA_DIR"
+            sre_success "Created: ${MOODLEDATA_DIR} (www-data:www-data, 770)"
+
+            local laravel_storage="${U02_APPDATA}/laravel-storage"
+            mkdir -p "$laravel_storage"
+            chown -R www-data:www-data "$laravel_storage"
+            chmod 775 "$laravel_storage"
+            sre_success "Created: ${laravel_storage} (www-data:www-data, 775)"
+
+            if command -v setfacl &>/dev/null; then
+                setfacl -R -m d:u:www-data:rwX "$U02_APPDATA"
+                setfacl -R -m u:www-data:rwX   "$U02_APPDATA"
+                sre_success "POSIX ACL defaults set on ${U02_APPDATA}"
+            fi
+
+            mark_done "APPDATA_SETUP"
+        fi
+    fi
+
+    ############################################################################
+    # Phase 5: Mount /var volume
+    ############################################################################
+
+    sre_header "Phase 5: Mount Volume as /var"
+
+    local var_part
+    var_part=$(get_part "var_vol" "$VAR_DEV")
+    [[ -z "$var_part" ]] && { sre_error "Cannot find partition on $VAR_DEV"; exit 1; }
+
+    if [[ "$(dev_mountpoint "$var_part")" == "/var" ]]; then
+        sre_skipped "$VAR_DEV already mounted at /var"
+    else
+        var_has_data=false
+        [[ -n "$(ls -A /var 2>/dev/null)" ]] && var_has_data=true
+
+        if [[ "$var_has_data" == "true" ]] && ! phase_done "VAR_MIGRATED"; then
+            sre_info "Migrating /var data to block volume..."
+
+            local tmp_mount="/mnt/sre_var_$$"
+            mkdir -p "$tmp_mount"
+            mount -o defaults,noatime "$var_part" "$tmp_mount"
+
+            sre_info "Copying /var → $tmp_mount ..."
+            rsync -aHAXx --numeric-ids --info=progress2 /var/ "$tmp_mount/"
+            sre_success "Migration complete"
+
+            umount "$tmp_mount"
+            rmdir "$tmp_mount"
+            mark_done "VAR_MIGRATED"
+        fi
+
+        if ! phase_done "VAR_MOUNTED"; then
+            sre_info "Mounting $var_part at /var ..."
+            mount -o defaults,noatime "$var_part" /var
+            findmnt -n /var >/dev/null || { sre_error "Mount verification failed for /var"; exit 1; }
+            sre_success "Mounted: $var_part → /var"
+            mark_done "VAR_MOUNTED"
+        fi
+
+        local uuid
+        uuid=$(dev_uuid "$var_part")
+        add_fstab "$uuid" "/var"
+    fi
+}
+
+################################################################################
 # SCENARIO: SINGLE — one volume → /var
 ################################################################################
 
@@ -780,8 +1392,10 @@ setup_single() {
 ################################################################################
 
 case "$SCENARIO" in
-    dual)   setup_dual   ;;
-    single) setup_single ;;
+    triple)       setup_triple       ;;
+    dual_appdata) setup_dual_appdata ;;
+    dual_var)     setup_dual_var     ;;
+    single)       setup_single       ;;
 esac
 
 ################################################################################
@@ -790,44 +1404,61 @@ esac
 
 sre_header "Validation"
 
-case "$SCENARIO" in
-    dual)
-        for mp in "$U02_MYSQL" "$U02_APPDATA"; do
-            if findmnt -n "$mp" &>/dev/null; then
-                sre_success "Mounted: $mp"
-                df -h "$mp" | tail -1
+_validate_mariadb() {
+    if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
+        sre_success "MariaDB is running"
+        actual_datadir=$(mysql -NBe "SELECT @@datadir;" 2>/dev/null || true)
+        if [[ -n "$actual_datadir" ]]; then
+            sre_info "MariaDB datadir: $actual_datadir"
+            if [[ "$actual_datadir" == "${U02_MYSQL}/"* || "$actual_datadir" == "${U02_MYSQL}" ]]; then
+                sre_success "MariaDB is using the new datadir"
             else
-                sre_error "NOT mounted: $mp"
+                sre_warning "MariaDB datadir is: $actual_datadir (expected: ${U02_MYSQL})"
             fi
-        done
-
-        if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
-            sre_success "MariaDB is running"
-            actual_datadir=$(mysql -NBe "SELECT @@datadir;" 2>/dev/null || true)
-            if [[ -n "$actual_datadir" ]]; then
-                sre_info "MariaDB datadir: $actual_datadir"
-                if [[ "$actual_datadir" == "${U02_MYSQL}/"* || "$actual_datadir" == "${U02_MYSQL}" ]]; then
-                    sre_success "MariaDB is using the new datadir"
-                else
-                    sre_warning "MariaDB datadir is: $actual_datadir (expected: ${U02_MYSQL})"
-                fi
-            fi
-        else
-            sre_warning "MariaDB is not running — check: journalctl -u ${MARIADB_SVC} -n 50"
         fi
+    else
+        sre_warning "MariaDB is not running — check: journalctl -u ${MARIADB_SVC} -n 50"
+    fi
+}
 
+_validate_mount() {
+    local mp="$1"
+    if findmnt -n "$mp" &>/dev/null; then
+        sre_success "Mounted: $mp"
+        df -h "$mp" | tail -1
+    else
+        sre_error "NOT mounted: $mp"
+    fi
+}
+
+case "$SCENARIO" in
+    triple)
+        _validate_mount "$U02_MYSQL"
+        _validate_mount "$U02_APPDATA"
+        _validate_mount "/var"
+        _validate_mariadb
         [[ -d "$MOODLEDATA_DIR" ]] \
             && sre_success "Moodledata dir exists: $MOODLEDATA_DIR" \
             || sre_warning "Moodledata dir missing: $MOODLEDATA_DIR"
         ;;
 
+    dual_appdata)
+        _validate_mount "$U02_MYSQL"
+        _validate_mount "$U02_APPDATA"
+        _validate_mariadb
+        [[ -d "$MOODLEDATA_DIR" ]] \
+            && sre_success "Moodledata dir exists: $MOODLEDATA_DIR" \
+            || sre_warning "Moodledata dir missing: $MOODLEDATA_DIR"
+        ;;
+
+    dual_var)
+        _validate_mount "$U02_MYSQL"
+        _validate_mount "/var"
+        _validate_mariadb
+        ;;
+
     single)
-        if findmnt -n /var &>/dev/null; then
-            sre_success "Mounted: /var"
-            df -h /var | tail -1
-        else
-            sre_error "NOT mounted: /var"
-        fi
+        _validate_mount "/var"
         ;;
 esac
 
@@ -839,14 +1470,35 @@ sre_header "Complete"
 
 echo ""
 case "$SCENARIO" in
-    dual)
-        sre_success "Two block volumes configured:"
+    triple)
+        sre_success "Three block volumes configured:"
         sre_info "  ${U02_MYSQL}    → MariaDB datadir"
+        sre_info "  ${U02_APPDATA}  → App data (moodledata, Laravel storage)"
+        sre_info "  /var            → OS data, logs, packages"
+        sre_info "  ${MOODLEDATA_DIR} → ready for Moodle"
+        echo ""
+        sre_info "Migration script (step 10) will use:"
+        sre_info "  moodledata: ${MOODLEDATA_DIR}"
+        echo ""
+        sre_warning "Reboot to confirm /var mounts correctly from fstab:"
+        sre_warning "  sudo reboot && df -h /var"
+        ;;
+    dual_appdata)
+        sre_success "Two block volumes configured:"
+        sre_info "  ${U02_MYSQL}    → MariaDB datadir (small volume)"
         sre_info "  ${U02_APPDATA}  → App data (moodledata, Laravel storage)"
         sre_info "  ${MOODLEDATA_DIR} → ready for Moodle"
         echo ""
         sre_info "Migration script (step 10) will use:"
         sre_info "  moodledata: ${MOODLEDATA_DIR}"
+        ;;
+    dual_var)
+        sre_success "Two block volumes configured:"
+        sre_info "  ${U02_MYSQL}    → MariaDB datadir (small volume)"
+        sre_info "  /var            → OS data, logs, packages (large volume)"
+        echo ""
+        sre_warning "Reboot to confirm /var mounts correctly from fstab:"
+        sre_warning "  sudo reboot && df -h /var"
         ;;
     single)
         sre_success "Block volume mounted as /var"

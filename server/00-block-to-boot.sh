@@ -6,11 +6,20 @@
 # back to the boot/root disk so block volumes can be detached or replaced.
 #
 # Handles:
-#   dual mode:
+#   triple mode:
+#     - Move MariaDB datadir from /u02/mysql  → /var/lib/mysql
+#     - Move app data from /u02/appdata → /var/www
+#     - Migrate /var from block volume back to root disk
+#     - Unmount all three volumes, remove fstab entries
+#   dual_appdata mode:
 #     - Move MariaDB datadir from /u02/mysql  → /var/lib/mysql
 #     - Move app data   from /u02/appdata → /var/www (moodledata) or original paths
 #     - Update MariaDB config, fix AppArmor, verify MariaDB starts
 #     - Unmount /u02/mysql and /u02/appdata, remove fstab entries
+#   dual_var mode:
+#     - Move MariaDB datadir from /u02/mysql → /var/lib/mysql
+#     - Migrate /var from block volume back to root disk
+#     - Unmount both volumes, remove fstab entries
 #   single (/var) mode:
 #     - Migrate /var contents back to root disk
 #     - Unmount block /var, remove fstab entry
@@ -91,11 +100,13 @@ Step 00b: Migrate Block Storage Back to Boot Disk
   Reads previous setup from: $BV_STATE_FILE
 
   Modes:
-    dual    - Unmount /u02/mysql + /u02/appdata, restore MariaDB to /var/lib/mysql
-    single  - Unmount block /var, restore to root disk /var
+    triple       - Unmount /u02/mysql + /u02/appdata + block /var, restore all to boot disk
+    dual_appdata - Unmount /u02/mysql + /u02/appdata, restore MariaDB to /var/lib/mysql
+    dual_var     - Unmount /u02/mysql + block /var, restore both to boot disk
+    single       - Unmount block /var, restore to root disk /var
 
 Options:
-  --mode <dual|single>   Force mode (auto-detected from state file if omitted)
+  --mode <triple|dual_appdata|dual_var|single>   Force mode (auto-detected from state file if omitted)
   --dry-run              Show planned actions without making changes
   --yes                  Accept defaults without prompting
   --help                 Show this help
@@ -103,7 +114,7 @@ Options:
 Examples:
   sudo bash $0
   sudo bash $0 --dry-run
-  sudo bash $0 --mode dual
+  sudo bash $0 --mode dual_appdata
 EOF
 }
 
@@ -156,16 +167,30 @@ fi
 
 if [[ -z "$SCENARIO" ]]; then
     # Auto-detect from what is currently mounted
-    if findmnt -n "$U02_MYSQL" &>/dev/null && findmnt -n "$U02_APPDATA" &>/dev/null; then
-        SCENARIO="dual"
-        sre_info "Auto-detected: dual (both /u02/mysql and /u02/appdata are mounted)"
-    elif findmnt -n /var &>/dev/null; then
+    _var_on_block=false
+    if findmnt -n /var &>/dev/null; then
         var_src=$(findmnt -n -o SOURCE /var 2>/dev/null || true)
         root_disk=$(lsblk -nd --output PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1 || echo "sda")
         if echo "$var_src" | grep -qv "$root_disk"; then
-            SCENARIO="single"
-            sre_info "Auto-detected: single (/var is on a block volume)"
+            _var_on_block=true
         fi
+    fi
+
+    _has_db=$(findmnt -n "$U02_MYSQL" &>/dev/null && echo true || echo false)
+    _has_app=$(findmnt -n "$U02_APPDATA" &>/dev/null && echo true || echo false)
+
+    if [[ "$_has_db" == "true" && "$_has_app" == "true" && "$_var_on_block" == "true" ]]; then
+        SCENARIO="triple"
+        sre_info "Auto-detected: triple (/u02/mysql + /u02/appdata + /var on block)"
+    elif [[ "$_has_db" == "true" && "$_has_app" == "true" ]]; then
+        SCENARIO="dual_appdata"
+        sre_info "Auto-detected: dual_appdata (/u02/mysql + /u02/appdata mounted)"
+    elif [[ "$_has_db" == "true" && "$_var_on_block" == "true" ]]; then
+        SCENARIO="dual_var"
+        sre_info "Auto-detected: dual_var (/u02/mysql mounted + /var on block volume)"
+    elif [[ "$_var_on_block" == "true" ]]; then
+        SCENARIO="single"
+        sre_info "Auto-detected: single (/var is on a block volume)"
     fi
 fi
 
@@ -176,8 +201,8 @@ if [[ -z "$SCENARIO" ]]; then
 fi
 
 case "$SCENARIO" in
-    dual|single) ;;
-    *) sre_error "Invalid scenario: $SCENARIO (must be: dual or single)"; exit 1 ;;
+    triple|dual_appdata|dual_var|single) ;;
+    *) sre_error "Invalid scenario: $SCENARIO (must be: triple, dual_appdata, dual_var, or single)"; exit 1 ;;
 esac
 
 ################################################################################
@@ -247,10 +272,285 @@ safe_unmount() {
 }
 
 ################################################################################
-# SCENARIO: DUAL — migrate /u02/mysql + /u02/appdata back
+# SCENARIO: TRIPLE — migrate /u02/mysql + /u02/appdata + block /var back
 ################################################################################
 
-migrate_dual() {
+migrate_triple() {
+    ############################################################################
+    # Pre-flight checks
+    ############################################################################
+
+    sre_header "Pre-flight: Space Check"
+
+    local space_ok=true
+
+    if findmnt -n "$U02_MYSQL" &>/dev/null; then
+        check_space "$U02_MYSQL" "/" "MariaDB datadir (→ /var/lib/mysql)" || space_ok=false
+    fi
+    if findmnt -n "$U02_APPDATA" &>/dev/null; then
+        check_space "$U02_APPDATA" "/" "App data (→ /var/www)" || space_ok=false
+    fi
+    check_space /var / "/var (→ root disk)" || space_ok=false
+
+    [[ "$space_ok" == "false" ]] && exit 1
+
+    echo ""
+    sre_warning "This will:"
+    sre_warning "  1. Stop MariaDB and all services"
+    sre_warning "  2. Copy /u02/mysql → /var/lib/mysql"
+    sre_warning "  3. Copy /u02/appdata → /var/www"
+    sre_warning "  4. Copy /var to temp dir on root disk"
+    sre_warning "  5. Unmount all three block volumes"
+    sre_warning "  6. Restore /var on root disk, restart services"
+    sre_warning "  7. Remove fstab entries"
+    echo ""
+    sre_warning "Block volumes will NOT be formatted — data remains until you detach."
+    echo ""
+
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        if ! prompt_yesno "Proceed with migration back to boot disk?" "no"; then
+            sre_info "Aborted by user."
+            exit 0
+        fi
+    fi
+
+    ############################################################################
+    # Phase 1: Restore MariaDB datadir
+    ############################################################################
+
+    sre_header "Phase 1: Restore MariaDB Datadir → ${MARIADB_DATADIR_DEFAULT}"
+
+    if phase_done "MARIADB_RESTORED"; then
+        sre_skipped "MariaDB already restored to boot disk"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would stop MariaDB, rsync ${U02_MYSQL} → ${MARIADB_DATADIR_DEFAULT}, update config"
+    else
+        if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
+            sre_info "Stopping MariaDB..."
+            systemctl stop "$MARIADB_SVC"
+            sre_success "MariaDB stopped"
+        fi
+
+        sre_info "Copying ${U02_MYSQL}/ → ${MARIADB_DATADIR_DEFAULT}/ ..."
+        mkdir -p "$MARIADB_DATADIR_DEFAULT"
+        rsync -aHAX --numeric-ids --delete --info=progress2 \
+            "${U02_MYSQL}/" "${MARIADB_DATADIR_DEFAULT}/"
+        sre_success "MariaDB data copied back"
+
+        chown -R mysql:mysql "$MARIADB_DATADIR_DEFAULT"
+        chmod 750 "$MARIADB_DATADIR_DEFAULT"
+
+        local mariadb_conf="/etc/mysql/mariadb.conf.d/50-server.cnf"
+        for conf_path in \
+            "/etc/mysql/mariadb.conf.d/50-server.cnf" \
+            "/etc/mysql/mysql.conf.d/mysqld.cnf" \
+            "/etc/my.cnf.d/mariadb-server.cnf" \
+            "/etc/my.cnf"; do
+            if [[ -f "$conf_path" ]]; then
+                mariadb_conf="$conf_path"
+                break
+            fi
+        done
+
+        cp "$mariadb_conf" "${mariadb_conf}.pre-revert.$(date +%Y%m%d%H%M%S)"
+        if grep -q "^datadir" "$mariadb_conf"; then
+            sed -i "s|^datadir.*|datadir = ${MARIADB_DATADIR_DEFAULT}|" "$mariadb_conf"
+        else
+            sed -i "/^\[mysqld\]/a datadir = ${MARIADB_DATADIR_DEFAULT}" "$mariadb_conf"
+        fi
+        sre_success "MariaDB config restored: datadir = ${MARIADB_DATADIR_DEFAULT}"
+
+        if [[ "$SRE_OS_FAMILY" == "debian" ]] && command -v aa-status &>/dev/null; then
+            local apparmor_local="/etc/apparmor.d/local/usr.sbin.mysqld"
+            if [[ -f "$apparmor_local" ]]; then
+                sed -i '/# sre-helpers step 00/,+2d' "$apparmor_local"
+                apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld 2>/dev/null \
+                    && sre_success "AppArmor profile reloaded" \
+                    || sre_warning "AppArmor reload failed — may need manual fix"
+            fi
+        fi
+
+        for f in /etc/mysql/mariadb.conf.d/99-sre-datadir.cnf \
+                 /etc/mysql/mysql.conf.d/99-sre-datadir.cnf \
+                 /etc/my.cnf.d/99-sre-datadir.cnf; do
+            [[ -f "$f" ]] && { rm -f "$f"; sre_success "Removed datadir override: $f"; }
+        done
+
+        mark_done "MARIADB_RESTORED"
+    fi
+
+    ############################################################################
+    # Phase 2: Restore app data
+    ############################################################################
+
+    sre_header "Phase 2: Restore App Data → /var/www"
+
+    if phase_done "APPDATA_RESTORED"; then
+        sre_skipped "App data already restored"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would rsync ${U02_APPDATA}/ → /var/www/"
+    else
+        if findmnt -n "$U02_APPDATA" &>/dev/null; then
+            mkdir -p /var/www
+            sre_info "Copying ${U02_APPDATA}/ → /var/www/ ..."
+            rsync -aHAX --numeric-ids --info=progress2 \
+                "${U02_APPDATA}/" "/var/www/"
+            sre_success "App data copied to /var/www"
+            chown -R www-data:www-data /var/www
+            sre_success "Ownership: www-data:www-data on /var/www"
+        else
+            sre_info "$U02_APPDATA not mounted — skipping app data copy"
+        fi
+        mark_done "APPDATA_RESTORED"
+    fi
+
+    ############################################################################
+    # Phase 3: Stop all services for /var migration
+    ############################################################################
+
+    sre_header "Phase 3: Stop Services"
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would stop all services"
+    else
+        for svc in "$MARIADB_SVC" php8.3-fpm php8.2-fpm php8.1-fpm nginx apache2 httpd; do
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                systemctl stop "$svc"
+                sre_success "Stopped: $svc"
+                state_set "WAS_RUNNING_${svc}" "yes"
+            fi
+        done
+    fi
+
+    ############################################################################
+    # Phase 4: Unmount /u02/mysql and /u02/appdata
+    ############################################################################
+
+    sre_header "Phase 4: Unmount DB + Appdata Volumes"
+
+    if phase_done "U02_UNMOUNTED"; then
+        sre_skipped "/u02 volumes already unmounted"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would unmount $U02_MYSQL and $U02_APPDATA"
+    else
+        remove_fstab_entry "$U02_MYSQL"
+        remove_fstab_entry "$U02_APPDATA"
+        safe_unmount "$U02_MYSQL"
+        safe_unmount "$U02_APPDATA"
+
+        for mp in "$U02_MYSQL" "$U02_APPDATA" "/u02"; do
+            if [[ -d "$mp" ]] && [[ -z "$(ls -A "$mp" 2>/dev/null)" ]]; then
+                rmdir "$mp"
+                sre_success "Removed empty dir: $mp"
+            fi
+        done
+
+        mark_done "U02_UNMOUNTED"
+    fi
+
+    ############################################################################
+    # Phase 5: Copy /var to temp on root disk
+    ############################################################################
+
+    sre_header "Phase 5: Copy /var to Root Disk"
+
+    local tmp_var="/var.boot.$$"
+
+    if phase_done "VAR_COPIED"; then
+        tmp_var=$(state_get "TMP_VAR_PATH")
+        sre_info "Using previously copied temp dir: $tmp_var"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would rsync /var → ${tmp_var} on root disk"
+    else
+        mkdir -p "$tmp_var"
+        state_set "TMP_VAR_PATH" "$tmp_var"
+        sre_info "Copying /var → $tmp_var ..."
+        rsync -aHAXx --numeric-ids --info=progress2 /var/ "$tmp_var/"
+        sre_success "Copy complete"
+        mark_done "VAR_COPIED"
+    fi
+
+    ############################################################################
+    # Phase 6: Unmount block /var
+    ############################################################################
+
+    sre_header "Phase 6: Unmount Block Volume from /var"
+
+    if phase_done "VAR_UNMOUNTED"; then
+        sre_skipped "/var already unmounted"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would unmount block /var"
+    else
+        remove_fstab_entry /var
+        sre_info "Unmounting block volume from /var..."
+        umount /var && sre_success "Unmounted block /var" || {
+            sre_error "Failed to unmount /var"
+            sre_error "Your data copy is safe at: $tmp_var"
+            exit 1
+        }
+        mark_done "VAR_UNMOUNTED"
+    fi
+
+    ############################################################################
+    # Phase 7: Restore /var on root disk
+    ############################################################################
+
+    sre_header "Phase 7: Restore /var on Root Disk"
+
+    if phase_done "VAR_RESTORED"; then
+        sre_skipped "/var already restored on root disk"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would rsync $tmp_var → /var on root disk"
+    else
+        tmp_var=$(state_get "TMP_VAR_PATH")
+        if [[ -z "$tmp_var" || ! -d "$tmp_var" ]]; then
+            sre_error "Temp dir not found. Re-run from phase 5."
+            exit 1
+        fi
+        sre_info "Restoring ${tmp_var} → /var ..."
+        rsync -aHAXx --numeric-ids --delete --info=progress2 "$tmp_var/" /var/
+        sre_success "/var restored on root disk"
+        rm -rf "$tmp_var"
+        sre_success "Temp dir removed: $tmp_var"
+        mark_done "VAR_RESTORED"
+    fi
+
+    ############################################################################
+    # Phase 8: Restart services
+    ############################################################################
+
+    sre_header "Phase 8: Restart Services"
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would start MariaDB and restart services"
+    else
+        sre_info "Starting MariaDB..."
+        systemctl start "$MARIADB_SVC"
+        sleep 3
+        if systemctl is-active --quiet "$MARIADB_SVC"; then
+            sre_success "MariaDB started successfully"
+            actual_datadir=$(mysql -NBe "SELECT @@datadir;" 2>/dev/null || true)
+            [[ -n "$actual_datadir" ]] && sre_info "Confirmed datadir: $actual_datadir"
+        else
+            sre_error "MariaDB failed to start. Check: journalctl -u ${MARIADB_SVC} -n 50"
+            exit 1
+        fi
+
+        for svc in nginx apache2 httpd php8.3-fpm php8.2-fpm php8.1-fpm; do
+            if [[ "$(state_get "WAS_RUNNING_${svc}")" == "yes" ]]; then
+                systemctl start "$svc" 2>/dev/null \
+                    && sre_success "Started: $svc" \
+                    || sre_warning "Failed to start $svc — check: journalctl -u $svc -n 30"
+            fi
+        done
+    fi
+}
+
+################################################################################
+# SCENARIO: DUAL_APPDATA — migrate /u02/mysql + /u02/appdata back
+################################################################################
+
+migrate_dual_appdata() {
     ############################################################################
     # Pre-flight checks
     ############################################################################
@@ -431,6 +731,253 @@ migrate_dual() {
 }
 
 ################################################################################
+# SCENARIO: DUAL_VAR — migrate /u02/mysql back + restore block /var
+################################################################################
+
+migrate_dual_var() {
+    ############################################################################
+    # Pre-flight checks
+    ############################################################################
+
+    sre_header "Pre-flight: Space Check"
+
+    local space_ok=true
+
+    if findmnt -n "$U02_MYSQL" &>/dev/null; then
+        check_space "$U02_MYSQL" "/" "MariaDB datadir (→ /var/lib/mysql)" || space_ok=false
+    fi
+    check_space /var / "/var (→ root disk)" || space_ok=false
+
+    [[ "$space_ok" == "false" ]] && exit 1
+
+    echo ""
+    sre_warning "This will:"
+    sre_warning "  1. Stop MariaDB and other services"
+    sre_warning "  2. Copy /u02/mysql → /var/lib/mysql"
+    sre_warning "  3. Update MariaDB config back to default datadir"
+    sre_warning "  4. Copy /var to temp dir on root disk"
+    sre_warning "  5. Unmount block /var and /u02/mysql"
+    sre_warning "  6. Restore /var and restart services"
+    sre_warning "  7. Remove fstab entries"
+    echo ""
+    sre_warning "Block volumes will NOT be formatted — data remains until you detach."
+    echo ""
+
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        if ! prompt_yesno "Proceed with migration back to boot disk?" "no"; then
+            sre_info "Aborted by user."
+            exit 0
+        fi
+    fi
+
+    ############################################################################
+    # Phase 1: Restore MariaDB datadir (same as dual_appdata)
+    ############################################################################
+
+    sre_header "Phase 1: Restore MariaDB Datadir → ${MARIADB_DATADIR_DEFAULT}"
+
+    if phase_done "MARIADB_RESTORED"; then
+        sre_skipped "MariaDB already restored to boot disk"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would stop MariaDB, rsync ${U02_MYSQL} → ${MARIADB_DATADIR_DEFAULT}, update config, restart"
+    else
+        if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
+            sre_info "Stopping MariaDB..."
+            systemctl stop "$MARIADB_SVC"
+            sre_success "MariaDB stopped"
+        fi
+
+        sre_info "Copying ${U02_MYSQL}/ → ${MARIADB_DATADIR_DEFAULT}/ ..."
+        mkdir -p "$MARIADB_DATADIR_DEFAULT"
+        rsync -aHAX --numeric-ids --delete --info=progress2 \
+            "${U02_MYSQL}/" "${MARIADB_DATADIR_DEFAULT}/"
+        sre_success "MariaDB data copied back"
+
+        chown -R mysql:mysql "$MARIADB_DATADIR_DEFAULT"
+        chmod 750 "$MARIADB_DATADIR_DEFAULT"
+        sre_success "Ownership: mysql:mysql on ${MARIADB_DATADIR_DEFAULT}"
+
+        local mariadb_conf="/etc/mysql/mariadb.conf.d/50-server.cnf"
+        for conf_path in \
+            "/etc/mysql/mariadb.conf.d/50-server.cnf" \
+            "/etc/mysql/mysql.conf.d/mysqld.cnf" \
+            "/etc/my.cnf.d/mariadb-server.cnf" \
+            "/etc/my.cnf"; do
+            if [[ -f "$conf_path" ]]; then
+                mariadb_conf="$conf_path"
+                break
+            fi
+        done
+
+        cp "$mariadb_conf" "${mariadb_conf}.pre-revert.$(date +%Y%m%d%H%M%S)"
+        if grep -q "^datadir" "$mariadb_conf"; then
+            sed -i "s|^datadir.*|datadir = ${MARIADB_DATADIR_DEFAULT}|" "$mariadb_conf"
+        else
+            sed -i "/^\[mysqld\]/a datadir = ${MARIADB_DATADIR_DEFAULT}" "$mariadb_conf"
+        fi
+        sre_success "MariaDB config restored: datadir = ${MARIADB_DATADIR_DEFAULT}"
+
+        if [[ "$SRE_OS_FAMILY" == "debian" ]] && command -v aa-status &>/dev/null; then
+            local apparmor_local="/etc/apparmor.d/local/usr.sbin.mysqld"
+            if [[ -f "$apparmor_local" ]]; then
+                sed -i '/# sre-helpers step 00/,+2d' "$apparmor_local"
+                apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld 2>/dev/null \
+                    && sre_success "AppArmor profile reloaded" \
+                    || sre_warning "AppArmor reload failed — may need manual fix"
+            fi
+        fi
+
+        # Remove sre-datadir override
+        local override_conf=""
+        for f in /etc/mysql/mariadb.conf.d/99-sre-datadir.cnf \
+                 /etc/mysql/mysql.conf.d/99-sre-datadir.cnf \
+                 /etc/my.cnf.d/99-sre-datadir.cnf; do
+            [[ -f "$f" ]] && { rm -f "$f"; sre_success "Removed datadir override: $f"; }
+        done
+
+        mark_done "MARIADB_RESTORED"
+    fi
+
+    ############################################################################
+    # Phase 2: Unmount /u02/mysql
+    ############################################################################
+
+    sre_header "Phase 2: Unmount /u02/mysql"
+
+    if phase_done "DB_VOL_UNMOUNTED"; then
+        sre_skipped "/u02/mysql already unmounted"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would unmount $U02_MYSQL and remove fstab entry"
+    else
+        remove_fstab_entry "$U02_MYSQL"
+        safe_unmount "$U02_MYSQL"
+        for mp in "$U02_MYSQL" "/u02"; do
+            if [[ -d "$mp" ]] && [[ -z "$(ls -A "$mp" 2>/dev/null)" ]]; then
+                rmdir "$mp"
+                sre_success "Removed empty dir: $mp"
+            fi
+        done
+        mark_done "DB_VOL_UNMOUNTED"
+    fi
+
+    ############################################################################
+    # Phase 3: Stop services for /var migration
+    ############################################################################
+
+    sre_header "Phase 3: Stop Services"
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would stop MariaDB, PHP-FPM, Nginx/Apache"
+    else
+        for svc in "$MARIADB_SVC" php8.3-fpm php8.2-fpm php8.1-fpm nginx apache2 httpd; do
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                systemctl stop "$svc"
+                sre_success "Stopped: $svc"
+                state_set "WAS_RUNNING_${svc}" "yes"
+            fi
+        done
+    fi
+
+    ############################################################################
+    # Phase 4: Copy /var to temp location on root disk
+    ############################################################################
+
+    sre_header "Phase 4: Copy /var to Root Disk"
+
+    local tmp_var="/var.boot.$$"
+
+    if phase_done "VAR_COPIED"; then
+        tmp_var=$(state_get "TMP_VAR_PATH")
+        sre_info "Using previously copied temp dir: $tmp_var"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would rsync /var → ${tmp_var} on root disk"
+    else
+        mkdir -p "$tmp_var"
+        state_set "TMP_VAR_PATH" "$tmp_var"
+        sre_info "Copying /var → $tmp_var ..."
+        rsync -aHAXx --numeric-ids --info=progress2 /var/ "$tmp_var/"
+        sre_success "Copy complete"
+        mark_done "VAR_COPIED"
+    fi
+
+    ############################################################################
+    # Phase 5: Unmount block /var
+    ############################################################################
+
+    sre_header "Phase 5: Unmount Block Volume from /var"
+
+    if phase_done "VAR_UNMOUNTED"; then
+        sre_skipped "/var already unmounted"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would unmount block /var"
+    else
+        remove_fstab_entry /var
+        sre_info "Unmounting block volume from /var..."
+        umount /var && sre_success "Unmounted block /var" || {
+            sre_error "Failed to unmount /var"
+            sre_error "Your data copy is safe at: $tmp_var"
+            exit 1
+        }
+        mark_done "VAR_UNMOUNTED"
+    fi
+
+    ############################################################################
+    # Phase 6: Restore /var on root disk
+    ############################################################################
+
+    sre_header "Phase 6: Restore /var on Root Disk"
+
+    if phase_done "VAR_RESTORED"; then
+        sre_skipped "/var already restored on root disk"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would rsync $tmp_var → /var on root disk"
+    else
+        tmp_var=$(state_get "TMP_VAR_PATH")
+        if [[ -z "$tmp_var" || ! -d "$tmp_var" ]]; then
+            sre_error "Temp dir not found. Re-run from phase 4."
+            exit 1
+        fi
+        sre_info "Restoring ${tmp_var} → /var ..."
+        rsync -aHAXx --numeric-ids --delete --info=progress2 "$tmp_var/" /var/
+        sre_success "/var restored on root disk"
+        rm -rf "$tmp_var"
+        sre_success "Temp dir removed: $tmp_var"
+        mark_done "VAR_RESTORED"
+    fi
+
+    ############################################################################
+    # Phase 7: Start MariaDB with restored datadir + restart services
+    ############################################################################
+
+    sre_header "Phase 7: Restart Services"
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would start MariaDB and restart previously running services"
+    else
+        # Start MariaDB first (now using /var/lib/mysql on boot disk)
+        sre_info "Starting MariaDB..."
+        systemctl start "$MARIADB_SVC"
+        sleep 3
+        if systemctl is-active --quiet "$MARIADB_SVC"; then
+            sre_success "MariaDB started successfully"
+            actual_datadir=$(mysql -NBe "SELECT @@datadir;" 2>/dev/null || true)
+            [[ -n "$actual_datadir" ]] && sre_info "Confirmed datadir: $actual_datadir"
+        else
+            sre_error "MariaDB failed to start. Check: journalctl -u ${MARIADB_SVC} -n 50"
+            exit 1
+        fi
+
+        for svc in nginx apache2 httpd php8.3-fpm php8.2-fpm php8.1-fpm; do
+            if [[ "$(state_get "WAS_RUNNING_${svc}")" == "yes" ]]; then
+                systemctl start "$svc" 2>/dev/null \
+                    && sre_success "Started: $svc" \
+                    || sre_warning "Failed to start $svc — check: journalctl -u $svc -n 30"
+            fi
+        done
+    fi
+}
+
+################################################################################
 # SCENARIO: SINGLE — migrate block /var back to root disk
 ################################################################################
 
@@ -604,8 +1151,10 @@ migrate_single() {
 ################################################################################
 
 case "$SCENARIO" in
-    dual)   migrate_dual   ;;
-    single) migrate_single ;;
+    triple)       migrate_triple       ;;
+    dual_appdata) migrate_dual_appdata ;;
+    dual_var)     migrate_dual_var     ;;
+    single)       migrate_single       ;;
 esac
 
 ################################################################################
@@ -614,44 +1163,64 @@ esac
 
 sre_header "Validation"
 
-case "$SCENARIO" in
-    dual)
-        # MariaDB
-        if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
-            sre_success "MariaDB is running"
-            actual=$(mysql -NBe "SELECT @@datadir;" 2>/dev/null || true)
-            if [[ -n "$actual" ]]; then
-                sre_info "  datadir: $actual"
-                if [[ "$actual" == "${MARIADB_DATADIR_DEFAULT}"* ]]; then
-                    sre_success "  MariaDB is using the boot disk datadir"
-                else
-                    sre_warning "  datadir is not ${MARIADB_DATADIR_DEFAULT} — check config"
-                fi
-            fi
-        else
-            sre_warning "MariaDB is not running — check: journalctl -u ${MARIADB_SVC} -n 50"
-        fi
-
-        # Volumes should be gone
-        for mp in "$U02_MYSQL" "$U02_APPDATA"; do
-            if findmnt -n "$mp" &>/dev/null; then
-                sre_warning "$mp is still mounted"
+_validate_mariadb_restored() {
+    if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
+        sre_success "MariaDB is running"
+        actual=$(mysql -NBe "SELECT @@datadir;" 2>/dev/null || true)
+        if [[ -n "$actual" ]]; then
+            sre_info "  datadir: $actual"
+            if [[ "$actual" == "${MARIADB_DATADIR_DEFAULT}"* ]]; then
+                sre_success "  MariaDB is using the boot disk datadir"
             else
-                sre_success "$mp is unmounted (OK)"
+                sre_warning "  datadir is not ${MARIADB_DATADIR_DEFAULT} — check config"
             fi
-        done
+        fi
+    else
+        sre_warning "MariaDB is not running — check: journalctl -u ${MARIADB_SVC} -n 50"
+    fi
+}
+
+_validate_unmounted() {
+    local mp="$1"
+    if findmnt -n "$mp" &>/dev/null; then
+        sre_warning "$mp is still mounted"
+    else
+        sre_success "$mp is unmounted (OK)"
+    fi
+}
+
+_validate_var_on_rootdisk() {
+    var_src=$(findmnt -n -o SOURCE /var 2>/dev/null || true)
+    if [[ -z "$var_src" ]]; then
+        sre_success "/var is on root disk (not separately mounted)"
+    else
+        sre_info "/var source: $var_src"
+    fi
+    df -h /var
+}
+
+case "$SCENARIO" in
+    triple)
+        _validate_mariadb_restored
+        _validate_unmounted "$U02_MYSQL"
+        _validate_unmounted "$U02_APPDATA"
+        _validate_var_on_rootdisk
+        ;;
+
+    dual_appdata)
+        _validate_mariadb_restored
+        _validate_unmounted "$U02_MYSQL"
+        _validate_unmounted "$U02_APPDATA"
+        ;;
+
+    dual_var)
+        _validate_mariadb_restored
+        _validate_unmounted "$U02_MYSQL"
+        _validate_var_on_rootdisk
         ;;
 
     single)
-        # /var should be on root disk
-        var_src=$(findmnt -n -o SOURCE /var 2>/dev/null || true)
-        if [[ -z "$var_src" ]]; then
-            sre_success "/var is on root disk (not separately mounted)"
-        else
-            sre_info "/var source: $var_src"
-        fi
-
-        df -h /var
+        _validate_var_on_rootdisk
         ;;
 esac
 
@@ -663,10 +1232,27 @@ sre_header "Migration to Boot Disk Complete"
 
 echo ""
 case "$SCENARIO" in
-    dual)
+    triple)
+        sre_success "All block volumes unmounted. Data is now on the boot disk."
+        sre_info "  MariaDB datadir: ${MARIADB_DATADIR_DEFAULT}"
+        sre_info "  App data:        /var/www"
+        sre_info "  /var:            on root disk"
+        echo ""
+        sre_info "Block volumes can now be safely detached from Oracle Cloud Console:"
+        sre_info "  Compute → Instances → your instance → Attached block volumes → Detach"
+        ;;
+    dual_appdata)
         sre_success "Block volumes unmounted. Data is now on the boot disk."
         sre_info "  MariaDB datadir: ${MARIADB_DATADIR_DEFAULT}"
         sre_info "  App data:        /var/www"
+        echo ""
+        sre_info "Block volumes can now be safely detached from Oracle Cloud Console:"
+        sre_info "  Compute → Instances → your instance → Attached block volumes → Detach"
+        ;;
+    dual_var)
+        sre_success "Block volumes unmounted. Data is now on the boot disk."
+        sre_info "  MariaDB datadir: ${MARIADB_DATADIR_DEFAULT}"
+        sre_info "  /var:            on root disk"
         echo ""
         sre_info "Block volumes can now be safely detached from Oracle Cloud Console:"
         sre_info "  Compute → Instances → your instance → Attached block volumes → Detach"
