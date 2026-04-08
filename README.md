@@ -1,91 +1,198 @@
 # SRE Server Provisioning Scripts
 
-Modular Bash scripts for provisioning Ubuntu/Debian and Oracle Linux/RHEL servers. Each script handles one task, detects server specs for adaptive tuning, and recommends the next step.
+Modular Bash scripts for provisioning Ubuntu 22.04/24.04 and Oracle Linux 8/9 servers.
+Each script handles one task, detects server specs for adaptive tuning, and guides you to the next step.
 
-Supports **LAMP** and **LEMP** stacks serving **Laravel**, **Moodle**, **Nuxt**, and **Vue** projects.
+Supports **LAMP** and **LEMP** stacks for **Laravel**, **Moodle**, **Nuxt**, and **Vue** projects.
 
-## Quick Start
+---
+
+## Requirements
+
+- Root or sudo access
+- Ubuntu 22.04/24.04 LTS **or** Oracle Linux 8/9
+- Bash 4+
+
+---
+
+## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/sre-scripts.git /opt/sre-scripts
+git clone https://github.com/e7trafy/sre-scripts.git /opt/sre-scripts
 cd /opt/sre-scripts
-chmod +x common/lib.sh server/*.sh stack/*.sh tuning/*.sh vhost/*.sh ssl/*.sh
-
-sudo bash server/01-base-setup.sh
-# Follow the "NEXT STEP" recommendation after each script
+chmod +x common/lib.sh server/*.sh stack/*.sh tuning/*.sh vhost/*.sh migrate/*.sh ssl/*.sh
 ```
 
-## Script Sequence
+---
 
-| Step | Script | Purpose |
-|------|--------|---------|
-| 1 | `server/01-base-setup.sh` | Detect specs, choose stack, install essentials, harden SSH |
-| 2 | `server/02-firewall.sh` | Configure ufw or firewalld |
-| 3 | `stack/03-web-server.sh` | Install Nginx or Apache |
-| 4 | `stack/04-php.sh` | Install PHP-FPM + extensions |
-| 5 | `stack/05-database.sh` | Install MySQL/MariaDB/PostgreSQL |
-| 6 | `stack/06-node.sh` | Install Node.js + PM2 + Composer |
-| 7 | `tuning/07-tune.sh` | Auto-tune based on server specs |
-| 8 | `vhost/08-vhost.sh` | Create virtual host for a project |
-| 9 | `ssl/09-ssl.sh` | Obtain Let's Encrypt SSL certificate |
+## Step Sequence
 
-## Adding a Project
+| Step | Script | Purpose | Required |
+|------|--------|---------|----------|
+| 1 | `server/01-base-setup.sh` | Detect specs, choose LAMP/LEMP, PHP version, DB engine, SSH hardening | Yes |
+| 2 | `server/02-firewall.sh` | Configure ufw (Ubuntu) or firewalld (Oracle Linux) | Yes |
+| 3 | `stack/03-web-server.sh` | Install Nginx or Apache with secure defaults | Yes |
+| 4 | `stack/04-php.sh` | Install PHP-FPM + 15 extensions | Yes |
+| 5 | `stack/05-database.sh` | Install MariaDB / MySQL / PostgreSQL | If using DB |
+| 6 | `stack/06-node.sh` | Install Node.js + PM2 + Composer | If using Node/PHP |
+| 7 | `tuning/07-tune.sh` | Auto-tune PHP-FPM, Nginx/Apache, DB based on server specs | Yes |
+| 8 | `vhost/08-vhost.sh` | Create virtual host for a project | Per project |
+| 9 | `server/09-ssh-keys.sh` | Generate / import / copy SSH keys | Optional |
+| 10 | `migrate/10-migrate-cpanel.sh` | Migrate files + DB from a cPanel/WHM server | Optional |
+| 11 | `ssl/11-ssl.sh` | Obtain Let's Encrypt SSL certificate | Per project |
+
+Each script prints a full step map at the end showing your progress and the recommended next step.
+
+---
+
+## Fresh Server Setup (Full Stack)
 
 ```bash
-sudo bash vhost/08-vhost.sh --domain app.example.com --type laravel
-sudo bash ssl/09-ssl.sh --domain app.example.com --email admin@example.com
+cd /opt/sre-scripts
+
+sudo bash server/01-base-setup.sh       # Step 1 — base setup
+sudo bash server/02-firewall.sh         # Step 2 — firewall
+sudo bash stack/03-web-server.sh        # Step 3 — web server
+sudo bash stack/04-php.sh               # Step 4 — PHP
+sudo bash stack/05-database.sh          # Step 5 — database
+sudo bash stack/06-node.sh              # Step 6 — Node.js + Composer
+sudo bash tuning/07-tune.sh             # Step 7 — tune
 ```
 
-Project types: `laravel`, `moodle`, `nuxt`, `vue`
+---
 
-## Re-running a Step
-
-All scripts are idempotent. After a RAM upgrade:
+## Adding a Project (Virtual Host + SSL)
 
 ```bash
-sudo bash tuning/07-tune.sh   # Recalculates and applies new values
+sudo bash vhost/08-vhost.sh             # Step 8 — prompted for domain, type, PHP version
+sudo bash ssl/11-ssl.sh                 # Step 11 — SSL for the domain
 ```
+
+**Project types:** `laravel` `moodle` `nuxt` `vue`
+
+---
+
+## SSH Key Setup (Optional — Run Before Migration)
+
+```bash
+sudo bash server/09-ssh-keys.sh
+```
+
+Modes (prompted interactively):
+- **generate** — create a new ed25519 or RSA key pair
+- **import** — paste an existing private key
+- **copy** — push your public key to a remote server (`ssh-copy-id`)
+- **show** — display current public keys
+- **list** — list all keys on this server
+
+---
+
+## Migrate from cPanel / WHM (Optional)
+
+```bash
+sudo bash migrate/10-migrate-cpanel.sh
+```
+
+Prompts for:
+- Source server host, SSH port, SSH user
+- Domain to migrate
+- Migration mode: `full` (files + DB), `rsync-only`, `db-only`
+- rsync exclusion: `smart-exclude` (skip cache/logs), `transfer-all`, `custom-exclude`
+- Source DB name, user, and password
+- Local DB name and user to create
+
+**Features:**
+- Saves state per domain to `/etc/sre-helpers/migrations/<domain>.conf` — safe to re-run
+- POSIX ACL permissions (`setfacl`) for proper `www-data` ownership
+- Post-migration setup (composer install, cache warm-up) is optional
+
+**Prerequisite:** SSH key must be copied to source server first:
+```bash
+ssh-copy-id -p <port> <user>@<source-host>
+# Then verify:
+ssh -p <port> <user>@<source-host> "echo connected"
+```
+
+---
+
+## SSL Certificate
+
+```bash
+sudo bash ssl/11-ssl.sh
+```
+
+Prompts for domain and email. Uses Certbot with the Nginx or Apache plugin (auto-detected from config).
+
+---
 
 ## Common Flags
 
 All scripts support:
 
-```
---dry-run   Preview actions without making changes
---yes       Accept defaults without prompting
---help      Show usage
---config    Override config path (default: /etc/sre-helpers/setup.conf)
-```
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Preview actions without making any changes |
+| `--yes` | Accept all defaults, no prompts |
+| `--help` | Show usage |
+| `--config <path>` | Override config file (default: `/etc/sre-helpers/setup.conf`) |
+
+---
 
 ## Spec-Driven Tuning
 
-Tuning values are calculated from your server's hardware, not hard-coded:
+Tuning values are calculated from your hardware — not hard-coded:
 
-| Server | PHP-FPM Workers | Nginx Connections | DB Buffer Pool |
-|--------|----------------|-------------------|----------------|
-| 2 CPU / 2GB RAM | 40 | 512 | 512MB |
-| 4 CPU / 8GB RAM | 160 | 1024 | 2048MB |
-| 8 CPU / 16GB RAM | 200 | 1024 | 4096MB |
+| RAM | PHP-FPM Workers | DB Buffer Pool |
+|-----|----------------|----------------|
+| 2 GB | 40 | 512 MB |
+| 4 GB | 80 | 1 GB |
+| 8 GB | 160 | 2 GB |
+| 16 GB | 200 (max) | 4 GB |
 
-## Supported OS
+Nginx workers = number of CPU cores. Re-run step 7 any time after a RAM/CPU upgrade.
 
-- Ubuntu 22.04 / 24.04 LTS
-- Oracle Linux 8 / 9
+---
+
+## Config File
+
+All choices and detected values are saved to `/etc/sre-helpers/setup.conf`:
+
+```ini
+WEB_SERVER=nginx
+PHP_VERSION=8.3
+DB_ENGINE=mariadb
+NODE_VERSION=20
+CPU_CORES=4
+RAM_MB=8192
+DISK_TYPE=ssd
+```
+
+This file is sourced by every script. Backups are saved to `/etc/sre-helpers/backups/` before each change.
+
+---
 
 ## Structure
 
 ```
-common/lib.sh          # Shared library (logging, OS detection, config I/O)
-server/                # Base setup and firewall
-stack/                 # Package installers (web server, PHP, DB, Node)
-tuning/                # Performance tuning calculator
-vhost/                 # Virtual host creation + templates
-ssl/                   # SSL certificate management
+common/lib.sh          # Shared library: logging, OS detection, config, prompts
+server/                # 01-base-setup, 02-firewall, 09-ssh-keys
+stack/                 # 03-web-server, 04-php, 05-database, 06-node
+tuning/                # 07-tune
+vhost/                 # 08-vhost + templates/
+migrate/               # 10-migrate-cpanel
+ssl/                   # 11-ssl
 ```
 
-## Config
+---
 
-All choices and detected specs are saved to `/etc/sre-helpers/setup.conf`. This file is human-readable, editable, and sourced by all scripts. Config backups go to `/etc/sre-helpers/backups/`.
+## Supported OS
+
+| OS | Versions |
+|----|---------|
+| Ubuntu | 22.04, 24.04 LTS |
+| Oracle Linux / RHEL | 8, 9 |
+
+---
 
 ## License
 
