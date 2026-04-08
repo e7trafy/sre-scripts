@@ -29,6 +29,7 @@ chmod +x common/lib.sh server/*.sh stack/*.sh tuning/*.sh vhost/*.sh migrate/*.s
 
 | Step | Script | Purpose | Required |
 |------|--------|---------|----------|
+| 0 | `server/00-block-volume.sh` | Mount Oracle block volume as `/var` | Optional |
 | 1 | `server/01-base-setup.sh` | Detect specs, choose LAMP/LEMP, PHP version, DB engine, SSH hardening | Yes |
 | 2 | `server/02-firewall.sh` | Configure ufw (Ubuntu) or firewalld (Oracle Linux) | Yes |
 | 3 | `stack/03-web-server.sh` | Install Nginx or Apache with secure defaults | Yes |
@@ -45,10 +46,47 @@ Each script prints a full step map at the end showing your progress and the reco
 
 ---
 
+## Oracle Block Volume Setup (Optional — Step 0)
+
+Run this **before step 1** if you want to mount an Oracle block volume as `/var` (recommended for production — keeps web files, logs, and DB data on a separate, resizable volume).
+
+```bash
+# 1. Attach the volume in Oracle Cloud Console first:
+#    Compute → Instances → your instance → Attach block volume
+
+# 2. Then run:
+sudo bash server/00-block-volume.sh
+```
+
+**Handles three scenarios automatically:**
+
+| Scenario | What happens |
+|---|---|
+| Fresh volume (no filesystem) | Formats with ext4, mounts at `/var` |
+| `/var` has existing data | Formats volume, migrates all `/var` data to it, remounts |
+| Already mounted at `/var` | Detects and skips — nothing to do |
+
+**Safety:**
+- Default confirmation is **No** — will not proceed without explicit yes
+- `--dry-run` shows full plan without touching anything
+- Uses UUID in `/etc/fstab` (not device path — safer on Oracle Cloud)
+- Backs up `/etc/fstab` before modifying
+
+**After running:**
+```bash
+sudo reboot
+df -h /var   # confirm mount survived reboot
+```
+
+---
+
 ## Fresh Server Setup (Full Stack)
 
 ```bash
 cd /opt/sre-scripts
+
+# Optional: mount block volume first (Oracle Cloud)
+sudo bash server/00-block-volume.sh     # Step 0
 
 sudo bash server/01-base-setup.sh       # Step 1 — base setup
 sudo bash server/02-firewall.sh         # Step 2 — firewall
@@ -70,9 +108,22 @@ sudo bash ssl/11-ssl.sh                 # Step 11 — SSL for the domain
 
 **Project types:** `laravel` `moodle` `nuxt` `vue`
 
+**Document roots by type:**
+
+| Type | Web Root |
+|------|----------|
+| Laravel | `/var/www/{domain}/current/public` |
+| Moodle | `/var/www/{domain}/public_html` |
+| Nuxt | `/var/www/{domain}/current` |
+| Vue | `/var/www/{domain}/current/dist` |
+
+**Moodle note:** moodledata is stored outside the web root at `/var/www/{domain}/moodledata`.
+
 ---
 
-## SSH Key Setup (Optional — Run Before Migration)
+## SSH Key Setup (Optional — Step 9)
+
+Run before migration to enable passwordless SSH to source servers.
 
 ```bash
 sudo bash server/09-ssh-keys.sh
@@ -87,7 +138,7 @@ Modes (prompted interactively):
 
 ---
 
-## Migrate from cPanel / WHM (Optional)
+## Migrate from cPanel / WHM (Optional — Step 10)
 
 ```bash
 sudo bash migrate/10-migrate-cpanel.sh
@@ -103,8 +154,15 @@ Prompts for:
 
 **Features:**
 - Saves state per domain to `/etc/sre-helpers/migrations/<domain>.conf` — safe to re-run
-- POSIX ACL permissions (`setfacl`) for proper `www-data` ownership
+- Ownership fixed to `www-data` immediately after rsync (source UIDs replaced)
+- POSIX ACL permissions (`setfacl`) applied during post-migration setup
 - Post-migration setup (composer install, cache warm-up) is optional
+
+**Moodle migration extras:**
+- Prompts separately for moodledata path on source (auto-detected from `config.php`)
+- Syncs web root and moodledata in separate rsync passes
+- Writes correct `config.php` with `mysqli`/`pgsql` dbtype, detected table prefix
+- Updates `wwwroot` in the Moodle database to match new domain
 
 **Prerequisite:** SSH key must be copied to source server first:
 ```bash
@@ -115,7 +173,7 @@ ssh -p <port> <user>@<source-host> "echo connected"
 
 ---
 
-## SSL Certificate
+## SSL Certificate (Step 11)
 
 ```bash
 sudo bash ssl/11-ssl.sh
@@ -175,7 +233,7 @@ This file is sourced by every script. Backups are saved to `/etc/sre-helpers/bac
 
 ```
 common/lib.sh          # Shared library: logging, OS detection, config, prompts
-server/                # 01-base-setup, 02-firewall, 09-ssh-keys
+server/                # 00-block-volume, 01-base-setup, 02-firewall, 09-ssh-keys
 stack/                 # 03-web-server, 04-php, 05-database, 06-node
 tuning/                # 07-tune
 vhost/                 # 08-vhost + templates/
