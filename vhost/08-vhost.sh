@@ -96,7 +96,7 @@ esac
 if [[ -z "$VHOST_ROOT" ]]; then
     case "$VHOST_TYPE" in
         laravel) VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current/public" ;;
-        moodle)  VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current" ;;
+        moodle)  VHOST_ROOT="/var/www/${VHOST_DOMAIN}/public_html" ;;
         nuxt)    VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current" ;;
         vue)     VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current/dist" ;;
     esac
