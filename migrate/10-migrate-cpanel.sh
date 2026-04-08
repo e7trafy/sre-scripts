@@ -17,6 +17,7 @@ MIG_SOURCE_USER=""
 MIG_SOURCE_PORT="22"
 MIG_SOURCE_PATH=""
 MIG_SOURCE_MOODLEDATA=""   # Moodle only: moodledata path on source server
+MIG_MOODLEDATA_DIR=""      # Moodle only: resolved local moodledata destination
 MIG_DOMAIN=""
 MIG_PROJECT_TYPE=""
 MIG_DB_NAME=""
@@ -90,6 +91,7 @@ MIG_SOURCE_USER="${MIG_SOURCE_USER}"
 MIG_SOURCE_PORT="${MIG_SOURCE_PORT}"
 MIG_SOURCE_PATH="${MIG_SOURCE_PATH}"
 MIG_SOURCE_MOODLEDATA="${MIG_SOURCE_MOODLEDATA}"
+MIG_MOODLEDATA_DIR="${moodledata_dir:-}"
 MIG_SOURCE_DB_NAME="${MIG_SOURCE_DB_NAME}"
 MIG_SOURCE_DB_USER="${MIG_SOURCE_DB_USER}"
 MIG_SOURCE_DB_PASS="${MIG_SOURCE_DB_PASS}"
@@ -292,8 +294,24 @@ case "$MIG_PROJECT_TYPE" in
     vue)     local_root="/var/www/${MIG_DOMAIN}/current/dist" ;;
 esac
 
-# Moodle: moodledata must live OUTSIDE the web root
+# Moodle: moodledata must live OUTSIDE the web root.
+# Priority:
+#   1. Value saved from a previous run (MIG_MOODLEDATA_DIR in state file)
+#   2. Dedicated app data block volume /u02/appdata if mounted (step 00)
+#   3. Default: /var/www/{domain}/moodledata
 moodledata_dir="/var/www/${MIG_DOMAIN}/moodledata"
+if [[ "$MIG_PROJECT_TYPE" == "moodle" ]]; then
+    if [[ -n "$MIG_MOODLEDATA_DIR" ]]; then
+        # Re-run: use previously resolved path
+        moodledata_dir="$MIG_MOODLEDATA_DIR"
+        sre_info "Using saved moodledata path: $moodledata_dir"
+    elif findmnt -n "/u02/appdata" &>/dev/null; then
+        moodledata_dir="/u02/appdata/moodledata"
+        sre_success "App data volume detected (/u02/appdata) — moodledata will use: $moodledata_dir"
+    else
+        sre_info "No app data volume mounted — moodledata will use: $moodledata_dir"
+    fi
+fi
 
 sre_info "Local root: $local_root"
 [[ "$MIG_PROJECT_TYPE" == "moodle" ]] && sre_info "Moodledata: $moodledata_dir"
