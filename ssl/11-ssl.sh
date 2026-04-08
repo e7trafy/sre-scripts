@@ -154,14 +154,39 @@ fi
 
 sre_header "Obtaining SSL Certificate"
 
-# Use a dedicated webroot dir for ACME challenges (never inside app root).
-# The vhost templates already include a location block pointing here.
-acme_webroot="/var/www/letsencrypt"
+# Ensure .well-known/acme-challenge is accessible for webroot validation.
+# We temporarily add a location block if using nginx and the vhost doesn't
+# already have it — but the simplest approach is standalone mode if port 80
+# is free, or webroot if the server is running.
+#
+# Strategy: try webroot first (server stays up), fall back to standalone.
+
+acme_webroot="${doc_root}"
 
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
 
-    # Ensure the dedicated webroot exists and is served
+    # Ensure webroot exists for ACME challenge
     mkdir -p "${acme_webroot}/.well-known/acme-challenge"
+    case "$web_server" in
+        nginx)
+            # Add temporary acme-challenge location if not present
+            if ! grep -q 'well-known' "$vhost_conf"; then
+                sed -i '/server_name/a\    location ^~ /.well-known/acme-challenge/ { root '"${acme_webroot}"'; }' "$vhost_conf"
+                svc_reload nginx 2>/dev/null || true
+                _added_acme_location=true
+            fi
+            ;;
+        apache)
+            if ! grep -qi 'well-known' "$vhost_conf"; then
+                sed -i "/<\/VirtualHost>/i\\    Alias /.well-known/acme-challenge/ \"${acme_webroot}/.well-known/acme-challenge/\"" "$vhost_conf"
+                case "$os_family" in
+                    debian) svc_reload apache2 2>/dev/null || true ;;
+                    rhel)   svc_reload httpd   2>/dev/null || true ;;
+                esac
+                _added_acme_location=true
+            fi
+            ;;
+    esac
 
     certbot_args=(
         "certonly"
@@ -263,12 +288,10 @@ case "$web_server" in
             sre_warning "Template for $vhost_type not found, falling back to laravel template"
         fi
 
-        # Extract inner lines: strip outer server{} wrapper, listen 80,
-        # and the acme-challenge block (HTTPS block doesn't need it)
+        # Extract inner lines: strip outer server{} wrapper + listen 80 lines
         existing_inner=$(sed -n '/^server {/,/^}$/p' "$template_file" \
             | sed '1d;$d' \
             | grep -v 'listen 80\|listen \[::\]:80' \
-            | sed '/well-known/,/}/d' \
             | sed "s|{DOMAIN}|${SSL_DOMAIN}|g" \
             | sed "s|{DOCUMENT_ROOT}|${doc_root}|g" \
             | sed "s|{PHP_VERSION}|${php_version}|g")
@@ -301,19 +324,16 @@ server {
     ssl_certificate     ${cert_pem};
     ssl_certificate_key ${cert_key};
 
+    # Modern SSL settings
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256;
     ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
     ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
     ssl_session_tickets off;
 
-    # Security headers
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    # HSTS (6 months)
+    add_header Strict-Transport-Security "max-age=15768000" always;
 
 ${existing_inner}
 }
