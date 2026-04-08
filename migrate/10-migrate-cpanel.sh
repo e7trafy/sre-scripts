@@ -16,6 +16,7 @@ MIG_SOURCE_HOST=""
 MIG_SOURCE_USER=""
 MIG_SOURCE_PORT="22"
 MIG_SOURCE_PATH=""
+MIG_SOURCE_MOODLEDATA=""   # Moodle only: moodledata path on source server
 MIG_DOMAIN=""
 MIG_PROJECT_TYPE=""
 MIG_DB_NAME=""
@@ -88,6 +89,7 @@ MIG_SOURCE_HOST="${MIG_SOURCE_HOST}"
 MIG_SOURCE_USER="${MIG_SOURCE_USER}"
 MIG_SOURCE_PORT="${MIG_SOURCE_PORT}"
 MIG_SOURCE_PATH="${MIG_SOURCE_PATH}"
+MIG_SOURCE_MOODLEDATA="${MIG_SOURCE_MOODLEDATA}"
 MIG_SOURCE_DB_NAME="${MIG_SOURCE_DB_NAME}"
 MIG_SOURCE_DB_USER="${MIG_SOURCE_DB_USER}"
 MIG_SOURCE_DB_PASS="${MIG_SOURCE_DB_PASS}"
@@ -246,8 +248,21 @@ fi
 MIG_SOURCE_PORT=$(prompt_input "SSH port on source server" "$MIG_SOURCE_PORT")
 
 if [[ -z "$MIG_SOURCE_PATH" ]] || [[ "$saved_state_exists" == "true" && -z "${_raw_args[*]}" ]]; then
-    MIG_SOURCE_PATH=$(prompt_input "Project root on source server" "$MIG_SOURCE_PATH")
+    MIG_SOURCE_PATH=$(prompt_input "Project root on source server (Moodle: web root e.g. /home/user/public_html/moodle)" "$MIG_SOURCE_PATH")
     [[ -z "$MIG_SOURCE_PATH" ]] && { sre_error "Source path is required."; exit 1; }
+fi
+
+# Moodle: ask for moodledata path on source (often outside web root)
+if [[ "$MIG_PROJECT_TYPE" == "moodle" ]] && [[ "$do_rsync" == "true" ]]; then
+    if [[ -z "$MIG_SOURCE_MOODLEDATA" ]]; then
+        # Try to auto-detect from source config.php
+        sre_info "Detecting moodledata path from source config.php..."
+        detected_moodledata=$(ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+            "grep -oP \"\\\\\\\$CFG->dataroot\s*=\s*['\\\"]?\K[^'\\\";\s]+\" ${MIG_SOURCE_PATH}/config.php 2>/dev/null" || true)
+        [[ -n "$detected_moodledata" ]] && sre_success "Detected moodledata: $detected_moodledata"
+        MIG_SOURCE_MOODLEDATA=$(prompt_input "Moodledata path on SOURCE server" "${detected_moodledata:-/home/$(echo "$MIG_SOURCE_USER")/moodledata}")
+    fi
+    sre_info "Source moodledata: $MIG_SOURCE_MOODLEDATA"
 fi
 
 sre_info "Source: ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_PORT}"
@@ -272,12 +287,16 @@ fi
 
 case "$MIG_PROJECT_TYPE" in
     laravel) local_root="/var/www/${MIG_DOMAIN}/current" ;;
-    moodle)  local_root="/var/www/${MIG_DOMAIN}/current" ;;
+    moodle)  local_root="/var/www/${MIG_DOMAIN}/public_html" ;;
     nuxt)    local_root="/var/www/${MIG_DOMAIN}/current" ;;
     vue)     local_root="/var/www/${MIG_DOMAIN}/current/dist" ;;
 esac
 
+# Moodle: moodledata must live OUTSIDE the web root
+moodledata_dir="/var/www/${MIG_DOMAIN}/moodledata"
+
 sre_info "Local root: $local_root"
+[[ "$MIG_PROJECT_TYPE" == "moodle" ]] && sre_info "Moodledata: $moodledata_dir"
 
 ################################################################################
 # Database credentials (only if doing DB migration)
@@ -402,9 +421,23 @@ if [[ "$do_rsync" == "true" ]]; then
             "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_PATH}/" \
             "${local_root}/"
 
-        sre_success "Files synced successfully"
+        sre_success "Files synced to: $local_root"
+
+        # Moodle: also sync moodledata (separate from web root)
+        if [[ "$MIG_PROJECT_TYPE" == "moodle" ]] && [[ -n "$MIG_SOURCE_MOODLEDATA" ]]; then
+            sre_header "Syncing Moodledata from Source"
+            sre_info "From: ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_MOODLEDATA}/"
+            sre_info "To:   ${moodledata_dir}/"
+            mkdir -p "$moodledata_dir"
+            rsync -avz --progress \
+                -e "ssh -p ${MIG_SOURCE_PORT}" \
+                "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_MOODLEDATA}/" \
+                "${moodledata_dir}/"
+            sre_success "Moodledata synced to: $moodledata_dir"
+        fi
     else
-        sre_info "[DRY-RUN] Would rsync files"
+        sre_info "[DRY-RUN] Would rsync files to $local_root"
+        [[ "$MIG_PROJECT_TYPE" == "moodle" ]] && sre_info "[DRY-RUN] Would rsync moodledata to $moodledata_dir"
     fi
 else
     sre_skipped "File sync (mode: $MIG_MODE)"
@@ -655,25 +688,35 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         moodle)
             sre_info "Configuring Moodle..."
 
-            [[ -f "${local_root}/config.php" ]] && backup_config "${local_root}/config.php"
-
-            moodledata_dir="/var/www/${MIG_DOMAIN}/moodledata"
             mkdir -p "$moodledata_dir"
 
-            if [[ "$needs_db" == "true" ]]; then
-                cat > "${local_root}/config.php" <<MOODLE_CONFIG
+            # Detect table prefix from source config if available
+            source_prefix=$(ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+                "grep -oP \"\\\\\$CFG->prefix\s*=\s*['\\\"]?\K[^'\\\";\s]+\" ${MIG_SOURCE_PATH}/config.php 2>/dev/null" || true)
+            moodle_prefix="${source_prefix:-mdl_}"
+
+            [[ -f "${local_root}/config.php" ]] && cp "${local_root}/config.php" "${local_root}/config.php.bak"
+
+            # Determine dbtype for config.php (mariadb -> mysqli, postgresql -> pgsql)
+            case "$db_engine" in
+                mariadb|mysql) moodle_dbtype="mysqli" ;;
+                postgresql)    moodle_dbtype="pgsql" ;;
+                *)             moodle_dbtype="mysqli" ;;
+            esac
+
+            cat > "${local_root}/config.php" <<MOODLE_CONFIG
 <?php
 unset(\$CFG);
 global \$CFG;
 \$CFG = new stdClass();
 
-\$CFG->dbtype    = '${db_engine}';
+\$CFG->dbtype    = '${moodle_dbtype}';
 \$CFG->dblibrary = 'native';
 \$CFG->dbhost    = 'localhost';
 \$CFG->dbname    = '${MIG_DB_NAME}';
 \$CFG->dbuser    = '${MIG_DB_USER}';
 \$CFG->dbpass    = '${MIG_DB_PASS}';
-\$CFG->prefix    = 'mdl_';
+\$CFG->prefix    = '${moodle_prefix}';
 
 \$CFG->wwwroot   = 'http://${MIG_DOMAIN}';
 \$CFG->dataroot  = '${moodledata_dir}';
@@ -683,24 +726,17 @@ global \$CFG;
 
 require_once(__DIR__ . '/lib/setup.php');
 MOODLE_CONFIG
-                sre_success "Moodle config.php created"
-            fi
+            sre_success "Moodle config.php written (dbtype: $moodle_dbtype, prefix: $moodle_prefix)"
+            sre_info "  wwwroot:  http://${MIG_DOMAIN}"
+            sre_info "  dataroot: ${moodledata_dir}"
 
-            # Sync moodledata from source
-            sre_info "Checking for moodledata on source..."
-            source_moodledata=$(ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
-                "grep -oP \"dataroot\\s*=\\s*['\\\"]?\\K[^'\\\";\s]+\" ${MIG_SOURCE_PATH}/config.php 2>/dev/null" || true)
-
-            if [[ -n "$source_moodledata" ]]; then
-                if prompt_yesno "Sync moodledata from source ($source_moodledata)?" "yes"; then
-                    rsync -avz --progress \
-                        -e "ssh -p ${MIG_SOURCE_PORT}" \
-                        "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${source_moodledata}/" \
-                        "${moodledata_dir}/"
-                    sre_success "Moodledata synced"
-                fi
-            else
-                sre_warning "Could not detect moodledata path. Sync manually if needed."
+            # Update wwwroot in database to match new domain
+            if [[ "$needs_db" == "true" ]]; then
+                sre_info "Updating wwwroot in Moodle database..."
+                $mysql_cmd "$MIG_DB_NAME" -e \
+                    "UPDATE \`${moodle_prefix}config\` SET value='http://${MIG_DOMAIN}' WHERE name='wwwroot';" 2>/dev/null \
+                    && sre_success "DB wwwroot updated to http://${MIG_DOMAIN}" \
+                    || sre_warning "Could not update wwwroot in DB (may need manual update)"
             fi
             ;;
 
@@ -781,7 +817,6 @@ MOODLE_CONFIG
             ;;
 
         moodle)
-            moodledata_dir="/var/www/${MIG_DOMAIN}/moodledata"
             if [[ -d "$moodledata_dir" ]]; then
                 chmod -R 775 "$moodledata_dir"
                 setfacl -R -m u:www-data:rwX "$moodledata_dir"
