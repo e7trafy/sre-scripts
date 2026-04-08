@@ -435,6 +435,11 @@ if [[ "$do_rsync" == "true" ]]; then
                 "${moodledata_dir}/"
             sre_success "Moodledata synced to: $moodledata_dir"
         fi
+
+        # Always fix ownership immediately after rsync — source UIDs won't exist on this server
+        sre_info "Fixing file ownership (source UIDs replaced with www-data)..."
+        chown -R www-data:www-data "/var/www/${MIG_DOMAIN}"
+        sre_success "Ownership set: www-data:www-data on /var/www/${MIG_DOMAIN}"
     else
         sre_info "[DRY-RUN] Would rsync files to $local_root"
         [[ "$MIG_PROJECT_TYPE" == "moodle" ]] && sre_info "[DRY-RUN] Would rsync moodledata to $moodledata_dir"
