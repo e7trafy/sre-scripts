@@ -160,11 +160,12 @@ dev_uuid()      { blkid -s UUID -o value "$1" 2>/dev/null || true; }
 # Safety: identify root disk and all its partitions
 ################################################################################
 
-ROOT_DISK=$(lsblk -nd --output PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1 || true)
-# Fallback: derive from / mount source
+root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+ROOT_DISK=$(lsblk -nd --output PKNAME "$root_src" 2>/dev/null | tr -d ' ' | head -1 || true)
+# Fallback: strip trailing partition suffix (sda1→sda, nvme0n1p1→nvme0n1, vda2→vda)
 if [[ -z "$ROOT_DISK" ]]; then
-    root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
-    ROOT_DISK=$(lsblk -nd --output NAME "$root_src" 2>/dev/null | head -1 || true)
+    root_name=$(lsblk -nd --output NAME "$root_src" 2>/dev/null | head -1 | tr -d ' ' || true)
+    ROOT_DISK=$(echo "$root_name" | sed 's/p\?[0-9]\+$//')
 fi
 ROOT_DISK="${ROOT_DISK:-sda}"
 sre_info "Root disk identified as: /dev/${ROOT_DISK}"
@@ -174,8 +175,16 @@ is_root_disk() {
     local dev="$1"
     local name
     name=$(basename "$dev")
-    # Matches root disk itself and any partition of it (sda, sda1, sda2...)
-    [[ "$name" == "$ROOT_DISK" || "$name" == "${ROOT_DISK}p"* || "$name" == "${ROOT_DISK}[0-9]"* ]]
+    # Match root disk itself
+    [[ "$name" == "$ROOT_DISK" ]] && return 0
+    # Match partitions: sda1, sda2, nvme0n1p1, nvme0n1p2, vda1, etc.
+    [[ "$name" == "${ROOT_DISK}p"[0-9]* ]] && return 0
+    [[ "$name" == "${ROOT_DISK}[0-9]"* ]] && return 0
+    # Double-check via lsblk PKNAME (most reliable)
+    local parent
+    parent=$(lsblk -nd --output PKNAME "/dev/${name}" 2>/dev/null | tr -d ' ' || true)
+    [[ "$parent" == "$ROOT_DISK" ]] && return 0
+    return 1
 }
 
 ################################################################################

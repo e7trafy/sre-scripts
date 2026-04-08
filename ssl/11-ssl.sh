@@ -17,7 +17,7 @@ sre_show_help() {
     cat <<EOF
 Usage: sudo bash $0 [OPTIONS]
 
-Step 9: SSL Certificate Setup
+Step 11: SSL Certificate Setup
   Obtains a Let's Encrypt certificate via Certbot for a domain
   and configures the web server for HTTPS with HTTP-to-HTTPS redirect.
 
@@ -139,33 +139,37 @@ fi
 sre_header "Obtaining SSL Certificate"
 
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
-    certbot_cmd=""
-    case "$web_server" in
-        nginx)
-            certbot_cmd="certbot --nginx -d ${SSL_DOMAIN} --non-interactive --agree-tos --email ${SSL_EMAIL} --redirect"
-            ;;
-        apache)
-            certbot_cmd="certbot --apache -d ${SSL_DOMAIN} --non-interactive --agree-tos --email ${SSL_EMAIL} --redirect"
-            ;;
-    esac
+    certbot_args=(
+        "--${web_server}"
+        "-d" "$SSL_DOMAIN"
+        "--non-interactive"
+        "--agree-tos"
+        "--email" "$SSL_EMAIL"
+        "--redirect"
+    )
 
-    sre_info "Running: $certbot_cmd"
-    if eval "$certbot_cmd"; then
+    sre_info "Running: certbot ${certbot_args[*]}"
+    if certbot "${certbot_args[@]}"; then
         sre_success "SSL certificate obtained and configured for $SSL_DOMAIN"
     else
         sre_error "Certbot failed. Check DNS records and ensure port 80 is accessible."
-        sre_error "You can retry manually: $certbot_cmd"
+        sre_error "Retry manually: certbot ${certbot_args[*]}"
         exit 1
     fi
 
-    # Verify auto-renewal timer
-    if systemctl list-timers | grep -q certbot; then
-        sre_success "Certbot auto-renewal timer is active"
+    # Enable auto-renewal timer (name differs by distro)
+    renewal_enabled=false
+    for timer_name in certbot-renew.timer certbot.timer snap.certbot.renew.timer; do
+        if systemctl list-unit-files "$timer_name" &>/dev/null 2>&1; then
+            systemctl enable --now "$timer_name" 2>/dev/null && renewal_enabled=true && break
+        fi
+    done
+    if [[ "$renewal_enabled" == "true" ]]; then
+        sre_success "Auto-renewal timer enabled"
     else
-        sre_info "Setting up auto-renewal..."
-        systemctl enable --now certbot-renew.timer 2>/dev/null || \
-        systemctl enable --now certbot.timer 2>/dev/null || \
-        sre_warning "Could not enable auto-renewal timer. Add a cron job: 0 0 * * * certbot renew --quiet"
+        sre_warning "Could not enable auto-renewal timer — adding cron fallback..."
+        (crontab -l 2>/dev/null | grep -v "certbot renew"; echo "0 3 * * * certbot renew --quiet") | crontab -
+        sre_success "Auto-renewal cron added: daily at 03:00"
     fi
 else
     sre_info "[DRY-RUN] Would run: certbot --${web_server} -d ${SSL_DOMAIN} --non-interactive --agree-tos --email ${SSL_EMAIL} --redirect"

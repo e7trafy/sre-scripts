@@ -132,13 +132,13 @@ if [[ -n "$php_version" ]]; then
     if [[ -f "$pool_conf" ]]; then
         if [[ "$SRE_DRY_RUN" != "true" ]]; then
             backup_config "$pool_conf"
-            sed -i "s/^pm.max_children\s*=.*/pm.max_children = $fpm_max_children/" "$pool_conf"
-            sed -i "s/^pm.start_servers\s*=.*/pm.start_servers = $fpm_start_servers/" "$pool_conf"
-            sed -i "s/^pm.min_spare_servers\s*=.*/pm.min_spare_servers = $fpm_min_spare/" "$pool_conf"
-            sed -i "s/^pm.max_spare_servers\s*=.*/pm.max_spare_servers = $fpm_max_spare/" "$pool_conf"
+            sed -i "s/^[;]*\s*pm\.max_children\s*=.*/pm.max_children = $fpm_max_children/" "$pool_conf"
+            sed -i "s/^[;]*\s*pm\.start_servers\s*=.*/pm.start_servers = $fpm_start_servers/" "$pool_conf"
+            sed -i "s/^[;]*\s*pm\.min_spare_servers\s*=.*/pm.min_spare_servers = $fpm_min_spare/" "$pool_conf"
+            sed -i "s/^[;]*\s*pm\.max_spare_servers\s*=.*/pm.max_spare_servers = $fpm_max_spare/" "$pool_conf"
 
             # Ensure dynamic PM mode
-            sed -i "s/^pm\s*=.*/pm = dynamic/" "$pool_conf"
+            sed -i "s/^[;]*\s*pm\s*=.*/pm = dynamic/" "$pool_conf"
 
             sre_success "PHP-FPM pool tuned: $pool_conf"
         else
@@ -233,6 +233,8 @@ if [[ "$db_engine" != "none" && "$db_engine" != "" ]]; then
                 mkdir -p "$(dirname "$my_cnf")"
             fi
 
+            # Note: datadir is intentionally NOT set here.
+            # It is managed by 99-sre-datadir.cnf (step 00) to avoid conflicts.
             db_config="[mysqld]
 innodb_buffer_pool_size = ${db_buffer_pool}M
 max_connections = $db_max_connections

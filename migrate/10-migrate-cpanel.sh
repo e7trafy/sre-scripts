@@ -529,35 +529,31 @@ if [[ "$needs_db" == "true" ]]; then
                 sre_success "mysqldump found at: $mysqldump_path"
 
                 sre_info "Dumping database from source (errors shown live)..."
-                # Write a remote script with credentials via a my.cnf defaults file
-                # to avoid ALL shell escaping issues with special chars in passwords
+                # Stream a self-contained shell script into bash via SSH stdin.
+                # Credentials are passed only through the SSH-encrypted channel —
+                # nothing is written to the remote filesystem.
                 dump_err_file="/tmp/mysqldump_err_$$.txt"
-                remote_cnf="/tmp/.my_dump_$$.cnf"
-                remote_script="/tmp/do_dump_$$.sh"
-
-                # Upload a temp my.cnf with credentials (no shell escaping needed)
-                ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
-                    "cat > '$remote_cnf'" <<EOF
-[client]
-user=${MIG_SOURCE_DB_USER}
-password=${MIG_SOURCE_DB_PASS}
-EOF
-
-                # Upload a dump script that uses the cnf file
-                ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
-                    "cat > '$remote_script'" <<SCRIPT
-#!/bin/bash
-mysqldump --defaults-extra-file='$remote_cnf' \
-    '${MIG_SOURCE_DB_NAME}' --single-transaction --quick
-rc=\$?
-rm -f '$remote_cnf'
-exit \$rc
-SCRIPT
 
                 set +e
                 ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
-                    "bash '$remote_script'; rm -f '$remote_script'" \
-                    > "$dump_file" 2>"$dump_err_file"
+                    "bash -s" <<REMOTE_DUMP > "$dump_file" 2>"$dump_err_file"
+#!/bin/bash
+# Write a per-process my.cnf into a private tmpdir only readable by this user
+_tmpdir=\$(mktemp -d)
+_cnf="\${_tmpdir}/.my.cnf"
+chmod 700 "\${_tmpdir}"
+cat > "\${_cnf}" <<CNF
+[client]
+user=${MIG_SOURCE_DB_USER}
+password=${MIG_SOURCE_DB_PASS}
+CNF
+chmod 600 "\${_cnf}"
+mysqldump --defaults-extra-file="\${_cnf}" \
+    '${MIG_SOURCE_DB_NAME}' --single-transaction --quick
+rc=\$?
+rm -rf "\${_tmpdir}"
+exit \$rc
+REMOTE_DUMP
                 dump_rc=$?
                 set -e
 

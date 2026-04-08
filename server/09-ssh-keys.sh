@@ -89,11 +89,14 @@ if [[ -z "$SSH_USER" ]]; then
     SSH_USER=$(prompt_input "Local user for SSH key" "root")
 fi
 
-# Determine home directory for the user
-user_home=$(eval echo "~${SSH_USER}" 2>/dev/null)
-if [[ "$SSH_USER" == "www-data" ]]; then
-    user_home="/var/www"
+# Determine home directory for the user (getent is reliable, eval is not)
+user_home=$(getent passwd "$SSH_USER" 2>/dev/null | cut -d: -f6 || true)
+if [[ -z "$user_home" ]]; then
+    # Fallback for users not in /etc/passwd (e.g. LDAP) or www-data with non-standard home
+    user_home=$(eval echo "~${SSH_USER}" 2>/dev/null || echo "/root")
 fi
+# www-data on Debian/Ubuntu has home /var/www but .ssh should still be there
+[[ "$SSH_USER" == "www-data" && "$user_home" == "/var/www" ]] && user_home="/var/www"
 
 ssh_dir="${user_home}/.ssh"
 sre_info "User: $SSH_USER"

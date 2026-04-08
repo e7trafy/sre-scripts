@@ -162,22 +162,21 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
     # Security settings
     sed -i 's/^expose_php\s*=.*/expose_php = Off/' "$php_ini"
 
-    # Disable dangerous functions
-    # NOTE: Some of these may need to be re-enabled for specific applications
-    # (e.g., Laravel Horizon uses proc_open, Composer uses exec)
-    sed -i 's/^disable_functions\s*=.*/disable_functions = exec,passthru,shell_exec,system,proc_open,popen/' "$php_ini"
+    # Disable dangerous functions — keep exec/proc_open/popen for Laravel, Composer, Horizon
+    # Only block functions with no legitimate use in web apps
+    sed -i 's/^[;]*\s*disable_functions\s*=.*/disable_functions = passthru,shell_exec,system/' "$php_ini"
 
-    # Upload and memory limits
-    sed -i 's/^upload_max_filesize\s*=.*/upload_max_filesize = 64M/' "$php_ini"
-    sed -i 's/^post_max_size\s*=.*/post_max_size = 64M/' "$php_ini"
-    sed -i 's/^memory_limit\s*=.*/memory_limit = 256M/' "$php_ini"
-    sed -i 's/^max_execution_time\s*=.*/max_execution_time = 300/' "$php_ini"
+    # Upload and memory limits — sed handles both active and commented lines
+    sed -i 's/^[;]*\s*upload_max_filesize\s*=.*/upload_max_filesize = 64M/' "$php_ini"
+    sed -i 's/^[;]*\s*post_max_size\s*=.*/post_max_size = 64M/' "$php_ini"
+    sed -i 's/^[;]*\s*memory_limit\s*=.*/memory_limit = 256M/' "$php_ini"
+    sed -i 's/^[;]*\s*max_execution_time\s*=.*/max_execution_time = 300/' "$php_ini"
 
     sre_success "php.ini configured with secure defaults"
 else
     sre_info "[DRY-RUN] Would configure $php_ini:"
     sre_info "  expose_php = Off"
-    sre_info "  disable_functions = exec,passthru,shell_exec,system,proc_open,popen"
+    sre_info "  disable_functions = passthru,shell_exec,system"
     sre_info "  upload_max_filesize = 64M"
     sre_info "  post_max_size = 64M"
     sre_info "  memory_limit = 256M"

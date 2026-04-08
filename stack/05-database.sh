@@ -113,9 +113,12 @@ if [[ "$SRE_DB_ENGINE" == "mariadb" || "$SRE_DB_ENGINE" == "mysql" ]]; then
         sre_info "Setting root password and removing insecure defaults..."
 
         # Set root password and secure the installation
+        # Use UPDATE on mysql.user for compatibility with fresh MariaDB installs
+        # where unix_socket auth is default and ALTER USER may not work
         mysql -u root <<-EOSQL
-			-- Set root password
-			ALTER USER 'root'@'localhost' IDENTIFIED BY '${DB_ROOT_PASS}';
+			-- Set root password (works on both MariaDB and MySQL fresh installs)
+			UPDATE mysql.user SET Password=PASSWORD('${DB_ROOT_PASS}'), plugin='mysql_native_password'
+			    WHERE User='root';
 
 			-- Remove anonymous users
 			DELETE FROM mysql.user WHERE User='';

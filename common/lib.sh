@@ -183,7 +183,7 @@ config_get() {
     local default="${2:-}"
     if [[ -f "$SRE_CONFIG_FILE" ]]; then
         local val
-        val=$(grep -m1 "^${key}=" "$SRE_CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '"' || true)
+        val=$(grep -m1 "^${key}=" "$SRE_CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | sed 's/^"\(.*\)"$/\1/' || true)
         if [[ -n "$val" ]]; then
             echo "$val"
             return 0
@@ -196,13 +196,11 @@ config_set() {
     local key="$1"
     local value="$2"
     config_init
+    # Use a python-safe temp approach: remove key then append, avoids sed delimiter issues with slashes
     if grep -q "^${key}=" "$SRE_CONFIG_FILE" 2>/dev/null; then
-        # Update existing key (in-place)
-        sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$SRE_CONFIG_FILE"
-    else
-        # Append new key
-        echo "${key}=\"${value}\"" >> "$SRE_CONFIG_FILE"
+        sed -i "/^${key}=/d" "$SRE_CONFIG_FILE"
     fi
+    printf '%s="%s"\n' "$key" "$value" >> "$SRE_CONFIG_FILE"
 }
 
 ################################################################################
