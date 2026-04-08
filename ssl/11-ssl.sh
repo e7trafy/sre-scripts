@@ -280,12 +280,21 @@ case "$web_server" in
 
         sre_info "Detected vhost type: $vhost_type"
 
-        # Read the existing server block content (everything inside the braces)
-        # and reuse it for the HTTPS block — preserving all location/PHP config
-        existing_inner=""
-        existing_inner=$(sed -n '/^server {/,/^}$/p' "$vhost_conf" \
+        # Re-read inner content from the original template (clean, no injected bits)
+        # so we avoid re-parsing a potentially modified vhost file.
+        template_file="${SCRIPT_DIR}/vhost/templates/nginx-${vhost_type}.conf"
+        if [[ ! -f "$template_file" ]]; then
+            template_file="${SCRIPT_DIR}/vhost/templates/nginx-laravel.conf"
+            sre_warning "Template for $vhost_type not found, falling back to laravel template"
+        fi
+
+        # Extract inner lines: strip outer server{} wrapper + listen 80 lines
+        existing_inner=$(sed -n '/^server {/,/^}$/p' "$template_file" \
             | sed '1d;$d' \
-            | grep -v 'listen 80\|listen \[::\]:80\|well-known\|acme-challenge')
+            | grep -v 'listen 80\|listen \[::\]:80' \
+            | sed "s|{DOMAIN}|${SSL_DOMAIN}|g" \
+            | sed "s|{DOCUMENT_ROOT}|${doc_root}|g" \
+            | sed "s|{PHP_VERSION}|${php_version}|g")
 
         if [[ "$SRE_DRY_RUN" != "true" ]]; then
             cat > "$vhost_conf" <<NGINX_CONF
@@ -353,11 +362,17 @@ NGINX_CONF
             # Enable required modules
             a2enmod ssl rewrite headers 2>/dev/null || true
 
-            # Read existing VirtualHost inner content (port 80 block)
-            existing_inner=""
-            existing_inner=$(sed -n '/<VirtualHost/,/<\/VirtualHost>/p' "$vhost_conf" \
+            # Read inner content from original template (clean, no injected bits)
+            apache_type="laravel"
+            grep -qi 'moodle\|pluginfile' "$vhost_conf" 2>/dev/null && apache_type="moodle"
+            apache_template="${SCRIPT_DIR}/vhost/templates/apache-${apache_type}.conf"
+            [[ ! -f "$apache_template" ]] && apache_template="${SCRIPT_DIR}/vhost/templates/apache-laravel.conf"
+
+            existing_inner=$(sed -n '/<VirtualHost/,/<\/VirtualHost>/p' "$apache_template" \
                 | sed '1d;$d' \
-                | grep -v 'well-known\|acme-challenge')
+                | sed "s|{DOMAIN}|${SSL_DOMAIN}|g" \
+                | sed "s|{DOCUMENT_ROOT}|${doc_root}|g" \
+                | sed "s|{PHP_VERSION}|${php_version}|g")
 
             cat > "$vhost_conf" <<APACHE_CONF
 # HTTP → HTTPS redirect
