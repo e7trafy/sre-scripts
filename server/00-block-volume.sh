@@ -463,52 +463,120 @@ setup_dual() {
     mount_volume "$app_part" "$U02_APPDATA" "u02_appdata"
 
     ############################################################################
-    # Phase 3: Move MariaDB datadir
+    # Phase 3: Configure MariaDB datadir on block volume
+    # Two sub-cases:
+    #   A) MariaDB NOT yet installed → pre-create dir + drop config override
+    #      so the installer writes directly to /u02/mysql (no migration needed)
+    #   B) MariaDB already installed → stop, rsync, update config, restart
     ############################################################################
 
-    sre_header "Phase 3: Move MariaDB Datadir → ${U02_MYSQL}"
+    sre_header "Phase 3: Configure MariaDB Datadir → ${U02_MYSQL}"
 
     if phase_done "MARIADB_MOVED"; then
-        sre_skipped "MariaDB datadir already moved"
-    else
-        if [[ "$SRE_DRY_RUN" == "true" ]]; then
-            sre_info "[DRY-RUN] Would move MariaDB datadir to ${U02_MYSQL}"
+        sre_skipped "MariaDB datadir already configured on block volume"
+    elif [[ "$SRE_DRY_RUN" == "true" ]]; then
+        if command -v mysqld &>/dev/null || command -v mariadbd &>/dev/null \
+                || systemctl list-unit-files "${MARIADB_SVC}.service" &>/dev/null 2>&1; then
+            sre_info "[DRY-RUN] MariaDB IS installed — would stop, rsync datadir, update config, restart"
         else
-            mariadb_is_running=false
-            if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
-                mariadb_is_running=true
+            sre_info "[DRY-RUN] MariaDB NOT installed — would pre-create ${U02_MYSQL} and drop config override"
+            sre_info "[DRY-RUN] When step 5 installs MariaDB it will write directly to ${U02_MYSQL}"
+        fi
+    else
+        mariadb_installed=false
+        if command -v mysqld &>/dev/null || command -v mariadbd &>/dev/null; then
+            mariadb_installed=true
+        elif systemctl list-unit-files "${MARIADB_SVC}.service" &>/dev/null 2>&1; then
+            mariadb_installed=true
+        fi
+
+        # ── Config override drop dir (works for both pre-install and post-install) ──
+        # We always write the config snippet. For pre-install, the installer reads it.
+        # For post-install, it takes effect after restart.
+        local override_dir=""
+        for conf_dir in \
+            "/etc/mysql/mariadb.conf.d" \
+            "/etc/mysql/mysql.conf.d" \
+            "/etc/my.cnf.d"; do
+            if [[ -d "$conf_dir" ]]; then
+                override_dir="$conf_dir"
+                break
+            fi
+        done
+
+        # If no conf dir exists yet (MariaDB not installed), create a staging path.
+        # step 5 installs MariaDB after this, at which point the dir will exist.
+        # We write to /etc/mysql/mariadb.conf.d proactively — the installer creates
+        # /etc/mysql so we just need to ensure the subdir exists.
+        if [[ -z "$override_dir" ]]; then
+            override_dir="/etc/mysql/mariadb.conf.d"
+            mkdir -p "$override_dir"
+            sre_info "Created conf dir (MariaDB not yet installed): $override_dir"
+        fi
+
+        local override_conf="${override_dir}/99-sre-datadir.cnf"
+
+        if [[ ! -f "$override_conf" ]]; then
+            cat > "$override_conf" <<DBCONF
+# sre-helpers step 00 — datadir on block volume
+# Written before MariaDB install so the installer uses /u02/mysql directly.
+[mysqld]
+datadir = ${U02_MYSQL}
+DBCONF
+            sre_success "Wrote datadir override: $override_conf"
+            _log "INFO" "wrote mariadb override conf=${override_conf} datadir=${U02_MYSQL}"
+        else
+            sre_skipped "Datadir override already exists: $override_conf"
+        fi
+
+        if [[ "$mariadb_installed" == "false" ]]; then
+            # ── Case A: MariaDB not installed ──────────────────────────────────
+            sre_info "MariaDB is NOT installed yet."
+            sre_info "Pre-creating ${U02_MYSQL} with correct ownership for installer..."
+
+            # mysql user may not exist yet — create it if missing
+            if ! id mysql &>/dev/null; then
+                useradd --system --no-create-home --shell /usr/sbin/nologin mysql 2>/dev/null \
+                    && sre_success "Created system user: mysql" \
+                    || sre_info "mysql user already exists"
             fi
 
-            # Stop MariaDB before touching datadir
-            if [[ "$mariadb_is_running" == "true" ]]; then
+            mkdir -p "${U02_MYSQL}"
+            chown mysql:mysql "${U02_MYSQL}"
+            chmod 750 "${U02_MYSQL}"
+            sre_success "Pre-created ${U02_MYSQL} (mysql:mysql 750)"
+            sre_success "MariaDB installer (step 5) will write directly to ${U02_MYSQL} — no migration needed"
+            _log "INFO" "pre-created empty datadir for installer"
+
+        else
+            # ── Case B: MariaDB already installed ─────────────────────────────
+            sre_info "MariaDB IS installed — migrating existing datadir..."
+
+            # Stop MariaDB
+            if systemctl is-active --quiet "$MARIADB_SVC" 2>/dev/null; then
                 sre_info "Stopping MariaDB..."
                 systemctl stop "$MARIADB_SVC"
                 sre_success "MariaDB stopped"
-            else
-                sre_info "MariaDB is not running — skipping stop"
             fi
 
-            # Copy existing datadir to new location
-            if [[ -d "$MARIADB_DATADIR_DEFAULT" ]]; then
+            # Rsync existing datadir to block volume
+            if [[ -d "$MARIADB_DATADIR_DEFAULT" ]] && \
+               [[ -n "$(ls -A "$MARIADB_DATADIR_DEFAULT" 2>/dev/null)" ]]; then
                 sre_info "Copying ${MARIADB_DATADIR_DEFAULT} → ${U02_MYSQL} ..."
                 rsync -aHAX --numeric-ids --info=progress2 \
                     "${MARIADB_DATADIR_DEFAULT}/" "${U02_MYSQL}/"
-                sre_success "MariaDB data copied"
+                sre_success "MariaDB data copied to block volume"
                 _log "INFO" "mariadb data copied to ${U02_MYSQL}"
             else
-                sre_info "No existing MariaDB datadir at ${MARIADB_DATADIR_DEFAULT} — initializing empty"
-                mkdir -p "${U02_MYSQL}"
+                sre_info "Default datadir empty or missing — nothing to copy"
             fi
 
-            # Fix ownership
             chown -R mysql:mysql "${U02_MYSQL}"
             chmod 750 "${U02_MYSQL}"
-            sre_success "Ownership set: mysql:mysql on ${U02_MYSQL}"
+            sre_success "Ownership: mysql:mysql on ${U02_MYSQL}"
 
-            # Update MariaDB config
-            sre_info "Updating MariaDB datadir config..."
-            local mariadb_conf="/etc/mysql/mariadb.conf.d/50-server.cnf"
-            # Fallback paths
+            # Update main config file as well (belt and suspenders alongside override)
+            local mariadb_conf=""
             for conf_path in \
                 "/etc/mysql/mariadb.conf.d/50-server.cnf" \
                 "/etc/mysql/mysql.conf.d/mysqld.cnf" \
@@ -520,55 +588,48 @@ setup_dual() {
                 fi
             done
 
-            sre_info "Updating: $mariadb_conf"
-            cp "$mariadb_conf" "${mariadb_conf}.bak.$(date +%Y%m%d%H%M%S)"
-
-            if grep -q "^datadir" "$mariadb_conf"; then
-                sed -i "s|^datadir.*|datadir = ${U02_MYSQL}|" "$mariadb_conf"
-            else
-                # Insert after [mysqld] section header
-                sed -i "/^\[mysqld\]/a datadir = ${U02_MYSQL}" "$mariadb_conf"
+            if [[ -n "$mariadb_conf" ]]; then
+                cp "$mariadb_conf" "${mariadb_conf}.bak.$(date +%Y%m%d%H%M%S)"
+                if grep -q "^datadir" "$mariadb_conf"; then
+                    sed -i "s|^datadir.*|datadir = ${U02_MYSQL}|" "$mariadb_conf"
+                else
+                    sed -i "/^\[mysqld\]/a datadir = ${U02_MYSQL}" "$mariadb_conf"
+                fi
+                sre_success "Updated: $mariadb_conf"
             fi
-            sre_success "MariaDB config updated: datadir = ${U02_MYSQL}"
-            _log "INFO" "mariadb config updated conf=${mariadb_conf}"
 
             # Handle AppArmor (Debian/Ubuntu)
             if [[ "$SRE_OS_FAMILY" == "debian" ]] && command -v aa-status &>/dev/null; then
-                apparmor_local="/etc/apparmor.d/local/usr.sbin.mysqld"
-                if [[ -f "$apparmor_local" ]] || [[ -d /etc/apparmor.d/local ]]; then
-                    sre_info "Configuring AppArmor for new datadir..."
-                    mkdir -p /etc/apparmor.d/local
-                    # Remove old sre entry if present
-                    sed -i '/# sre-helpers/d' "$apparmor_local" 2>/dev/null || true
-                    cat >> "$apparmor_local" <<AAEOF
+                local apparmor_local="/etc/apparmor.d/local/usr.sbin.mysqld"
+                mkdir -p /etc/apparmor.d/local
+                touch "$apparmor_local"
+                sed -i '/# sre-helpers/d' "$apparmor_local" 2>/dev/null || true
+                cat >> "$apparmor_local" <<AAEOF
 # sre-helpers step 00
 ${U02_MYSQL}/ r,
 ${U02_MYSQL}/** rwk,
 AAEOF
-                    apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld 2>/dev/null \
-                        && sre_success "AppArmor profile reloaded" \
-                        || sre_warning "AppArmor reload failed — may need manual fix"
-                else
-                    sre_info "AppArmor local override not found — skipping"
-                fi
+                apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld 2>/dev/null \
+                    && sre_success "AppArmor profile reloaded" \
+                    || sre_warning "AppArmor reload failed — check manually"
             fi
 
-            # Start MariaDB and verify
+            # Start and verify
             sre_info "Starting MariaDB..."
             systemctl start "$MARIADB_SVC"
             sleep 3
 
             if systemctl is-active --quiet "$MARIADB_SVC"; then
-                sre_success "MariaDB started successfully with new datadir"
-                _log "INFO" "mariadb started ok"
+                sre_success "MariaDB started successfully with block volume datadir"
+                _log "INFO" "mariadb started ok datadir=${U02_MYSQL}"
             else
                 sre_error "MariaDB failed to start. Check: journalctl -u ${MARIADB_SVC} -n 50"
-                sre_error "Manual rollback: restore $mariadb_conf.bak.* and restart"
+                sre_error "Rollback: restore config backup and restart"
                 exit 1
             fi
-
-            mark_done "MARIADB_MOVED"
         fi
+
+        mark_done "MARIADB_MOVED"
     fi
 
     ############################################################################
