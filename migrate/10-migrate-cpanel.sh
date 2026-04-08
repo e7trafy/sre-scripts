@@ -832,6 +832,14 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
     chown -R www-data:www-data "$project_dir"
     sre_success "Ownership: www-data:www-data on $project_dir"
 
+    # Fix moodledata/appdata ownership (may be outside project_dir, e.g. /u02/appdata)
+    if [[ -n "${moodledata_dir:-}" ]] && [[ -d "$moodledata_dir" ]] \
+            && [[ "$moodledata_dir" != "$project_dir"* ]]; then
+        sre_info "Fixing ownership on external moodledata: $moodledata_dir"
+        chown -R www-data:www-data "$moodledata_dir"
+        sre_success "Ownership: www-data:www-data on $moodledata_dir"
+    fi
+
     # ── Base permissions ──────────────────────────────────────────────────────
     find "$project_dir" -type d -exec chmod 755 {} \;
     find "$project_dir" -type f -exec chmod 644 {} \;
