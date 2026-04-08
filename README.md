@@ -80,6 +80,34 @@ df -h /var   # confirm mount survived reboot
 
 ---
 
+## Migrate Block Storage Back to Boot Disk (Optional)
+
+Reverses step 00. Moves all data from block volumes back to the boot disk so volumes can be detached or replaced.
+
+```bash
+sudo bash server/00-block-to-boot.sh
+```
+
+Auto-detects the previous scenario from the state file left by step 00.
+
+**What it does:**
+
+| Scenario | Actions |
+|---|---|
+| dual | Stop MariaDB → rsync `/u02/mysql` → `/var/lib/mysql` → restore config → restart MariaDB → rsync `/u02/appdata` → `/var/www` → unmount + remove fstab entries |
+| single | Stop services → rsync `/var` to temp on root disk → unmount block `/var` → move temp → `/var` → restart services → remove fstab entry |
+
+**Safety:**
+- Checks available space on boot disk before starting — refuses if not enough
+- Data on block volumes is **never erased** — only unmounted after boot copy is verified
+- Idempotent: state file at `/etc/sre-helpers/block-to-boot.state` — safe to re-run after interruption
+- `--dry-run` shows full plan without touching anything
+
+**After running:** detach volumes from Oracle Cloud Console:
+> Compute → Instances → your instance → Attached block volumes → Detach
+
+---
+
 ## Fresh Server Setup (Full Stack)
 
 ```bash
@@ -233,7 +261,7 @@ This file is sourced by every script. Backups are saved to `/etc/sre-helpers/bac
 
 ```
 common/lib.sh          # Shared library: logging, OS detection, config, prompts
-server/                # 00-block-volume, 01-base-setup, 02-firewall, 09-ssh-keys
+server/                # 00-block-volume, 00-block-to-boot, 01-base-setup, 02-firewall, 09-ssh-keys
 stack/                 # 03-web-server, 04-php, 05-database, 06-node
 tuning/                # 07-tune
 vhost/                 # 08-vhost + templates/
