@@ -544,6 +544,7 @@ require_step() {
 SRE_SCRIPTS_DIR="${SRE_SCRIPTS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 declare -A STEP_REGISTRY=(
+    [0]="server/00-block-volume.sh"
     [1]="server/01-base-setup.sh"
     [2]="server/02-firewall.sh"
     [3]="stack/03-web-server.sh"
@@ -558,6 +559,7 @@ declare -A STEP_REGISTRY=(
 )
 
 declare -A STEP_NAMES=(
+    [0]="Block Volume Mount (Oracle)"
     [1]="Base Setup"
     [2]="Firewall"
     [3]="Web Server"
@@ -576,14 +578,14 @@ _is_step_skipped() {
     case "$step" in
         5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" ]] && return 0 ;;
         6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
-        9|10) return 0 ;; # SSH keys and migration are optional
+        0|9|10) return 0 ;; # block volume, SSH keys and migration are optional
     esac
     return 1
 }
 
 _is_step_optional() {
     local step="$1"
-    [[ "$step" == "9" || "$step" == "10" ]] && return 0
+    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" ]] && return 0
     return 1
 }
 
