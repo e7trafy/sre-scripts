@@ -306,7 +306,7 @@ if [[ "$MIG_PROJECT_TYPE" == "moodle" ]]; then
         moodledata_dir="$MIG_MOODLEDATA_DIR"
         sre_info "Using saved moodledata path: $moodledata_dir"
     elif findmnt -n "/u02/appdata" &>/dev/null; then
-        moodledata_dir="/u02/appdata/moodledata"
+        moodledata_dir="/u02/appdata/${MIG_DOMAIN}/moodledata"
         sre_success "App data volume detected (/u02/appdata) — moodledata will use: $moodledata_dir"
     else
         sre_info "No app data volume mounted — moodledata will use: $moodledata_dir"
