@@ -79,6 +79,7 @@ case "$web_server" in
         nginx_security_content=$(cat <<'NGINX_EOF'
 # SRE Helpers - Nginx security defaults
 server_tokens off;
+client_max_body_size 256M;
 
 add_header X-Content-Type-Options "nosniff" always;
 add_header X-Frame-Options "SAMEORIGIN" always;

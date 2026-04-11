@@ -102,6 +102,31 @@ case "$SRE_DB_ENGINE" in
         ;;
 esac
 
+# --- Set UTF-8 (utf8mb4) as default charset (MariaDB/MySQL) ---
+if [[ "$SRE_DB_ENGINE" == "mariadb" || "$SRE_DB_ENGINE" == "mysql" ]]; then
+    sre_header "Configuring UTF-8 (utf8mb4) Defaults"
+
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        cnf_dir="/etc/mysql/conf.d"
+        [[ "$SRE_OS_FAMILY" == "rhel" ]] && cnf_dir="/etc/my.cnf.d"
+        mkdir -p "$cnf_dir"
+
+        cat > "${cnf_dir}/utf8mb4.cnf" <<'EOCNF'
+[mysqld]
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+
+[client]
+default-character-set = utf8mb4
+EOCNF
+
+        svc_restart "$(get_db_svc "$SRE_DB_ENGINE")"
+        sre_success "Default charset set to utf8mb4 (full Arabic/Unicode support)"
+    else
+        sre_info "[DRY-RUN] Would configure utf8mb4 as default charset"
+    fi
+fi
+
 # --- Secure installation (MariaDB/MySQL only) ---
 if [[ "$SRE_DB_ENGINE" == "mariadb" || "$SRE_DB_ENGINE" == "mysql" ]]; then
     sre_header "Securing $SRE_DB_ENGINE Installation"

@@ -820,10 +820,7 @@ sre_header "Fix Permissions"
 
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
 
-    if ! command -v setfacl &>/dev/null; then
-        sre_info "Installing ACL utilities..."
-        pkg_install acl
-    fi
+    require_acl
 
     project_dir="/var/www/${MIG_DOMAIN}"
 
@@ -899,6 +896,15 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 setfacl -R -m d:u:www-data:rwX "$moodledata_dir"
                 setfacl -R -m g:www-data:rwX "$moodledata_dir"
                 setfacl -R -m d:g:www-data:rwX "$moodledata_dir"
+
+                # Warn if block storage may not support ACLs
+                mount_point=$(df "$moodledata_dir" --output=target 2>/dev/null | tail -1)
+                if [[ -n "$mount_point" && "$mount_point" != "/" ]]; then
+                    if ! mount | grep "$mount_point" | grep -q "acl"; then
+                        sre_warning "Block storage at $mount_point may need 'acl' mount option in /etc/fstab"
+                    fi
+                fi
+
                 sre_success "Moodledata ($moodledata_dir): 775, ACL rwX"
             fi
 

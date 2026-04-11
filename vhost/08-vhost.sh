@@ -172,6 +172,62 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
     # Create document root if it doesn't exist
     mkdir -p "$VHOST_ROOT" 2>/dev/null || true
 
+    # --- Set FACL permissions on project and data directories ---
+    sre_info "Setting filesystem ACLs for www-data access..."
+
+    require_acl
+
+    project_base="/var/www/${VHOST_DOMAIN}"
+
+    # Set ownership
+    chown -R www-data:www-data "$project_base"
+
+    # Default ACL: www-data gets rwx on all new files/dirs automatically
+    setfacl -R -m u:www-data:rwX "$project_base"
+    setfacl -R -d -m u:www-data:rwX "$project_base"
+
+    # For Moodle: set ACL on moodledata (may be on external block storage)
+    if [[ "$VHOST_TYPE" == "moodle" ]]; then
+        default_moodledata="/var/www/${VHOST_DOMAIN}/moodledata"
+        moodledata=$(prompt_input "Moodledata path (may be on block storage)" "$default_moodledata")
+
+        mkdir -p "$moodledata"
+        chown -R www-data:www-data "$moodledata"
+        setfacl -R -m u:www-data:rwX "$moodledata"
+        setfacl -R -d -m u:www-data:rwX "$moodledata"
+        chmod 2770 "$moodledata"
+
+        # Ensure the filesystem supports ACLs (block storage may need acl mount option)
+        mount_point=$(df "$moodledata" --output=target 2>/dev/null | tail -1)
+        if [[ -n "$mount_point" && "$mount_point" != "/" ]]; then
+            if ! mount | grep "$mount_point" | grep -q "acl"; then
+                sre_warning "Block storage at $mount_point may need 'acl' mount option"
+                sre_warning "Add 'acl' to mount options in /etc/fstab if ACLs don't persist after reboot"
+            fi
+        fi
+
+        sre_success "FACL set on moodledata: $moodledata"
+    fi
+
+    # For Laravel: ensure storage and cache dirs have proper ACLs
+    if [[ "$VHOST_TYPE" == "laravel" ]]; then
+        for subdir in storage bootstrap/cache; do
+            target="${project_base}/current/${subdir}"
+            if [[ -d "$target" ]]; then
+                setfacl -R -m u:www-data:rwX "$target"
+                setfacl -R -d -m u:www-data:rwX "$target"
+            fi
+        done
+        # Also set on shared storage (symlinked)
+        shared_storage="${project_base}/shared/storage"
+        if [[ -d "$shared_storage" ]]; then
+            setfacl -R -m u:www-data:rwX "$shared_storage"
+            setfacl -R -d -m u:www-data:rwX "$shared_storage"
+        fi
+    fi
+
+    sre_success "FACL permissions configured on $project_base"
+
     echo "$vhost_content" > "$vhost_dest"
     sre_success "Written vhost config: $vhost_dest"
 
@@ -213,6 +269,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             ;;
     esac
 else
+    sre_info "[DRY-RUN] Would set FACL on /var/www/${VHOST_DOMAIN} (www-data:rwX + default ACL)"
+    [[ "$VHOST_TYPE" == "moodle" ]] && sre_info "[DRY-RUN] Would set FACL on moodledata (prompted path, may be external block storage)"
+    [[ "$VHOST_TYPE" == "laravel" ]] && sre_info "[DRY-RUN] Would set FACL on storage + bootstrap/cache"
     sre_info "[DRY-RUN] Would write vhost config to: $vhost_dest"
     sre_info "[DRY-RUN] Template content preview:"
     echo "$vhost_content" | head -5

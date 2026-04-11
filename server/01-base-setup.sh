@@ -98,15 +98,41 @@ pkg_update
 
 case "$SRE_OS_FAMILY" in
     debian)
-        pkg_install curl wget git unzip software-properties-common \
+        pkg_install curl wget git unzip acl software-properties-common \
             apt-transport-https ca-certificates gnupg lsb-release
         ;;
     rhel)
-        pkg_install curl wget git unzip epel-release \
+        pkg_install curl wget git unzip acl epel-release \
             ca-certificates gnupg2
         ;;
 esac
 sre_success "Essential packages installed"
+
+# --- Locale Setup (Arabic + English UTF-8) ---
+sre_header "Locale Configuration"
+
+if [[ "$SRE_DRY_RUN" != "true" ]]; then
+    case "$SRE_OS_FAMILY" in
+        debian)
+            pkg_install locales language-pack-ar language-pack-en 2>/dev/null || pkg_install locales
+            sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+            sed -i 's/^# *ar_SA.UTF-8 UTF-8/ar_SA.UTF-8 UTF-8/' /etc/locale.gen
+            grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen || echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+            grep -q '^ar_SA.UTF-8 UTF-8' /etc/locale.gen || echo 'ar_SA.UTF-8 UTF-8' >> /etc/locale.gen
+            locale-gen
+            update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+            ;;
+        rhel)
+            pkg_install glibc-langpack-en glibc-langpack-ar
+            localectl set-locale LANG=en_US.UTF-8
+            ;;
+    esac
+    sre_success "Locales configured: en_US.UTF-8, ar_SA.UTF-8"
+else
+    sre_info "[DRY-RUN] Would configure en_US.UTF-8 and ar_SA.UTF-8 locales"
+fi
+
+config_set "SRE_LOCALE_CONFIGURED" "true"
 
 # --- Swap Configuration ---
 sre_header "Swap Configuration"
@@ -131,6 +157,19 @@ if [[ "$SRE_RAM_MB" -lt 2048 ]]; then
     fi
 else
     sre_skipped "RAM >= 2GB, swap configuration skipped"
+fi
+
+# --- Fix /tmp Permissions ---
+sre_header "Temp Directory Permissions"
+
+if [[ "$SRE_DRY_RUN" != "true" ]]; then
+    # Ensure /tmp has correct permissions (1777 sticky bit)
+    # Prevents Moodle invaliddatarootpermissions and other apps failing to write temp files
+    chmod 1777 /tmp
+    chown root:root /tmp
+    sre_success "/tmp permissions set to 1777 (sticky bit)"
+else
+    sre_info "[DRY-RUN] Would set /tmp permissions to 1777"
 fi
 
 # --- SSH Hardening (Optional) ---

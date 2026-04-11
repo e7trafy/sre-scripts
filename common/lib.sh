@@ -554,6 +554,7 @@ declare -A STEP_REGISTRY=(
     [9]="server/09-ssh-keys.sh"
     [10]="migrate/10-migrate-cpanel.sh"
     [11]="ssl/11-ssl.sh"
+    [12]="fixes/12-fixes.sh"
 )
 
 declare -A STEP_NAMES=(
@@ -569,6 +570,7 @@ declare -A STEP_NAMES=(
     [9]="SSH Key Setup"
     [10]="Migrate from cPanel"
     [11]="SSL Certificate"
+    [12]="Quick Fixes"
 )
 
 _is_step_skipped() {
@@ -583,7 +585,7 @@ _is_step_skipped() {
 
 _is_step_optional() {
     local step="$1"
-    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" ]] && return 0
+    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" ]] && return 0
     return 1
 }
 
@@ -707,6 +709,20 @@ clamp() {
     (( val < min )) && val=$min
     (( val > max )) && val=$max
     echo "$val"
+}
+
+# Helper: ensure setfacl is available, install acl if missing
+require_acl() {
+    if ! command -v setfacl &>/dev/null; then
+        sre_warning "setfacl not found — installing acl package..."
+        pkg_install acl
+        if ! command -v setfacl &>/dev/null; then
+            sre_error "Failed to install acl package. Cannot set filesystem ACLs."
+            return 1
+        fi
+        sre_success "acl package installed"
+    fi
+    return 0
 }
 
 # Helper: check if a port is in use
