@@ -41,7 +41,6 @@ STATE_FILE="/etc/sre-helpers/block-volume.state"
 LOG_FILE="/var/log/sre-helpers/block-volume.log"
 U02_MYSQL="/u02/mysql"
 U02_APPDATA="/u02/appdata"
-MOODLEDATA_DIR="${U02_APPDATA}/moodledata"
 MARIADB_DATADIR_NEW="${U02_MYSQL}"
 MARIADB_DATADIR_DEFAULT="/var/lib/mysql"
 
@@ -760,28 +759,24 @@ AAEOF
         sre_skipped "App data directories already set up"
     else
         if [[ "$SRE_DRY_RUN" == "true" ]]; then
-            sre_info "[DRY-RUN] Would create ${MOODLEDATA_DIR} and set www-data permissions"
+            sre_info "[DRY-RUN] Would prepare ${U02_APPDATA} with www-data permissions and ACLs"
         else
-            # Create moodledata
-            mkdir -p "$MOODLEDATA_DIR"
-            chown -R www-data:www-data "$MOODLEDATA_DIR"
-            chmod 770 "$MOODLEDATA_DIR"
-            sre_success "Created: ${MOODLEDATA_DIR} (www-data:www-data, 770)"
-            _log "INFO" "moodledata dir created at ${MOODLEDATA_DIR}"
+            # Prepare base appdata directory
+            # Domain-specific folders (e.g. /u02/appdata/{domain}/moodledata)
+            # are created during migration (step 10) or vhost setup (step 8)
+            chown www-data:www-data "$U02_APPDATA"
+            chmod 775 "$U02_APPDATA"
+            sre_success "Prepared: ${U02_APPDATA} (www-data:www-data, 775)"
+            _log "INFO" "appdata base dir prepared at ${U02_APPDATA}"
 
-            # Create Laravel storage placeholder (optional, for future use)
-            local laravel_storage="${U02_APPDATA}/laravel-storage"
-            mkdir -p "$laravel_storage"
-            chown -R www-data:www-data "$laravel_storage"
-            chmod 775 "$laravel_storage"
-            sre_success "Created: ${laravel_storage} (www-data:www-data, 775)"
-
-            # Set default ACLs so new files inherit correct ownership
+            # Set default ACLs so new domain folders inherit correct ownership
             if command -v setfacl &>/dev/null; then
                 setfacl -R -m d:u:www-data:rwX "$U02_APPDATA"
                 setfacl -R -m u:www-data:rwX   "$U02_APPDATA"
                 sre_success "POSIX ACL defaults set on ${U02_APPDATA}"
             fi
+
+            sre_info "Per-domain data dirs will be created at: ${U02_APPDATA}/{domain}/moodledata"
 
             mark_done "APPDATA_SETUP"
         fi
@@ -1222,24 +1217,19 @@ AAEOF
         sre_skipped "App data directories already set up"
     else
         if [[ "$SRE_DRY_RUN" == "true" ]]; then
-            sre_info "[DRY-RUN] Would create ${MOODLEDATA_DIR} and set www-data permissions"
+            sre_info "[DRY-RUN] Would prepare ${U02_APPDATA} with www-data permissions and ACLs"
         else
-            mkdir -p "$MOODLEDATA_DIR"
-            chown -R www-data:www-data "$MOODLEDATA_DIR"
-            chmod 770 "$MOODLEDATA_DIR"
-            sre_success "Created: ${MOODLEDATA_DIR} (www-data:www-data, 770)"
-
-            local laravel_storage="${U02_APPDATA}/laravel-storage"
-            mkdir -p "$laravel_storage"
-            chown -R www-data:www-data "$laravel_storage"
-            chmod 775 "$laravel_storage"
-            sre_success "Created: ${laravel_storage} (www-data:www-data, 775)"
+            chown www-data:www-data "$U02_APPDATA"
+            chmod 775 "$U02_APPDATA"
+            sre_success "Prepared: ${U02_APPDATA} (www-data:www-data, 775)"
 
             if command -v setfacl &>/dev/null; then
                 setfacl -R -m d:u:www-data:rwX "$U02_APPDATA"
                 setfacl -R -m u:www-data:rwX   "$U02_APPDATA"
                 sre_success "POSIX ACL defaults set on ${U02_APPDATA}"
             fi
+
+            sre_info "Per-domain data dirs will be created at: ${U02_APPDATA}/{domain}/moodledata"
 
             mark_done "APPDATA_SETUP"
         fi
@@ -1437,18 +1427,18 @@ case "$SCENARIO" in
         _validate_mount "$U02_APPDATA"
         _validate_mount "/var"
         _validate_mariadb
-        [[ -d "$MOODLEDATA_DIR" ]] \
-            && sre_success "Moodledata dir exists: $MOODLEDATA_DIR" \
-            || sre_warning "Moodledata dir missing: $MOODLEDATA_DIR"
+        [[ -d "$U02_APPDATA" ]] \
+            && sre_success "Appdata dir exists: $U02_APPDATA (domain dirs created during migration)" \
+            || sre_warning "Appdata dir missing: $U02_APPDATA"
         ;;
 
     dual_appdata)
         _validate_mount "$U02_MYSQL"
         _validate_mount "$U02_APPDATA"
         _validate_mariadb
-        [[ -d "$MOODLEDATA_DIR" ]] \
-            && sre_success "Moodledata dir exists: $MOODLEDATA_DIR" \
-            || sre_warning "Moodledata dir missing: $MOODLEDATA_DIR"
+        [[ -d "$U02_APPDATA" ]] \
+            && sre_success "Appdata dir exists: $U02_APPDATA (domain dirs created during migration)" \
+            || sre_warning "Appdata dir missing: $U02_APPDATA"
         ;;
 
     dual_var)
@@ -1473,12 +1463,11 @@ case "$SCENARIO" in
     triple)
         sre_success "Three block volumes configured:"
         sre_info "  ${U02_MYSQL}    → MariaDB datadir"
-        sre_info "  ${U02_APPDATA}  → App data (moodledata, Laravel storage)"
+        sre_info "  ${U02_APPDATA}  → App data (per-domain moodledata, Laravel storage)"
         sre_info "  /var            → OS data, logs, packages"
-        sre_info "  ${MOODLEDATA_DIR} → ready for Moodle"
         echo ""
-        sre_info "Migration script (step 10) will use:"
-        sre_info "  moodledata: ${MOODLEDATA_DIR}"
+        sre_info "Migration script (step 10) will create per-domain dirs:"
+        sre_info "  moodledata: ${U02_APPDATA}/{domain}/moodledata"
         echo ""
         sre_warning "Reboot to confirm /var mounts correctly from fstab:"
         sre_warning "  sudo reboot && df -h /var"
@@ -1486,11 +1475,10 @@ case "$SCENARIO" in
     dual_appdata)
         sre_success "Two block volumes configured:"
         sre_info "  ${U02_MYSQL}    → MariaDB datadir (small volume)"
-        sre_info "  ${U02_APPDATA}  → App data (moodledata, Laravel storage)"
-        sre_info "  ${MOODLEDATA_DIR} → ready for Moodle"
+        sre_info "  ${U02_APPDATA}  → App data (per-domain moodledata, Laravel storage)"
         echo ""
-        sre_info "Migration script (step 10) will use:"
-        sre_info "  moodledata: ${MOODLEDATA_DIR}"
+        sre_info "Migration script (step 10) will create per-domain dirs:"
+        sre_info "  moodledata: ${U02_APPDATA}/{domain}/moodledata"
         ;;
     dual_var)
         sre_success "Two block volumes configured:"
