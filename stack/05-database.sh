@@ -137,25 +137,22 @@ if [[ "$SRE_DB_ENGINE" == "mariadb" || "$SRE_DB_ENGINE" == "mysql" ]]; then
 
         sre_info "Setting root password and removing insecure defaults..."
 
-        # Set root password and secure the installation
-        # Use UPDATE on mysql.user for compatibility with fresh MariaDB installs
-        # where unix_socket auth is default and ALTER USER may not work
-        mysql -u root <<-EOSQL
-			-- Set root password (works on both MariaDB and MySQL fresh installs)
-			UPDATE mysql.user SET Password=PASSWORD('${DB_ROOT_PASS}'), plugin='mysql_native_password'
-			    WHERE User='root';
+        # Secure the installation — try modern syntax first (MariaDB 10.4+, MySQL 5.7+),
+        # fall back to legacy for older versions
+        if mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${DB_ROOT_PASS}';" 2>/dev/null; then
+            sre_info "Root password set via ALTER USER"
+        else
+            sre_warning "ALTER USER failed, trying legacy method..."
+            mysql -u root -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${DB_ROOT_PASS}');" 2>/dev/null \
+                || mysql -u root -e "UPDATE mysql.user SET Password=PASSWORD('${DB_ROOT_PASS}') WHERE User='root'; FLUSH PRIVILEGES;" 2>/dev/null \
+                || sre_warning "Could not set root password automatically — set it manually"
+        fi
 
-			-- Remove anonymous users
-			DELETE FROM mysql.user WHERE User='';
-
-			-- Disallow remote root login
-			DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
-
-			-- Remove test database
+        # Remove anonymous users and test database
+        mysql -u root -p"${DB_ROOT_PASS}" <<-EOSQL
+			DROP USER IF EXISTS ''@'localhost';
+			DROP USER IF EXISTS ''@'$(hostname)';
 			DROP DATABASE IF EXISTS test;
-			DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
-
-			-- Reload privilege tables
 			FLUSH PRIVILEGES;
 		EOSQL
 
