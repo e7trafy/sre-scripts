@@ -320,7 +320,7 @@ fix_logs() {
             if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 for log_dir in \
                     "${project_path}/storage/logs" \
-                    "${project_path}/shared/storage/logs" \
+                    "${project_path}/current/storage/logs" \
                     "/var/log/nginx" \
                     "/var/log/php-fpm"; do
                     if [[ ! -d "$log_dir" ]]; then

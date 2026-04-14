@@ -311,7 +311,7 @@ autostart=true
 autorestart=true
 user=www-data
 redirect_stderr=true
-stdout_logfile=${project_base}/shared/storage/logs/horizon.log
+stdout_logfile=${project_base}/current/storage/logs/horizon.log
 stopwaitsecs=3600
 HORIZONEOF
                 sre_success "Horizon worker config created: ${supervisor_conf_dir}/${VHOST_DOMAIN}-horizon.conf"
@@ -325,7 +325,7 @@ autorestart=true
 user=www-data
 numprocs=${worker_processes}
 redirect_stderr=true
-stdout_logfile=${project_base}/shared/storage/logs/worker.log
+stdout_logfile=${project_base}/current/storage/logs/worker.log
 stopwaitsecs=3600
 WORKEREOF
                 sre_success "Queue worker config created: ${supervisor_conf_dir}/${VHOST_DOMAIN}-worker.conf"

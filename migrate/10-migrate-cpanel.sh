@@ -979,7 +979,7 @@ autostart=true
 autorestart=true
 user=www-data
 redirect_stderr=true
-stdout_logfile=/var/www/${MIG_DOMAIN}/shared/storage/logs/horizon.log
+stdout_logfile=/var/www/${MIG_DOMAIN}/current/storage/logs/horizon.log
 stopwaitsecs=3600
 HORIZONEOF
                 sre_success "Horizon worker config: ${supervisor_conf_dir}/${MIG_DOMAIN}-horizon.conf"
@@ -993,7 +993,7 @@ autorestart=true
 user=www-data
 numprocs=${worker_processes}
 redirect_stderr=true
-stdout_logfile=/var/www/${MIG_DOMAIN}/shared/storage/logs/worker.log
+stdout_logfile=/var/www/${MIG_DOMAIN}/current/storage/logs/worker.log
 stopwaitsecs=3600
 WORKEREOF
                 sre_success "Queue worker config: ${supervisor_conf_dir}/${MIG_DOMAIN}-worker.conf"
