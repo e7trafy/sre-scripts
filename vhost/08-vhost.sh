@@ -280,4 +280,74 @@ fi
 
 sre_success "Virtual host created for $VHOST_DOMAIN ($VHOST_TYPE)"
 
+# --- Supervisor Queue Worker (Laravel only) ---
+if [[ "$VHOST_TYPE" == "laravel" ]] && [[ "$(config_get SRE_SUPERVISOR)" == "true" ]]; then
+    if prompt_yesno "Setup Supervisor queue worker for this Laravel project?" "yes"; then
+        sre_header "Supervisor Queue Worker"
+
+        project_base="/var/www/${VHOST_DOMAIN}"
+
+        worker_queue=$(prompt_input "Queue name" "default")
+        worker_processes=$(prompt_input "Number of worker processes" "2")
+        worker_tries=$(prompt_input "Max retries per job" "3")
+        worker_timeout=$(prompt_input "Job timeout (seconds)" "90")
+
+        setup_horizon="no"
+        if prompt_yesno "Use Laravel Horizon instead of default queue:work?" "no"; then
+            setup_horizon="yes"
+        fi
+
+        if [[ "$SRE_DRY_RUN" != "true" ]]; then
+            supervisor_conf_dir="/etc/supervisor/conf.d"
+            [[ "$SRE_OS_FAMILY" == "rhel" ]] && supervisor_conf_dir="/etc/supervisord.d"
+            mkdir -p "$supervisor_conf_dir"
+
+            if [[ "$setup_horizon" == "yes" ]]; then
+                cat > "${supervisor_conf_dir}/${VHOST_DOMAIN}-horizon.conf" <<HORIZONEOF
+[program:${VHOST_DOMAIN}-horizon]
+process_name=%(program_name)s
+command=php ${project_base}/current/artisan horizon
+autostart=true
+autorestart=true
+user=www-data
+redirect_stderr=true
+stdout_logfile=${project_base}/shared/storage/logs/horizon.log
+stopwaitsecs=3600
+HORIZONEOF
+                sre_success "Horizon worker config created: ${supervisor_conf_dir}/${VHOST_DOMAIN}-horizon.conf"
+            else
+                cat > "${supervisor_conf_dir}/${VHOST_DOMAIN}-worker.conf" <<WORKEREOF
+[program:${VHOST_DOMAIN}-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=php ${project_base}/current/artisan queue:work --sleep=3 --tries=${worker_tries} --timeout=${worker_timeout} --queue=${worker_queue}
+autostart=true
+autorestart=true
+user=www-data
+numprocs=${worker_processes}
+redirect_stderr=true
+stdout_logfile=${project_base}/shared/storage/logs/worker.log
+stopwaitsecs=3600
+WORKEREOF
+                sre_success "Queue worker config created: ${supervisor_conf_dir}/${VHOST_DOMAIN}-worker.conf"
+            fi
+
+            # Setup scheduler cron
+            if prompt_yesno "Also setup Laravel scheduler cron?" "yes"; then
+                cron_line="* * * * * www-data cd ${project_base}/current && php artisan schedule:run >> /dev/null 2>&1"
+                cron_file="/etc/cron.d/${VHOST_DOMAIN//\./-}-scheduler"
+                echo "$cron_line" > "$cron_file"
+                chmod 644 "$cron_file"
+                sre_success "Scheduler cron created: $cron_file"
+            fi
+
+            supervisorctl reread 2>/dev/null || true
+            supervisorctl update 2>/dev/null || true
+            sre_success "Supervisor updated — workers starting"
+        else
+            sre_info "[DRY-RUN] Would create supervisor worker config for $VHOST_DOMAIN"
+            [[ "$setup_horizon" == "yes" ]] && sre_info "[DRY-RUN] Using Horizon" || sre_info "[DRY-RUN] Using queue:work ($worker_processes processes)"
+        fi
+    fi
+fi
+
 recommend_next_step "$CURRENT_STEP"

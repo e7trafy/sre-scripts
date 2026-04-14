@@ -91,6 +91,15 @@ else
     sre_info "Node.js: skipped"
 fi
 
+# --- Supervisor ---
+if prompt_yesno "Install Supervisor? (process manager for Laravel queues, Horizon, etc.)" "yes"; then
+    config_set "SRE_SUPERVISOR" "true"
+    sre_info "Supervisor: will be installed"
+else
+    config_set "SRE_SUPERVISOR" "false"
+    sre_info "Supervisor: skipped"
+fi
+
 # --- Install Essential Packages ---
 sre_header "Installing Essential Packages"
 
@@ -107,6 +116,14 @@ case "$SRE_OS_FAMILY" in
         ;;
 esac
 sre_success "Essential packages installed"
+
+# Install supervisor if selected
+if [[ "$(config_get SRE_SUPERVISOR)" == "true" ]]; then
+    sre_info "Installing Supervisor..."
+    pkg_install supervisor
+    svc_enable_start supervisor
+    sre_success "Supervisor installed and running"
+fi
 
 # --- Locale Setup (Arabic + English UTF-8) ---
 sre_header "Locale Configuration"
