@@ -203,11 +203,16 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         cd "$im7_build_dir"
 
         im7_version="7.1.1-43"
-        wget -q "https://imagemagick.org/archive/ImageMagick-${im7_version}.tar.gz" \
-            || wget -q "https://github.com/ImageMagick/ImageMagick/archive/refs/tags/${im7_version}.tar.gz" -O "ImageMagick-${im7_version}.tar.gz"
+        wget -q "https://github.com/ImageMagick/ImageMagick/archive/refs/tags/${im7_version}.tar.gz" -O "ImageMagick-${im7_version}.tar.gz" \
+            || wget -q "https://imagemagick.org/archive/ImageMagick-${im7_version}.tar.gz"
 
         tar xzf "ImageMagick-${im7_version}.tar.gz"
-        cd ImageMagick-* || cd imagemagick-*
+        im7_src_dir=$(find . -maxdepth 1 -type d -name 'ImageMagick*' | head -1)
+        if [[ -z "$im7_src_dir" ]]; then
+            sre_error "ImageMagick source directory not found after extraction"
+            exit 1
+        fi
+        cd "$im7_src_dir"
 
         ./configure \
             --prefix=/usr/local \
