@@ -238,8 +238,36 @@ sre_info "Project type: $MIG_PROJECT_TYPE"
 
 sre_header "Source Server (cPanel/WHM)"
 
+# Collect previously used source hosts from all migration state files
+_prev_hosts=()
+if [[ -d "$MIG_STATE_DIR" ]]; then
+    while IFS= read -r _host; do
+        [[ -n "$_host" ]] && _prev_hosts+=("$_host")
+    done < <(grep -h '^MIG_SOURCE_HOST=' "${MIG_STATE_DIR}"/*.conf 2>/dev/null \
+        | sed 's/^MIG_SOURCE_HOST="//' | sed 's/"$//' | sort -u)
+fi
+
 if [[ -z "$MIG_SOURCE_HOST" ]] || [[ "$saved_state_exists" == "true" && -z "${_raw_args[*]}" ]]; then
-    MIG_SOURCE_HOST=$(prompt_input "Source server IP or hostname" "$MIG_SOURCE_HOST")
+    if [[ ${#_prev_hosts[@]} -gt 0 ]]; then
+        sre_info "Previously used source hosts:"
+        for _h in "${_prev_hosts[@]}"; do
+            sre_info "  - $_h"
+        done
+        echo ""
+        host_choice=$(prompt_choice "Source server:" "use-previous" "enter-new")
+        if [[ "$host_choice" == "use-previous" ]]; then
+            if [[ ${#_prev_hosts[@]} -eq 1 ]]; then
+                MIG_SOURCE_HOST="${_prev_hosts[0]}"
+            else
+                MIG_SOURCE_HOST=$(prompt_choice "Select host:" "${_prev_hosts[@]}")
+            fi
+            sre_info "Using: $MIG_SOURCE_HOST"
+        else
+            MIG_SOURCE_HOST=$(prompt_input "Source server IP or hostname" "$MIG_SOURCE_HOST")
+        fi
+    else
+        MIG_SOURCE_HOST=$(prompt_input "Source server IP or hostname" "$MIG_SOURCE_HOST")
+    fi
     [[ -z "$MIG_SOURCE_HOST" ]] && { sre_error "Source host is required."; exit 1; }
 fi
 
