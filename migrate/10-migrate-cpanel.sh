@@ -696,44 +696,101 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         laravel)
             sre_info "Configuring Laravel..."
 
-            if [[ ! -f "${local_root}/.env" ]]; then
-                if [[ -f "${local_root}/.env.example" ]]; then
-                    cp "${local_root}/.env.example" "${local_root}/.env"
-                    sre_info "Created .env from .env.example"
+            # .env setup
+            if prompt_yesno "Setup .env file?" "yes"; then
+                if [[ ! -f "${local_root}/.env" ]]; then
+                    if [[ -f "${local_root}/.env.example" ]]; then
+                        cp "${local_root}/.env.example" "${local_root}/.env"
+                        sre_info "Created .env from .env.example"
+                    else
+                        touch "${local_root}/.env"
+                        sre_info "Created empty .env"
+                    fi
+                fi
+
+                if [[ "$needs_db" == "true" ]]; then
+                    sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${MIG_DB_NAME}|" "${local_root}/.env"
+                    sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${MIG_DB_USER}|" "${local_root}/.env"
+                    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${MIG_DB_PASS}|" "${local_root}/.env"
+                    sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" "${local_root}/.env"
+                    sre_success "Updated .env with local database credentials"
+                fi
+
+                sed -i "s|^APP_URL=.*|APP_URL=http://${MIG_DOMAIN}|" "${local_root}/.env"
+                sre_success ".env configured"
+            else
+                sre_skipped ".env setup"
+            fi
+
+            # Storage directories
+            if prompt_yesno "Create storage directories?" "yes"; then
+                mkdir -p "${local_root}/storage"/{app/public,framework/{cache,sessions,views},logs}
+                sre_success "Storage directories created"
+            fi
+
+            # Composer install
+            if command -v composer &>/dev/null; then
+                if prompt_yesno "Run composer install?" "yes"; then
+                    sre_info "Running: composer install --no-dev --optimize-autoloader..."
+                    cd "$local_root" && composer install --no-dev --optimize-autoloader --no-interaction 2>&1 | tail -5
+                    sre_success "Composer dependencies installed"
                 else
-                    touch "${local_root}/.env"
-                    sre_info "Created empty .env"
+                    sre_skipped "composer install"
+                fi
+            else
+                sre_warning "Composer not found — skipping"
+            fi
+
+            # APP_KEY
+            if ! grep -q "^APP_KEY=base64:" "${local_root}/.env" 2>/dev/null; then
+                if prompt_yesno "Generate application key? (APP_KEY is missing)" "yes"; then
+                    cd "$local_root" && php artisan key:generate --no-interaction
+                    sre_success "Application key generated"
                 fi
             fi
 
+            # Artisan migrate
             if [[ "$needs_db" == "true" ]]; then
-                sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${MIG_DB_NAME}|" "${local_root}/.env"
-                sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${MIG_DB_USER}|" "${local_root}/.env"
-                sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${MIG_DB_PASS}|" "${local_root}/.env"
-                sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" "${local_root}/.env"
-                sre_success "Updated .env with local database credentials"
+                if prompt_yesno "Run php artisan migrate?" "no"; then
+                    sre_info "Running: php artisan migrate..."
+                    cd "$local_root" && php artisan migrate --force --no-interaction 2>&1 | tail -5
+                    sre_success "Database migrations complete"
+                else
+                    sre_skipped "artisan migrate"
+                fi
             fi
 
-            sed -i "s|^APP_URL=.*|APP_URL=http://${MIG_DOMAIN}|" "${local_root}/.env"
-
-            mkdir -p "${local_root}/storage"/{app/public,framework/{cache,sessions,views},logs}
-
-            if command -v composer &>/dev/null; then
-                sre_info "Installing Composer dependencies..."
-                cd "$local_root" && composer install --no-dev --optimize-autoloader --no-interaction 2>&1 | tail -3
-                sre_success "Composer dependencies installed"
+            # npm install + build
+            if [[ -f "${local_root}/package.json" ]]; then
+                if prompt_yesno "Run npm install && npm run build?" "yes"; then
+                    sre_info "Running: npm install..."
+                    cd "$local_root" && npm install 2>&1 | tail -3
+                    sre_info "Running: npm run build..."
+                    npm run build 2>&1 | tail -5
+                    sre_success "Frontend assets built"
+                else
+                    sre_skipped "npm install/build"
+                fi
             fi
 
-            if ! grep -q "^APP_KEY=base64:" "${local_root}/.env" 2>/dev/null; then
-                cd "$local_root" && php artisan key:generate --no-interaction
-                sre_success "Application key generated"
+            # Cache
+            if prompt_yesno "Rebuild Laravel caches? (config, route, view)" "yes"; then
+                cd "$local_root"
+                php artisan config:cache --no-interaction 2>/dev/null || true
+                php artisan route:cache --no-interaction 2>/dev/null || true
+                php artisan view:cache --no-interaction 2>/dev/null || true
+                sre_success "Laravel caches rebuilt"
+            else
+                sre_skipped "Cache rebuild"
             fi
 
-            cd "$local_root"
-            php artisan config:cache --no-interaction 2>/dev/null || true
-            php artisan route:cache --no-interaction 2>/dev/null || true
-            php artisan view:cache --no-interaction 2>/dev/null || true
-            sre_success "Laravel caches rebuilt"
+            # Storage link
+            if prompt_yesno "Run php artisan storage:link?" "yes"; then
+                cd "$local_root" && php artisan storage:link --no-interaction 2>/dev/null || true
+                sre_success "Storage symlink created"
+            else
+                sre_skipped "storage:link"
+            fi
             ;;
 
         moodle)
@@ -794,17 +851,33 @@ MOODLE_CONFIG
         nuxt)
             sre_info "Configuring Nuxt..."
             if [[ -f "${local_root}/package.json" ]]; then
-                cd "$local_root"
-                sre_info "Installing Node dependencies..."
-                npm install --production 2>&1 | tail -3
-                npm run build 2>&1 | tail -5
-                sre_success "Nuxt built"
+                if prompt_yesno "Run npm install?" "yes"; then
+                    cd "$local_root"
+                    sre_info "Running: npm install --production..."
+                    npm install --production 2>&1 | tail -3
+                    sre_success "Node dependencies installed"
+                else
+                    sre_skipped "npm install"
+                fi
+
+                if prompt_yesno "Run npm run build?" "yes"; then
+                    cd "$local_root"
+                    sre_info "Running: npm run build..."
+                    npm run build 2>&1 | tail -5
+                    sre_success "Nuxt built"
+                else
+                    sre_skipped "npm run build"
+                fi
 
                 if command -v pm2 &>/dev/null; then
-                    pm2 delete "${MIG_DOMAIN}" 2>/dev/null || true
-                    pm2 start npm --name "${MIG_DOMAIN}" -- start
-                    pm2 save
-                    sre_success "PM2 process started: ${MIG_DOMAIN}"
+                    if prompt_yesno "Start PM2 process?" "yes"; then
+                        pm2 delete "${MIG_DOMAIN}" 2>/dev/null || true
+                        pm2 start npm --name "${MIG_DOMAIN}" -- start
+                        pm2 save
+                        sre_success "PM2 process started: ${MIG_DOMAIN}"
+                    else
+                        sre_skipped "PM2 start"
+                    fi
                 fi
             fi
             ;;
@@ -812,10 +885,16 @@ MOODLE_CONFIG
         vue)
             sre_info "Configuring Vue..."
             if [[ -f "${local_root}/../package.json" ]]; then
-                cd "${local_root}/.."
-                npm install 2>&1 | tail -3
-                npm run build 2>&1 | tail -5
-                sre_success "Vue built to dist/"
+                if prompt_yesno "Run npm install && npm run build?" "yes"; then
+                    cd "${local_root}/.."
+                    sre_info "Running: npm install..."
+                    npm install 2>&1 | tail -3
+                    sre_info "Running: npm run build..."
+                    npm run build 2>&1 | tail -5
+                    sre_success "Vue built to dist/"
+                else
+                    sre_skipped "npm install/build"
+                fi
             fi
             ;;
     esac
