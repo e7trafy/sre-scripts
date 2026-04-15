@@ -66,14 +66,57 @@ web_server=$(config_get "SRE_WEB_SERVER" "")
 os_family=$(config_get "SRE_OS_FAMILY" "debian")
 php_version=$(config_get "SRE_PHP_VERSION" "8.3")
 
+# --- List available domains ---
+sre_header "Available Domains"
+
+available_domains=()
+case "$web_server" in
+    nginx)
+        case "$os_family" in
+            debian) vhost_dir="/etc/nginx/sites-available" ;;
+            rhel)   vhost_dir="/etc/nginx/conf.d" ;;
+        esac
+        ;;
+    apache)
+        case "$os_family" in
+            debian) vhost_dir="/etc/apache2/sites-available" ;;
+            rhel)   vhost_dir="/etc/httpd/conf.d" ;;
+        esac
+        ;;
+esac
+
+if [[ -d "$vhost_dir" ]]; then
+    while IFS= read -r conf_file; do
+        domain_name=$(basename "$conf_file" .conf)
+        # Skip default configs
+        [[ "$domain_name" == "default" || "$domain_name" == "000-default" || "$domain_name" == "security" ]] && continue
+        # Check if already has SSL
+        if grep -q "ssl_certificate\|SSLCertificateFile" "$conf_file" 2>/dev/null; then
+            sre_info "  [SSL] $domain_name"
+        else
+            sre_info "  [HTTP] $domain_name"
+            available_domains+=("$domain_name")
+        fi
+    done < <(find "$vhost_dir" -maxdepth 1 -name '*.conf' -type f 2>/dev/null | sort)
+fi
+
+if [[ ${#available_domains[@]} -eq 0 && -z "$SSL_DOMAIN" ]]; then
+    sre_warning "No HTTP-only domains found. All domains may already have SSL."
+    sre_info "You can still specify a domain manually to renew/replace its certificate."
+fi
+
 # --- Prompt for missing values ---
 if [[ -z "$SSL_DOMAIN" ]]; then
-    SSL_DOMAIN=$(prompt_input "Domain name for SSL certificate" "")
+    if [[ ${#available_domains[@]} -gt 0 ]]; then
+        SSL_DOMAIN=$(prompt_choice "Select domain for SSL:" "${available_domains[@]}")
+    else
+        SSL_DOMAIN=$(prompt_input "Domain name for SSL certificate" "")
+    fi
     [[ -z "$SSL_DOMAIN" ]] && { sre_error "Domain is required."; exit 1; }
 fi
 
 if [[ -z "$SSL_EMAIL" ]]; then
-    SSL_EMAIL=$(prompt_input "Email for Let's Encrypt registration" "")
+    SSL_EMAIL=$(prompt_input "Email for Let's Encrypt registration" "me@abdullah.link")
     [[ -z "$SSL_EMAIL" ]] && { sre_error "Email is required."; exit 1; }
 fi
 
