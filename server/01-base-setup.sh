@@ -72,9 +72,24 @@ config_set "SRE_WEB_SERVER" "$web_server"
 sre_info "Selected stack: $stack (web server: $web_server)"
 
 # --- PHP Version ---
-php_version=$(prompt_choice "Select PHP version:" "8.3" "8.2")
+php_version=$(prompt_choice "Select default PHP version:" "8.3" "8.1" "8.2" "8.4")
 config_set "SRE_PHP_VERSION" "$php_version"
-sre_info "Selected PHP version: $php_version"
+sre_info "Default PHP version: $php_version"
+
+# Additional PHP versions
+extra_php_versions=""
+if prompt_yesno "Install additional PHP versions? (for multi-project support)" "no"; then
+    sre_info "Select extra versions to install (comma-separated):"
+    sre_info "  Available: 8.1, 8.2, 8.3, 8.4"
+    sre_info "  Default ($php_version) is already included"
+    extra_php_versions=$(prompt_input "Extra PHP versions (e.g. 8.1,8.2)" "")
+    if [[ -n "$extra_php_versions" ]]; then
+        config_set "SRE_PHP_EXTRA_VERSIONS" "$extra_php_versions"
+        sre_info "Extra PHP versions: $extra_php_versions"
+    fi
+else
+    config_set "SRE_PHP_EXTRA_VERSIONS" ""
+fi
 
 # --- Database Engine ---
 db_engine=$(prompt_choice "Select database engine:" "mariadb" "mysql" "postgresql" "none")

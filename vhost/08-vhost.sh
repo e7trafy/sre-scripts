@@ -102,6 +102,25 @@ if [[ -z "$VHOST_ROOT" ]]; then
     esac
 fi
 
+# Select PHP version for this project (Laravel/Moodle only)
+if [[ "$VHOST_TYPE" == "laravel" || "$VHOST_TYPE" == "moodle" ]]; then
+    extra_versions=$(config_get "SRE_PHP_EXTRA_VERSIONS" "")
+    if [[ -n "$extra_versions" ]]; then
+        # Build list of available versions
+        available_versions=("$php_version")
+        IFS=',' read -ra _extra <<< "$extra_versions"
+        for v in "${_extra[@]}"; do
+            v=$(echo "$v" | tr -d ' ')
+            [[ -n "$v" && "$v" != "$php_version" ]] && available_versions+=("$v")
+        done
+
+        if [[ ${#available_versions[@]} -gt 1 ]]; then
+            php_version=$(prompt_choice "PHP version for this project:" "${available_versions[@]}")
+        fi
+    fi
+    sre_info "PHP version: $php_version"
+fi
+
 sre_info "Domain: $VHOST_DOMAIN"
 sre_info "Type: $VHOST_TYPE"
 sre_info "Root: $VHOST_ROOT"
@@ -219,7 +238,8 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             fi
         done
         # Also set on shared storage (symlinked)
-        shared_storage="${project_base}/shared/storage"
+        # shared_storage="${project_base}/shared/storage"
+        shared_storage="${project_base}/current/storage"
         if [[ -d "$shared_storage" ]]; then
             setfacl -R -m u:www-data:rwX "$shared_storage"
             setfacl -R -d -m u:www-data:rwX "$shared_storage"

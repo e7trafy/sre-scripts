@@ -320,7 +320,7 @@ fix_logs() {
             if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 for log_dir in \
                     "${project_path}/storage/logs" \
-                    "${project_path}/current/storage/logs" \
+                    "${project_path}/shared/storage/logs" \
                     "/var/log/nginx" \
                     "/var/log/php-fpm"; do
                     if [[ ! -d "$log_dir" ]]; then
@@ -582,6 +582,149 @@ fix_imagick() {
             fi
             ;;
     esac
+}
+
+################################################################################
+# Fix: Change PHP Version for a Project
+################################################################################
+
+fix_php_version() {
+    sre_header "Fix: Change PHP Version for a Project"
+
+    local domain
+    domain=$(prompt_input "Domain name" "")
+    [[ -z "$domain" ]] && { sre_error "Domain is required."; return 1; }
+
+    local web_server
+    web_server=$(config_get "SRE_WEB_SERVER" "nginx")
+    local os_family
+    os_family=$(config_get "SRE_OS_FAMILY" "debian")
+
+    # Detect installed PHP versions
+    sre_info "Detecting installed PHP versions..."
+    local installed_versions=()
+    if [[ "$os_family" == "debian" ]]; then
+        while IFS= read -r fpm_svc; do
+            local ver
+            ver=$(echo "$fpm_svc" | grep -oP 'php\K[0-9]+\.[0-9]+')
+            [[ -n "$ver" ]] && installed_versions+=("$ver")
+        done < <(systemctl list-unit-files 'php*-fpm.service' --no-legend 2>/dev/null | awk '{print $1}')
+    else
+        installed_versions+=("$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "8.3")")
+    fi
+
+    if [[ ${#installed_versions[@]} -eq 0 ]]; then
+        sre_error "No PHP-FPM versions detected"
+        return 1
+    fi
+
+    if [[ ${#installed_versions[@]} -eq 1 ]]; then
+        sre_warning "Only one PHP version installed: ${installed_versions[0]}"
+        sre_info "Install additional versions with step 4 (set SRE_PHP_EXTRA_VERSIONS in config first)"
+        return 0
+    fi
+
+    sre_info "Installed PHP versions: ${installed_versions[*]}"
+
+    # Detect current version from vhost config
+    local vhost_file=""
+    case "$web_server" in
+        nginx)
+            vhost_file="/etc/nginx/sites-available/${domain}.conf"
+            [[ ! -f "$vhost_file" ]] && vhost_file="/etc/nginx/conf.d/${domain}.conf"
+            ;;
+        apache)
+            vhost_file="/etc/apache2/sites-available/${domain}.conf"
+            [[ ! -f "$vhost_file" ]] && vhost_file="/etc/httpd/conf.d/${domain}.conf"
+            ;;
+    esac
+
+    if [[ ! -f "$vhost_file" ]]; then
+        sre_error "Vhost config not found for $domain"
+        return 1
+    fi
+
+    local current_ver
+    current_ver=$(grep -oP 'php\K[0-9]+\.[0-9]+' "$vhost_file" | head -1)
+    [[ -n "$current_ver" ]] && sre_info "Current PHP version in vhost: $current_ver"
+
+    local new_ver
+    new_ver=$(prompt_choice "Select new PHP version:" "${installed_versions[@]}")
+
+    if [[ "$new_ver" == "$current_ver" ]]; then
+        sre_skipped "Already using PHP $new_ver"
+        return 0
+    fi
+
+    sre_info "Switching $domain from PHP ${current_ver:-unknown} to PHP $new_ver"
+
+    if ! prompt_yesno "Proceed?" "yes"; then
+        sre_skipped "PHP version change cancelled"
+        return 0
+    fi
+
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        backup_config "$vhost_file"
+
+        # Replace PHP version in vhost config (socket path and any version references)
+        if [[ -n "$current_ver" ]]; then
+            sed -i "s|php${current_ver}|php${new_ver}|g" "$vhost_file"
+        else
+            sre_warning "Could not detect current version — updating socket path manually"
+            sed -i "s|php[0-9]\+\.[0-9]\+-fpm|php${new_ver}-fpm|g" "$vhost_file"
+        fi
+
+        # Verify new FPM service is running
+        local new_fpm
+        new_fpm=$(get_phpfpm_svc "$new_ver")
+        if ! systemctl is-active --quiet "$new_fpm" 2>/dev/null; then
+            sre_warning "$new_fpm not running — starting it..."
+            svc_enable_start "$new_fpm"
+        fi
+
+        # Also update PHP-FPM pool if it exists
+        local pool_dir
+        pool_dir=$(get_phpfpm_pool_dir "$new_ver")
+        local old_pool_dir
+        old_pool_dir=$(get_phpfpm_pool_dir "${current_ver:-$new_ver}")
+
+        if [[ -n "$current_ver" && -f "${old_pool_dir}/${domain}.conf" && "$old_pool_dir" != "$pool_dir" ]]; then
+            cp "${old_pool_dir}/${domain}.conf" "${pool_dir}/${domain}.conf"
+            # Update socket path in pool config
+            sed -i "s|php${current_ver}|php${new_ver}|g" "${pool_dir}/${domain}.conf"
+            sre_success "Pool config copied to ${pool_dir}/${domain}.conf"
+            svc_restart "$new_fpm"
+        fi
+
+        # Test and reload web server
+        case "$web_server" in
+            nginx)
+                if nginx -t 2>&1; then
+                    svc_reload nginx
+                    sre_success "Nginx reloaded"
+                else
+                    sre_error "Nginx config test failed! Restoring backup..."
+                    cp "${vhost_file}.bak."* "$vhost_file" 2>/dev/null || true
+                    return 1
+                fi
+                ;;
+            apache)
+                local test_cmd="apachectl configtest"
+                [[ "$os_family" == "rhel" ]] && test_cmd="httpd -t"
+                if $test_cmd 2>&1; then
+                    svc_reload "$(get_webserver_svc apache)"
+                    sre_success "Apache reloaded"
+                else
+                    sre_error "Apache config test failed!"
+                    return 1
+                fi
+                ;;
+        esac
+
+        sre_success "PHP version for $domain changed to $new_ver"
+    else
+        sre_info "[DRY-RUN] Would switch $domain from PHP ${current_ver:-unknown} to PHP $new_ver"
+    fi
 }
 
 ################################################################################
@@ -1139,6 +1282,7 @@ _run_fix_menu() {
         fix_choice=$(prompt_choice "Select a fix category:" \
             "permissions-ownership" \
             "filesystem-acl" \
+            "change-php-version" \
             "moodle-temp-dirs" \
             "log-files" \
             "imagick-arabic" \
@@ -1151,6 +1295,7 @@ _run_fix_menu() {
         case "$fix_choice" in
             permissions-ownership)  fix_permissions ;;
             filesystem-acl)         fix_acl ;;
+            change-php-version)     fix_php_version ;;
             moodle-temp-dirs)       fix_moodle_temp ;;
             log-files)              fix_logs ;;
             imagick-arabic)         fix_imagick ;;

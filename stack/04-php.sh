@@ -46,94 +46,112 @@ require_config_key "SRE_WEB_SERVER_INSTALLED" "3" > /dev/null
 
 SRE_OS_FAMILY="$(config_get SRE_OS_FAMILY)"
 SRE_PHP_VERSION="$(config_get SRE_PHP_VERSION)"
+SRE_PHP_EXTRA="$(config_get SRE_PHP_EXTRA_VERSIONS "")"
+
+# Build list of all PHP versions to install
+all_php_versions=("$SRE_PHP_VERSION")
+if [[ -n "$SRE_PHP_EXTRA" ]]; then
+    IFS=',' read -ra extra_vers <<< "$SRE_PHP_EXTRA"
+    for v in "${extra_vers[@]}"; do
+        v=$(echo "$v" | tr -d ' ')
+        [[ -n "$v" && "$v" != "$SRE_PHP_VERSION" ]] && all_php_versions+=("$v")
+    done
+fi
 
 sre_info "OS family: $SRE_OS_FAMILY"
-sre_info "PHP version: $SRE_PHP_VERSION"
+sre_info "Default PHP version: $SRE_PHP_VERSION"
+sre_info "All PHP versions to install: ${all_php_versions[*]}"
 
-# --- Install PHP-FPM and Extensions ---
-sre_header "Installing PHP ${SRE_PHP_VERSION}"
+# --- Install PHP-FPM and Extensions (all versions) ---
 
-local_ver="${SRE_PHP_VERSION}"
+_install_php_version() {
+    local ver="$1"
+    sre_header "Installing PHP ${ver}"
 
-case "$SRE_OS_FAMILY" in
-    debian)
-        # Add ondrej/php PPA if not already present
-        if ! grep -rq "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
-            sre_info "Adding ondrej/php PPA..."
-            if [[ "$SRE_DRY_RUN" != "true" ]]; then
-                pkg_install software-properties-common
-                add-apt-repository -y ppa:ondrej/php
-                pkg_update
-            else
-                sre_info "[DRY-RUN] Would add ondrej/php PPA"
+    case "$SRE_OS_FAMILY" in
+        debian)
+            # Add ondrej/php PPA if not already present
+            if ! grep -rq "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
+                sre_info "Adding ondrej/php PPA..."
+                if [[ "$SRE_DRY_RUN" != "true" ]]; then
+                    pkg_install software-properties-common
+                    add-apt-repository -y ppa:ondrej/php
+                    pkg_update
+                else
+                    sre_info "[DRY-RUN] Would add ondrej/php PPA"
+                fi
             fi
-        else
-            sre_skipped "ondrej/php PPA already present"
-        fi
 
-        php_packages=(
-            "php${local_ver}-fpm"
-            "php${local_ver}-cli"
-            "php${local_ver}-mysql"
-            "php${local_ver}-pgsql"
-            "php${local_ver}-mbstring"
-            "php${local_ver}-xml"
-            "php${local_ver}-curl"
-            "php${local_ver}-zip"
-            "php${local_ver}-gd"
-            "php${local_ver}-intl"
-            "php${local_ver}-bcmath"
-            "php${local_ver}-soap"
-            "php${local_ver}-redis"
-            "php${local_ver}-opcache"
-        )
+            php_packages=(
+                "php${ver}-fpm"
+                "php${ver}-cli"
+                "php${ver}-mysql"
+                "php${ver}-pgsql"
+                "php${ver}-mbstring"
+                "php${ver}-xml"
+                "php${ver}-curl"
+                "php${ver}-zip"
+                "php${ver}-gd"
+                "php${ver}-intl"
+                "php${ver}-bcmath"
+                "php${ver}-soap"
+                "php${ver}-redis"
+                "php${ver}-opcache"
+            )
 
-        sre_info "Installing PHP packages: ${php_packages[*]}"
-        pkg_install "${php_packages[@]}"
-        ;;
+            sre_info "Installing PHP ${ver} packages: ${php_packages[*]}"
+            pkg_install "${php_packages[@]}"
+            ;;
 
-    rhel)
-        # Enable Remi repository for PHP 8.x
-        if ! rpm -q remi-release &>/dev/null; then
-            sre_info "Enabling Remi repository for PHP ${local_ver}..."
+        rhel)
+            # Enable Remi repository for PHP
+            if ! rpm -q remi-release &>/dev/null; then
+                sre_info "Enabling Remi repository..."
+                if [[ "$SRE_DRY_RUN" != "true" ]]; then
+                    os_ver="$(config_get SRE_OS_VERSION)"
+                    remi_major="${os_ver%%.*}"
+                    dnf install -y -q "https://rpms.remirepo.net/enterprise/remi-release-${remi_major}.rpm" || true
+                fi
+            fi
+
             if [[ "$SRE_DRY_RUN" != "true" ]]; then
-                os_ver=""
-                os_ver="$(config_get SRE_OS_VERSION)"
-                remi_major="${os_ver%%.*}"
-                dnf install -y -q "https://rpms.remirepo.net/enterprise/remi-release-${remi_major}.rpm" || true
                 dnf module -y reset php 2>/dev/null || true
-                remi_stream="${local_ver//./}"
-                dnf module -y enable "php:remi-${local_ver}" 2>/dev/null || true
-            else
-                sre_info "[DRY-RUN] Would enable Remi repository"
+                dnf module -y enable "php:remi-${ver}" 2>/dev/null || true
             fi
-        else
-            sre_skipped "Remi repository already enabled"
-        fi
 
-        php_packages=(
-            php-fpm
-            php-cli
-            php-mysqlnd
-            php-pgsql
-            php-mbstring
-            php-xml
-            php-curl
-            php-zip
-            php-gd
-            php-intl
-            php-bcmath
-            php-soap
-            php-pecl-redis
-            php-opcache
-        )
+            php_packages=(
+                php-fpm php-cli php-mysqlnd php-pgsql php-mbstring
+                php-xml php-curl php-zip php-gd php-intl
+                php-bcmath php-soap php-pecl-redis php-opcache
+            )
 
-        sre_info "Installing PHP packages: ${php_packages[*]}"
-        pkg_install "${php_packages[@]}"
-        ;;
-esac
+            sre_info "Installing PHP ${ver} packages: ${php_packages[*]}"
+            pkg_install "${php_packages[@]}"
+            ;;
+    esac
 
-sre_success "PHP ${local_ver} packages installed"
+    # Enable and start FPM for this version
+    local fpm_svc
+    fpm_svc=$(get_phpfpm_svc "$ver")
+    svc_enable_start "$fpm_svc"
+
+    sre_success "PHP ${ver} installed and ${fpm_svc} running"
+}
+
+for php_ver in "${all_php_versions[@]}"; do
+    _install_php_version "$php_ver"
+done
+
+# Set default CLI version
+local_ver="${SRE_PHP_VERSION}"
+if [[ "$SRE_OS_FAMILY" == "debian" && "$SRE_DRY_RUN" != "true" ]]; then
+    update-alternatives --set php "/usr/bin/php${local_ver}" 2>/dev/null || true
+    update-alternatives --set php-config "/usr/bin/php-config${local_ver}" 2>/dev/null || true
+    update-alternatives --set phpize "/usr/bin/phpize${local_ver}" 2>/dev/null || true
+    sre_success "Default CLI PHP set to ${local_ver}"
+fi
+
+sre_success "All PHP versions installed: ${all_php_versions[*]}"
 
 # --- ImageMagick 7 + Arabic Support ---
 sre_header "Installing ImageMagick 7 with Arabic/Unicode Support"
@@ -248,33 +266,40 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         rm -rf "$im7_build_dir"
     fi
 
-    # Rebuild PHP imagick extension against ImageMagick 7
+    # Rebuild PHP imagick extension against ImageMagick 7 (all installed versions)
     sre_info "Rebuilding PHP imagick extension for ImageMagick 7..."
 
-    # Remove distro php-imagick (linked to IM6)
-    case "$SRE_OS_FAMILY" in
-        debian) apt-get remove -y "php${local_ver}-imagick" 2>/dev/null || true ;;
-        rhel)   dnf remove -y php-imagick 2>/dev/null || true ;;
-    esac
+    for _php_ver in "${all_php_versions[@]}"; do
+        sre_info "  Building imagick for PHP ${_php_ver}..."
 
-    # Install from PECL
-    pkg_install "php${local_ver}-dev" 2>/dev/null || pkg_install php-devel
-    printf "\n" | pecl install imagick 2>/dev/null || true
-
-    # Enable the extension
-    im_ini_dir=""
-    case "$SRE_OS_FAMILY" in
-        debian) im_ini_dir="/etc/php/${local_ver}/mods-available" ;;
-        rhel)   im_ini_dir="/etc/php.d" ;;
-    esac
-
-    if [[ -n "$im_ini_dir" ]]; then
-        mkdir -p "$im_ini_dir"
-        echo "extension=imagick.so" > "${im_ini_dir}/imagick.ini"
+        # Remove distro php-imagick (linked to IM6)
         case "$SRE_OS_FAMILY" in
-            debian) phpenmod -v "$local_ver" imagick 2>/dev/null || true ;;
+            debian) apt-get remove -y "php${_php_ver}-imagick" 2>/dev/null || true ;;
+            rhel)   dnf remove -y php-imagick 2>/dev/null || true ;;
         esac
-    fi
+
+        # Install dev package and build from PECL
+        case "$SRE_OS_FAMILY" in
+            debian)
+                pkg_install "php${_php_ver}-dev" 2>/dev/null || true
+                # Use version-specific pecl/phpize
+                printf "\n" | "/usr/bin/pecl${_php_ver}" install imagick 2>/dev/null \
+                    || printf "\n" | pecl install imagick 2>/dev/null || true
+
+                im_ini_dir="/etc/php/${_php_ver}/mods-available"
+                mkdir -p "$im_ini_dir"
+                echo "extension=imagick.so" > "${im_ini_dir}/imagick.ini"
+                phpenmod -v "$_php_ver" imagick 2>/dev/null || true
+                ;;
+            rhel)
+                pkg_install php-devel 2>/dev/null || true
+                printf "\n" | pecl install imagick 2>/dev/null || true
+                echo "extension=imagick.so" > "/etc/php.d/imagick.ini"
+                ;;
+        esac
+
+        sre_success "  imagick built for PHP ${_php_ver}"
+    done
 
     sre_success "PHP imagick extension rebuilt for ImageMagick 7"
 
@@ -349,8 +374,10 @@ sre_header "Configuring php.ini (FPM + CLI)"
 php_ini_files=()
 case "$SRE_OS_FAMILY" in
     debian)
-        php_ini_files+=("/etc/php/${local_ver}/fpm/php.ini")
-        php_ini_files+=("/etc/php/${local_ver}/cli/php.ini")
+        for _php_ver in "${all_php_versions[@]}"; do
+            php_ini_files+=("/etc/php/${_php_ver}/fpm/php.ini")
+            php_ini_files+=("/etc/php/${_php_ver}/cli/php.ini")
+        done
         ;;
     rhel)
         php_ini_files+=("/etc/php.ini")
@@ -401,26 +428,23 @@ else
     sre_info "  max_file_uploads = 20"
 fi
 
-# --- Enable and Start PHP-FPM ---
-sre_header "Starting PHP-FPM"
+# --- Verify PHP-FPM Services ---
+sre_header "Verifying PHP-FPM Services"
 
-case "$SRE_OS_FAMILY" in
-    debian)
-        fpm_service="php${local_ver}-fpm"
-        ;;
-    rhel)
-        fpm_service="php-fpm"
-        ;;
-esac
-
-sre_info "Enabling and starting $fpm_service..."
-svc_enable_start "$fpm_service"
-sre_success "$fpm_service is running"
+for _php_ver in "${all_php_versions[@]}"; do
+    fpm_svc=$(get_phpfpm_svc "$_php_ver")
+    if systemctl is-active --quiet "$fpm_svc" 2>/dev/null; then
+        sre_success "$fpm_svc is running"
+    else
+        sre_warning "$fpm_svc not running — attempting restart..."
+        svc_enable_start "$fpm_svc"
+    fi
+done
 
 # --- Persist config ---
 config_set "SRE_PHP_INSTALLED" "true"
 
-sre_success "PHP ${local_ver} installation and configuration complete!"
+sre_success "PHP installation complete: ${all_php_versions[*]} (default: ${local_ver})"
 sre_info "Config saved to: $SRE_CONFIG_FILE"
 
 recommend_next_step "$CURRENT_STEP"
