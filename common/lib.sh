@@ -555,6 +555,7 @@ declare -A STEP_REGISTRY=(
     [10]="migrate/10-migrate-cpanel.sh"
     [11]="ssl/11-ssl.sh"
     [12]="fixes/12-fixes.sh"
+    [13]="deploy/13-new-project.sh"
 )
 
 declare -A STEP_NAMES=(
@@ -571,6 +572,7 @@ declare -A STEP_NAMES=(
     [10]="Migrate from cPanel"
     [11]="SSL Certificate"
     [12]="Quick Fixes"
+    [13]="Deploy New Project (Git)"
 )
 
 _is_step_skipped() {
@@ -578,14 +580,14 @@ _is_step_skipped() {
     case "$step" in
         5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" ]] && return 0 ;;
         6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
-        0|9|10) return 0 ;; # block volume, SSH keys and migration are optional
+        0|9|10|13) return 0 ;; # block volume, SSH keys, migration and deploy are optional
     esac
     return 1
 }
 
 _is_step_optional() {
     local step="$1"
-    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" ]] && return 0
+    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" || "$step" == "13" ]] && return 0
     return 1
 }
 
