@@ -166,6 +166,14 @@ if [[ -z "$doc_root" ]]; then
 fi
 sre_info "Document root: $doc_root"
 
+# --- Extract proxy port from existing vhost (Nuxt reverse proxy) ---
+nuxt_port=""
+if grep -q 'proxy_pass' "$vhost_conf" 2>/dev/null; then
+    nuxt_port=$(grep -oP 'proxy_pass\s+http://127\.0\.0\.1:\K[0-9]+' "$vhost_conf" | head -1)
+    [[ -z "$nuxt_port" ]] && nuxt_port="3000"
+    sre_info "Nuxt proxy port: $nuxt_port"
+fi
+
 # --- Check for existing certificate ---
 cert_dir="/etc/letsencrypt/live/${SSL_DOMAIN}"
 if [[ -d "$cert_dir" ]]; then
@@ -314,7 +322,8 @@ case "$web_server" in
             | sed '/well-known/,/}/d' \
             | sed "s|{DOMAIN}|${SSL_DOMAIN}|g" \
             | sed "s|{DOCUMENT_ROOT}|${doc_root}|g" \
-            | sed "s|{PHP_VERSION}|${php_version}|g")
+            | sed "s|{PHP_VERSION}|${php_version}|g" \
+            | sed "s|{PORT}|${nuxt_port:-3000}|g")
 
         if [[ "$SRE_DRY_RUN" != "true" ]]; then
             cat > "$vhost_conf" <<NGINX_CONF
