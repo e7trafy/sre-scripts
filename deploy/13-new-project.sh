@@ -742,7 +742,20 @@ MOODLE_CONFIG
                 if command -v pm2 &>/dev/null; then
                     if prompt_yesno "Start PM2 process?" "yes"; then
                         pm2 delete "${DEPLOY_DOMAIN}" 2>/dev/null || true
-                        pm2 start npm --name "${DEPLOY_DOMAIN}" -- start
+
+                        # Nuxt 3 builds to .output/server/index.mjs
+                        if [[ -f "${local_root}/.output/server/index.mjs" ]]; then
+                            pm2 start "${local_root}/.output/server/index.mjs" \
+                                --name "${DEPLOY_DOMAIN}" \
+                                --cwd "${local_root}"
+                        elif [[ -f "${local_root}/.output/server/index.js" ]]; then
+                            pm2 start "${local_root}/.output/server/index.js" \
+                                --name "${DEPLOY_DOMAIN}" \
+                                --cwd "${local_root}"
+                        else
+                            # Nuxt 2 / custom start script fallback
+                            pm2 start npm --name "${DEPLOY_DOMAIN}" --cwd "${local_root}" -- start
+                        fi
                         pm2 save
                         sre_success "PM2 process started: ${DEPLOY_DOMAIN}"
                     else
