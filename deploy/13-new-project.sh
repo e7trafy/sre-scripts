@@ -405,7 +405,8 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 exit 1
             fi
 
-            # Create current symlink
+            # Create current symlink (remove dir if vhost step created it)
+            [[ -d "${project_dir}/current" && ! -L "${project_dir}/current" ]] && rm -rf "${project_dir}/current"
             ln -sfn "$release_dir" "${project_dir}/current"
             sre_success "Release directory: $release_dir"
             sre_success "Current symlink → $release_dir"
@@ -474,6 +475,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 exit 1
             fi
 
+            [[ -d "${project_dir}/current" && ! -L "${project_dir}/current" ]] && rm -rf "${project_dir}/current"
             ln -sfn "$release_dir" "${project_dir}/current"
             sre_success "Cloned and linked: current → $release_dir"
             local_root="$release_dir"
@@ -494,6 +496,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 exit 1
             fi
 
+            [[ -d "${project_dir}/current" && ! -L "${project_dir}/current" ]] && rm -rf "${project_dir}/current"
             ln -sfn "$release_dir" "${project_dir}/current"
             sre_success "Cloned and linked: current → $release_dir"
             local_root="$release_dir"
