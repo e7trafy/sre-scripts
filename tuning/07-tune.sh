@@ -65,7 +65,7 @@ disk=$SRE_DISK_TYPE
 os_family=$(config_get "SRE_OS_FAMILY" "debian")
 web_server=$(config_get "SRE_WEB_SERVER" "")
 php_version=$(config_get "SRE_PHP_VERSION" "")
-db_engine=$(config_get "SRE_DB_ENGINE" "none")
+db_engines_config=$(config_get "SRE_DB_ENGINE" "none")
 
 # --- PHP-FPM Tuning ---
 fpm_max_children=$(clamp $((ram / 50)) 5 200)
@@ -100,7 +100,7 @@ elif [[ "$web_server" == "apache" ]]; then
 fi
 
 # --- Database Tuning ---
-if [[ "$db_engine" != "none" ]]; then
+if [[ "$db_engines_config" != "none" && -n "$db_engines_config" ]]; then
     db_buffer_pool=$((ram / 4))
     db_max_connections=$(clamp $((ram / 20)) 50 500)
     config_set "SRE_DB_BUFFER_POOL_MB" "$db_buffer_pool"
@@ -217,25 +217,28 @@ if [[ "$web_server" == "apache" ]]; then
     fi
 fi
 
-# --- Apply Database Tuning ---
-if [[ "$db_engine" != "none" && "$db_engine" != "" ]]; then
-    case "$db_engine" in
-        mariadb|mysql)
-            my_cnf=""
-            if [[ -d "/etc/mysql/mariadb.conf.d" ]]; then
-                my_cnf="/etc/mysql/mariadb.conf.d/99-sre-tuning.cnf"
-            elif [[ -d "/etc/mysql/conf.d" ]]; then
-                my_cnf="/etc/mysql/conf.d/99-sre-tuning.cnf"
-            elif [[ -d "/etc/my.cnf.d" ]]; then
-                my_cnf="/etc/my.cnf.d/99-sre-tuning.cnf"
-            else
-                my_cnf="/etc/mysql/conf.d/99-sre-tuning.cnf"
-                mkdir -p "$(dirname "$my_cnf")"
-            fi
+# --- Apply Database Tuning (loop through installed engines) ---
+if [[ "$db_engines_config" != "none" && -n "$db_engines_config" ]]; then
+    IFS=',' read -ra _tune_engines <<< "$db_engines_config"
+    for _tune_engine in "${_tune_engines[@]}"; do
+        _tune_engine=$(echo "$_tune_engine" | tr -d ' ')
+        [[ -z "$_tune_engine" || "$_tune_engine" == "none" ]] && continue
 
-            # Note: datadir is intentionally NOT set here.
-            # It is managed by 99-sre-datadir.cnf (step 00) to avoid conflicts.
-            db_config="[mysqld]
+        case "$_tune_engine" in
+            mariadb|mysql)
+                my_cnf=""
+                if [[ -d "/etc/mysql/mariadb.conf.d" ]]; then
+                    my_cnf="/etc/mysql/mariadb.conf.d/99-sre-tuning.cnf"
+                elif [[ -d "/etc/mysql/conf.d" ]]; then
+                    my_cnf="/etc/mysql/conf.d/99-sre-tuning.cnf"
+                elif [[ -d "/etc/my.cnf.d" ]]; then
+                    my_cnf="/etc/my.cnf.d/99-sre-tuning.cnf"
+                else
+                    my_cnf="/etc/mysql/conf.d/99-sre-tuning.cnf"
+                    mkdir -p "$(dirname "$my_cnf")"
+                fi
+
+                db_config="[mysqld]
 innodb_buffer_pool_size = ${db_buffer_pool}M
 max_connections = $db_max_connections
 innodb_log_file_size = $((db_buffer_pool / 4))M
@@ -245,38 +248,38 @@ query_cache_type = 0
 tmp_table_size = 64M
 max_heap_table_size = 64M"
 
-            if [[ "$SRE_DRY_RUN" != "true" ]]; then
-                [[ -f "$my_cnf" ]] && backup_config "$my_cnf"
-                echo "$db_config" > "$my_cnf"
-                sre_success "MySQL/MariaDB tuned: $my_cnf"
-            else
-                sre_info "[DRY-RUN] Would tune MySQL/MariaDB: buffer_pool=${db_buffer_pool}M, max_connections=$db_max_connections"
-            fi
-            ;;
-        postgresql)
-            pg_conf=""
-            pg_conf=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
-            if [[ -z "$pg_conf" ]]; then
-                pg_conf="/var/lib/pgsql/data/postgresql.conf"
-            fi
-
-            if [[ -f "$pg_conf" ]]; then
                 if [[ "$SRE_DRY_RUN" != "true" ]]; then
-                    backup_config "$pg_conf"
-                    # shared_buffers = 25% of RAM
-                    sed -i "s/^#*shared_buffers\s*=.*/shared_buffers = ${db_buffer_pool}MB/" "$pg_conf"
-                    sed -i "s/^#*max_connections\s*=.*/max_connections = $db_max_connections/" "$pg_conf"
-                    sed -i "s/^#*effective_cache_size\s*=.*/effective_cache_size = $((ram * 3 / 4))MB/" "$pg_conf"
-                    sed -i "s/^#*work_mem\s*=.*/work_mem = $((ram / db_max_connections))MB/" "$pg_conf"
-                    sre_success "PostgreSQL tuned: $pg_conf"
+                    [[ -f "$my_cnf" ]] && backup_config "$my_cnf"
+                    echo "$db_config" > "$my_cnf"
+                    sre_success "$_tune_engine tuned: $my_cnf"
                 else
-                    sre_info "[DRY-RUN] Would tune PostgreSQL: shared_buffers=${db_buffer_pool}MB"
+                    sre_info "[DRY-RUN] Would tune $_tune_engine: buffer_pool=${db_buffer_pool}M, max_connections=$db_max_connections"
                 fi
-            else
-                sre_warning "PostgreSQL config not found"
-            fi
-            ;;
-    esac
+                ;;
+            postgresql)
+                pg_conf=""
+                pg_conf=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
+                if [[ -z "$pg_conf" ]]; then
+                    pg_conf="/var/lib/pgsql/data/postgresql.conf"
+                fi
+
+                if [[ -f "$pg_conf" ]]; then
+                    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+                        backup_config "$pg_conf"
+                        sed -i "s/^#*shared_buffers\s*=.*/shared_buffers = ${db_buffer_pool}MB/" "$pg_conf"
+                        sed -i "s/^#*max_connections\s*=.*/max_connections = $db_max_connections/" "$pg_conf"
+                        sed -i "s/^#*effective_cache_size\s*=.*/effective_cache_size = $((ram * 3 / 4))MB/" "$pg_conf"
+                        sed -i "s/^#*work_mem\s*=.*/work_mem = $((ram / db_max_connections))MB/" "$pg_conf"
+                        sre_success "PostgreSQL tuned: $pg_conf"
+                    else
+                        sre_info "[DRY-RUN] Would tune PostgreSQL: shared_buffers=${db_buffer_pool}MB"
+                    fi
+                else
+                    sre_warning "PostgreSQL config not found"
+                fi
+                ;;
+        esac
+    done
 fi
 
 # --- Restart Services ---
@@ -302,21 +305,14 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         sre_success "Apache reloaded"
     fi
 
-    if [[ "$db_engine" == "mariadb" || "$db_engine" == "mysql" ]]; then
-        db_svc=""
-        case "$os_family" in
-            debian) db_svc="mariadb"
-                    [[ "$db_engine" == "mysql" ]] && db_svc="mysql"
-                    ;;
-            rhel)   db_svc="mariadb"
-                    [[ "$db_engine" == "mysql" ]] && db_svc="mysqld"
-                    ;;
-        esac
-        svc_restart "$db_svc"
-        sre_success "Database restarted"
-    elif [[ "$db_engine" == "postgresql" ]]; then
-        svc_restart postgresql
-        sre_success "PostgreSQL restarted"
+    if [[ "$db_engines_config" != "none" && -n "$db_engines_config" ]]; then
+        IFS=',' read -ra _restart_engines <<< "$db_engines_config"
+        for _re in "${_restart_engines[@]}"; do
+            _re=$(echo "$_re" | tr -d ' ')
+            [[ -z "$_re" || "$_re" == "none" ]] && continue
+            svc_restart "$(get_db_svc "$_re")"
+            sre_success "$_re restarted"
+        done
     fi
 else
     sre_info "[DRY-RUN] Would restart PHP-FPM, web server, and database"

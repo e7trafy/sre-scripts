@@ -120,7 +120,8 @@ config_load || { sre_error "Config not found. Run step 1 first."; exit 2; }
 
 web_server=$(config_get "SRE_WEB_SERVER" "")
 os_family=$(config_get "SRE_OS_FAMILY" "debian")
-db_engine=$(config_get "SRE_DB_ENGINE" "none")
+db_engines_config=$(config_get "SRE_DB_ENGINE" "none")
+db_engine=""  # per-project engine, resolved later
 php_version=$(config_get "SRE_PHP_VERSION" "8.3")
 
 # Verify git is installed
@@ -293,7 +294,24 @@ fi
 ################################################################################
 
 needs_db=false
-if [[ "$DEPLOY_TYPE" == "laravel" || "$DEPLOY_TYPE" == "moodle" ]] && [[ "$db_engine" != "none" ]]; then
+if [[ "$DEPLOY_TYPE" == "laravel" || "$DEPLOY_TYPE" == "moodle" ]] && [[ "$db_engines_config" != "none" ]]; then
+
+    # Resolve which engine to use for this project
+    available_engines=()
+    IFS=',' read -ra _eng <<< "$db_engines_config"
+    for e in "${_eng[@]}"; do
+        e=$(echo "$e" | tr -d ' ')
+        [[ -n "$e" && "$e" != "none" ]] && available_engines+=("$e")
+    done
+
+    if [[ ${#available_engines[@]} -eq 1 ]]; then
+        db_engine="${available_engines[0]}"
+    elif [[ ${#available_engines[@]} -gt 1 ]]; then
+        db_engine=$(prompt_choice "Database engine for this project:" "${available_engines[@]}")
+    fi
+
+    sre_info "Database engine: $db_engine"
+
     if prompt_yesno "Create a database for this project?" "yes"; then
         needs_db=true
 

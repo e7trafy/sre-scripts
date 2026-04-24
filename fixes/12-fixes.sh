@@ -1099,11 +1099,17 @@ fix_nginx() {
 fix_db_charset() {
     sre_header "Fix: Database Charset (UTF-8/Arabic)"
 
-    local db_engine
-    db_engine=$(config_get "SRE_DB_ENGINE" "mariadb")
+    local db_engines_cfg
+    db_engines_cfg=$(config_get "SRE_DB_ENGINE" "mariadb")
 
-    if [[ "$db_engine" == "postgresql" ]]; then
-        sre_info "PostgreSQL uses UTF-8 by default. Usually no fix needed."
+    # Check if any MySQL-compatible engine is installed
+    local db_engine=""
+    if [[ ",$db_engines_cfg," == *",mariadb,"* ]]; then
+        db_engine="mariadb"
+    elif [[ ",$db_engines_cfg," == *",mysql,"* ]]; then
+        db_engine="mysql"
+    else
+        sre_info "No MySQL/MariaDB engine found. PostgreSQL uses UTF-8 by default."
         return 0
     fi
 

@@ -91,10 +91,33 @@ else
     config_set "SRE_PHP_EXTRA_VERSIONS" ""
 fi
 
-# --- Database Engine ---
-db_engine=$(prompt_choice "Select database engine:" "mariadb" "mysql" "postgresql" "none")
-config_set "SRE_DB_ENGINE" "$db_engine"
-sre_info "Selected database: $db_engine"
+# --- Database Engines (multi-select) ---
+sre_info "You can install multiple database engines side by side."
+sre_info "Note: MariaDB and MySQL are mutually exclusive (cannot coexist)."
+
+db_engines=""
+
+mysql_compat=$(prompt_choice "MySQL-compatible engine:" "mariadb" "mysql" "skip")
+if [[ "$mysql_compat" != "skip" ]]; then
+    db_engines="$mysql_compat"
+fi
+
+if prompt_yesno "Also install PostgreSQL?" "no"; then
+    [[ -n "$db_engines" ]] && db_engines="${db_engines},postgresql" || db_engines="postgresql"
+fi
+
+[[ -z "$db_engines" ]] && db_engines="none"
+config_set "SRE_DB_ENGINE" "$db_engines"
+sre_info "Selected database(s): $db_engines"
+
+# --- Redis ---
+if prompt_yesno "Install Redis? (caching, sessions, queues)" "yes"; then
+    config_set "SRE_REDIS" "true"
+    sre_info "Redis: will be installed"
+else
+    config_set "SRE_REDIS" "false"
+    sre_info "Redis: skipped"
+fi
 
 # --- Node.js ---
 if prompt_yesno "Install Node.js?" "yes"; then

@@ -297,6 +297,14 @@ get_phpfpm_svc() {
     esac
 }
 
+# Check if a specific database engine is in the installed list (comma-separated SRE_DB_ENGINE)
+has_db_engine() {
+    local engine="$1"
+    local engines
+    engines=$(config_get "SRE_DB_ENGINE" "none")
+    [[ ",$engines," == *",$engine,"* ]]
+}
+
 # Get DB service name
 get_db_svc() {
     local engine="$1"
@@ -578,7 +586,7 @@ declare -A STEP_NAMES=(
 _is_step_skipped() {
     local step="$1"
     case "$step" in
-        5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" ]] && return 0 ;;
+        5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" || -z "$e" ]] && return 0 ;;
         6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
         0|9|10|13) return 0 ;; # block volume, SSH keys, migration and deploy are optional
     esac
