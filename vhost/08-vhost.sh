@@ -28,7 +28,7 @@ Prerequisites: Web server (step 3) must be installed.
 
 Options:
   --domain <name>   Domain name (required, or prompted)
-  --type <type>     Project type: laravel, moodle, nuxt, vue (required, or prompted)
+  --type <type>     Project type: laravel, moodle, wordpress, nuxt, vue, static (required, or prompted)
   --root <path>     Document root (default: /var/www/<domain>/current/public)
   --port <port>     Node.js port for Nuxt (default: 3000)
   --dry-run         Print planned actions without executing
@@ -39,7 +39,9 @@ Options:
 
 Examples:
   sudo bash $0 --domain app.example.com --type laravel
-  sudo bash $0 --domain blog.example.com --type vue --root /var/www/blog/dist
+  sudo bash $0 --domain blog.example.com --type wordpress
+  sudo bash $0 --domain landing.example.com --type static
+  sudo bash $0 --domain spa.example.com --type vue --root /var/www/spa/dist
   sudo bash $0 --domain ssr.example.com --type nuxt --port 3001
 EOF
 }
@@ -83,27 +85,29 @@ if [[ -z "$VHOST_DOMAIN" ]]; then
 fi
 
 if [[ -z "$VHOST_TYPE" ]]; then
-    VHOST_TYPE=$(prompt_choice "Project type:" "laravel" "moodle" "nuxt" "vue")
+    VHOST_TYPE=$(prompt_choice "Project type:" "laravel" "moodle" "wordpress" "nuxt" "vue" "static")
 fi
 
 # Validate project type
 case "$VHOST_TYPE" in
-    laravel|moodle|nuxt|vue) ;;
-    *) sre_error "Invalid project type: $VHOST_TYPE (must be: laravel, moodle, nuxt, vue)"; exit 1 ;;
+    laravel|moodle|wordpress|nuxt|vue|static) ;;
+    *) sre_error "Invalid project type: $VHOST_TYPE (must be: laravel, moodle, wordpress, nuxt, vue, static)"; exit 1 ;;
 esac
 
 # Set default document root based on type
 if [[ -z "$VHOST_ROOT" ]]; then
     case "$VHOST_TYPE" in
-        laravel) VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current/public" ;;
-        moodle)  VHOST_ROOT="/var/www/${VHOST_DOMAIN}/public_html" ;;
-        nuxt)    VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current" ;;
-        vue)     VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current/dist" ;;
+        laravel)   VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current/public" ;;
+        moodle)    VHOST_ROOT="/var/www/${VHOST_DOMAIN}/public_html" ;;
+        wordpress) VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current" ;;
+        nuxt)      VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current" ;;
+        vue)       VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current/dist" ;;
+        static)    VHOST_ROOT="/var/www/${VHOST_DOMAIN}/current" ;;
     esac
 fi
 
-# Select PHP version for this project (Laravel/Moodle only)
-if [[ "$VHOST_TYPE" == "laravel" || "$VHOST_TYPE" == "moodle" ]]; then
+# Select PHP version for this project (Laravel/Moodle/WordPress only)
+if [[ "$VHOST_TYPE" == "laravel" || "$VHOST_TYPE" == "moodle" || "$VHOST_TYPE" == "wordpress" ]]; then
     extra_versions=$(config_get "SRE_PHP_EXTRA_VERSIONS" "")
     if [[ -n "$extra_versions" ]]; then
         # Build list of available versions

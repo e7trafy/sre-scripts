@@ -37,7 +37,7 @@ Prerequisites:
 
 Options:
   --domain <name>        Domain to deploy to (or pick from existing vhosts)
-  --type <type>          Project type: laravel, moodle, nuxt, vue
+  --type <type>          Project type: laravel, moodle, wordpress, nuxt, vue, static
   --repo <url>           Git repository URL (SSH or HTTPS)
   --branch <branch>      Git branch to clone (default: main)
   --dry-run              Print planned actions without executing
@@ -185,21 +185,21 @@ fi
 ################################################################################
 
 if [[ -z "$DEPLOY_TYPE" ]]; then
-    DEPLOY_TYPE=$(prompt_choice "Project type:" "laravel" "moodle" "nuxt" "vue")
+    DEPLOY_TYPE=$(prompt_choice "Project type:" "laravel" "moodle" "wordpress" "nuxt" "vue" "static")
 fi
 
 case "$DEPLOY_TYPE" in
-    laravel|moodle|nuxt|vue) ;;
+    laravel|moodle|wordpress|nuxt|vue|static) ;;
     *) sre_error "Invalid project type: $DEPLOY_TYPE"; exit 1 ;;
 esac
 
 sre_info "Project type: $DEPLOY_TYPE"
 
 ################################################################################
-# PHP version selection (Laravel/Moodle only)
+# PHP version selection (Laravel/Moodle/WordPress only)
 ################################################################################
 
-if [[ "$DEPLOY_TYPE" == "laravel" || "$DEPLOY_TYPE" == "moodle" ]]; then
+if [[ "$DEPLOY_TYPE" == "laravel" || "$DEPLOY_TYPE" == "moodle" || "$DEPLOY_TYPE" == "wordpress" ]]; then
     extra_versions=$(config_get "SRE_PHP_EXTRA_VERSIONS" "")
     if [[ -n "$extra_versions" ]]; then
         available_versions=("$php_version")
@@ -253,6 +253,12 @@ case "$DEPLOY_TYPE" in
         clone_target="${project_dir}/public_html"
         local_root="${project_dir}/public_html"
         ;;
+    wordpress)
+        # WordPress files (index.php, wp-config.php, wp-content/) live at clone root
+        # Document root is current (vhost expects this)
+        clone_target="${project_dir}"
+        local_root="${project_dir}"
+        ;;
     nuxt)
         # Code lives at project_dir root
         # Document root is current (vhost expects this)
@@ -262,6 +268,11 @@ case "$DEPLOY_TYPE" in
     vue)
         # Code lives at project_dir root — build output goes to dist/
         # Document root is current/dist (vhost expects this)
+        clone_target="${project_dir}"
+        local_root="${project_dir}"
+        ;;
+    static)
+        # Plain static files served directly from current/
         clone_target="${project_dir}"
         local_root="${project_dir}"
         ;;
@@ -294,7 +305,7 @@ fi
 ################################################################################
 
 needs_db=false
-if [[ "$DEPLOY_TYPE" == "laravel" || "$DEPLOY_TYPE" == "moodle" ]] && [[ "$db_engines_config" != "none" ]]; then
+if [[ "$DEPLOY_TYPE" == "laravel" || "$DEPLOY_TYPE" == "moodle" || "$DEPLOY_TYPE" == "wordpress" ]] && [[ "$db_engines_config" != "none" ]]; then
 
     # Resolve which engine to use for this project
     available_engines=()
@@ -303,6 +314,20 @@ if [[ "$DEPLOY_TYPE" == "laravel" || "$DEPLOY_TYPE" == "moodle" ]] && [[ "$db_en
         e=$(echo "$e" | tr -d ' ')
         [[ -n "$e" && "$e" != "none" ]] && available_engines+=("$e")
     done
+
+    # WordPress only supports MySQL/MariaDB — filter out PostgreSQL
+    if [[ "$DEPLOY_TYPE" == "wordpress" ]]; then
+        wp_engines=()
+        for e in "${available_engines[@]}"; do
+            [[ "$e" == "mariadb" || "$e" == "mysql" ]] && wp_engines+=("$e")
+        done
+        if [[ ${#wp_engines[@]} -eq 0 ]]; then
+            sre_error "WordPress requires MySQL or MariaDB, but only PostgreSQL is installed."
+            sre_error "Install MariaDB/MySQL via step 5 first."
+            exit 2
+        fi
+        available_engines=("${wp_engines[@]}")
+    fi
 
     if [[ ${#available_engines[@]} -eq 1 ]]; then
         db_engine="${available_engines[0]}"
@@ -385,9 +410,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             mkdir -p "$DEPLOY_MOODLEDATA_DIR"
             sre_success "Created Moodle directory structure"
             ;;
-        nuxt|vue)
-            mkdir -p "$project_dir"
-            sre_success "Created project directory"
+        wordpress|nuxt|vue|static)
+            mkdir -p "${project_dir}/releases"
+            sre_success "Created project directory structure"
             ;;
     esac
 
@@ -500,6 +525,27 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             ;;
 
         vue)
+            release_ts=$(date +%Y%m%d%H%M%S)
+            release_dir="${project_dir}/releases/${release_ts}"
+            mkdir -p "${project_dir}/releases"
+
+            sre_info "Cloning into release: $release_dir"
+            git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
+            git_rc=${PIPESTATUS[0]:-$?}
+
+            if [[ $git_rc -ne 0 ]]; then
+                sre_error "Git clone failed (exit: $git_rc)"
+                rm -rf "$release_dir"
+                exit 1
+            fi
+
+            [[ -d "${project_dir}/current" && ! -L "${project_dir}/current" ]] && rm -rf "${project_dir}/current"
+            ln -sfn "$release_dir" "${project_dir}/current"
+            sre_success "Cloned and linked: current → $release_dir"
+            local_root="$release_dir"
+            ;;
+
+        wordpress|static)
             release_ts=$(date +%Y%m%d%H%M%S)
             release_dir="${project_dir}/releases/${release_ts}"
             mkdir -p "${project_dir}/releases"
@@ -798,6 +844,97 @@ MOODLE_CONFIG
                 fi
             fi
             ;;
+
+        wordpress)
+            sre_info "Configuring WordPress..."
+
+            wp_table_prefix=$(prompt_input "WordPress table prefix" "wp_")
+
+            # Generate wp-config.php from sample if missing
+            wp_config="${local_root}/wp-config.php"
+            wp_sample="${local_root}/wp-config-sample.php"
+
+            if [[ ! -f "$wp_config" ]] && [[ "$needs_db" == "true" ]]; then
+                if [[ -f "$wp_sample" ]]; then
+                    cp "$wp_sample" "$wp_config"
+                    sre_info "Created wp-config.php from wp-config-sample.php"
+                else
+                    sre_warning "No wp-config-sample.php found — generating minimal wp-config.php"
+                    cat > "$wp_config" <<'WP_HEADER'
+<?php
+define('DB_NAME',     '__DB_NAME__');
+define('DB_USER',     '__DB_USER__');
+define('DB_PASSWORD', '__DB_PASS__');
+define('DB_HOST',     'localhost');
+define('DB_CHARSET',  'utf8mb4');
+define('DB_COLLATE',  '');
+
+define('AUTH_KEY',         '__AUTH_KEY__');
+define('SECURE_AUTH_KEY',  '__SECURE_AUTH_KEY__');
+define('LOGGED_IN_KEY',    '__LOGGED_IN_KEY__');
+define('NONCE_KEY',        '__NONCE_KEY__');
+define('AUTH_SALT',        '__AUTH_SALT__');
+define('SECURE_AUTH_SALT', '__SECURE_AUTH_SALT__');
+define('LOGGED_IN_SALT',   '__LOGGED_IN_SALT__');
+define('NONCE_SALT',       '__NONCE_SALT__');
+
+$table_prefix = 'wp_';
+
+define('WP_DEBUG', false);
+
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/' );
+}
+require_once ABSPATH . 'wp-settings.php';
+WP_HEADER
+                fi
+            fi
+
+            if [[ -f "$wp_config" ]] && [[ "$needs_db" == "true" ]]; then
+                # DB credentials
+                sed -i "s|define( *['\"]DB_NAME['\"] *,.*|define('DB_NAME', '${DEPLOY_DB_NAME}');|" "$wp_config"
+                sed -i "s|define( *['\"]DB_USER['\"] *,.*|define('DB_USER', '${DEPLOY_DB_USER}');|" "$wp_config"
+                sed -i "s|define( *['\"]DB_PASSWORD['\"] *,.*|define('DB_PASSWORD', '${DEPLOY_DB_PASS}');|" "$wp_config"
+                sed -i "s|define( *['\"]DB_HOST['\"] *,.*|define('DB_HOST', 'localhost');|" "$wp_config"
+                sed -i "s|define( *['\"]DB_CHARSET['\"] *,.*|define('DB_CHARSET', 'utf8mb4');|" "$wp_config"
+
+                # Table prefix
+                sed -i "s|^\$table_prefix *=.*|\$table_prefix = '${wp_table_prefix}';|" "$wp_config"
+
+                # Replace fallback placeholders if minimal config was generated
+                sed -i "s|__DB_NAME__|${DEPLOY_DB_NAME}|g" "$wp_config"
+                sed -i "s|__DB_USER__|${DEPLOY_DB_USER}|g" "$wp_config"
+                sed -i "s|__DB_PASS__|${DEPLOY_DB_PASS}|g" "$wp_config"
+
+                # Generate unique salt keys (8 keys)
+                for salt_key in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY \
+                                AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+                    salt_val=$(openssl rand -base64 64 | tr -d '\n' | tr -d '"' | tr -d "'" | tr -d '\\' | cut -c1-64)
+                    # Replace both real-config style placeholder ('put your...here')
+                    # and our minimal-config placeholder (__AUTH_KEY__ etc.)
+                    sed -i "s|define( *['\"]${salt_key}['\"] *,.*|define('${salt_key}', '${salt_val}');|" "$wp_config"
+                    sed -i "s|__${salt_key}__|${salt_val}|g" "$wp_config"
+                done
+
+                sre_success "wp-config.php configured (DB + unique salts, prefix: ${wp_table_prefix})"
+            elif [[ "$needs_db" != "true" ]]; then
+                sre_warning "No database — wp-config.php skipped (manual setup required)"
+            fi
+            ;;
+
+        static)
+            sre_info "Static site — no build step needed"
+            sre_info "Files served directly from: ${local_root}"
+            # If repo has a build script, optionally run it
+            if [[ -f "${local_root}/package.json" ]]; then
+                if prompt_yesno "Found package.json — run npm install && npm run build?" "no"; then
+                    cd "$local_root"
+                    npm install 2>&1 | tail -3
+                    npm run build 2>&1 | tail -5
+                    sre_success "Static site built"
+                fi
+            fi
+            ;;
     esac
 
     # Reload web server
@@ -910,6 +1047,25 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 chmod 640 "${local_root}/config.php"
                 setfacl -m u:www-data:r-- "${local_root}/config.php"
                 sre_success "config.php: 640, www-data read-only"
+            fi
+            ;;
+
+        wordpress)
+            # wp-content (uploads, plugins, themes) needs to be writable
+            if [[ -d "${local_root}/wp-content" ]]; then
+                chmod -R 775 "${local_root}/wp-content"
+                setfacl -R -m u:www-data:rwX "${local_root}/wp-content"
+                setfacl -R -m d:u:www-data:rwX "${local_root}/wp-content"
+                setfacl -R -m g:www-data:rwX "${local_root}/wp-content"
+                setfacl -R -m d:g:www-data:rwX "${local_root}/wp-content"
+                sre_success "WordPress: wp-content → 775, ACL rwX"
+            fi
+
+            # wp-config.php holds DB credentials — restrict
+            if [[ -f "${local_root}/wp-config.php" ]]; then
+                chmod 640 "${local_root}/wp-config.php"
+                setfacl -m u:www-data:r-- "${local_root}/wp-config.php"
+                sre_success "wp-config.php: 640, www-data read-only"
             fi
             ;;
     esac

@@ -52,7 +52,7 @@ Options:
   --source-user <user>   SSH user on source server (default: root)
   --source-port <port>   SSH port on source server (default: 22)
   --source-path <path>   Project root on source server
-  --type <type>          Project type: laravel, moodle, nuxt, vue
+  --type <type>          Project type: laravel, moodle, wordpress, nuxt, vue, static
   --mode <mode>          Migration mode: full, rsync-only, db-only
   --dry-run              Print planned actions without executing
   --yes                  Accept defaults without prompting
@@ -223,11 +223,11 @@ esac
 ################################################################################
 
 if [[ -z "$MIG_PROJECT_TYPE" ]]; then
-    MIG_PROJECT_TYPE=$(prompt_choice "Project type:" "laravel" "moodle" "nuxt" "vue")
+    MIG_PROJECT_TYPE=$(prompt_choice "Project type:" "laravel" "moodle" "wordpress" "nuxt" "vue" "static")
 fi
 
 case "$MIG_PROJECT_TYPE" in
-    laravel|moodle|nuxt|vue) ;;
+    laravel|moodle|wordpress|nuxt|vue|static) ;;
     *) sre_error "Invalid project type: $MIG_PROJECT_TYPE"; exit 1 ;;
 esac
 
@@ -317,10 +317,12 @@ fi
 ################################################################################
 
 case "$MIG_PROJECT_TYPE" in
-    laravel) local_root="/var/www/${MIG_DOMAIN}/current" ;;
-    moodle)  local_root="/var/www/${MIG_DOMAIN}/public_html" ;;
-    nuxt)    local_root="/var/www/${MIG_DOMAIN}/current" ;;
-    vue)     local_root="/var/www/${MIG_DOMAIN}/current/dist" ;;
+    laravel)   local_root="/var/www/${MIG_DOMAIN}/current" ;;
+    moodle)    local_root="/var/www/${MIG_DOMAIN}/public_html" ;;
+    wordpress) local_root="/var/www/${MIG_DOMAIN}/current" ;;
+    nuxt)      local_root="/var/www/${MIG_DOMAIN}/current" ;;
+    vue)       local_root="/var/www/${MIG_DOMAIN}/current/dist" ;;
+    static)    local_root="/var/www/${MIG_DOMAIN}/current" ;;
 esac
 
 # Moodle: moodledata must live OUTSIDE the web root.
@@ -351,7 +353,7 @@ sre_info "Local root: $local_root"
 
 needs_db=false
 case "$MIG_PROJECT_TYPE" in
-    laravel|moodle) [[ "$do_db" == "true" ]] && needs_db=true ;;
+    laravel|moodle|wordpress) [[ "$do_db" == "true" ]] && needs_db=true ;;
 esac
 
 if [[ "$needs_db" == "true" ]]; then
@@ -368,6 +370,19 @@ if [[ "$needs_db" == "true" ]]; then
         e=$(echo "$e" | tr -d ' ')
         [[ -n "$e" && "$e" != "none" ]] && available_engines+=("$e")
     done
+
+    # WordPress only supports MySQL/MariaDB — filter
+    if [[ "$MIG_PROJECT_TYPE" == "wordpress" ]]; then
+        wp_engines=()
+        for e in "${available_engines[@]}"; do
+            [[ "$e" == "mariadb" || "$e" == "mysql" ]] && wp_engines+=("$e")
+        done
+        if [[ ${#wp_engines[@]} -eq 0 ]]; then
+            sre_error "WordPress requires MySQL or MariaDB."
+            exit 2
+        fi
+        available_engines=("${wp_engines[@]}")
+    fi
 
     if [[ ${#available_engines[@]} -eq 1 ]]; then
         db_engine="${available_engines[0]}"
@@ -404,6 +419,18 @@ if [[ "$needs_db" == "true" ]]; then
                     sre_success "Detected source DB: $MIG_SOURCE_DB_NAME (user: $MIG_SOURCE_DB_USER)"
                 else
                     sre_warning "Could not read config.php from source."
+                fi
+                ;;
+            wordpress)
+                source_wpconf=$(ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+                    "cat ${MIG_SOURCE_PATH}/wp-config.php 2>/dev/null" || true)
+                if [[ -n "$source_wpconf" ]]; then
+                    MIG_SOURCE_DB_NAME=$(echo "$source_wpconf" | grep -oP "define\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]?\K[^'\")]+" | head -1)
+                    MIG_SOURCE_DB_USER=$(echo "$source_wpconf" | grep -oP "define\(\s*['\"]DB_USER['\"]\s*,\s*['\"]?\K[^'\")]+" | head -1)
+                    MIG_SOURCE_DB_PASS=$(echo "$source_wpconf" | grep -oP "define\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]?\K[^'\")]+" | head -1)
+                    sre_success "Detected source DB: $MIG_SOURCE_DB_NAME (user: $MIG_SOURCE_DB_USER)"
+                else
+                    sre_warning "Could not read wp-config.php from source."
                 fi
                 ;;
         esac
@@ -693,7 +720,7 @@ REMOTE_DUMP
         sre_info "[DRY-RUN] Would dump source DB and import into $MIG_DB_NAME"
     fi
 else
-    if [[ "$do_db" == "true" ]] && [[ "$MIG_PROJECT_TYPE" == "nuxt" || "$MIG_PROJECT_TYPE" == "vue" ]]; then
+    if [[ "$do_db" == "true" ]] && [[ "$MIG_PROJECT_TYPE" == "nuxt" || "$MIG_PROJECT_TYPE" == "vue" || "$MIG_PROJECT_TYPE" == "static" ]]; then
         sre_skipped "No database needed for $MIG_PROJECT_TYPE projects"
     elif [[ "$do_db" == "false" ]]; then
         sre_skipped "Database migration (mode: $MIG_MODE)"
@@ -925,6 +952,44 @@ MOODLE_CONFIG
                     sre_skipped "npm install/build"
                 fi
             fi
+            ;;
+
+        wordpress)
+            sre_info "Configuring WordPress..."
+
+            wp_config="${local_root}/wp-config.php"
+
+            if [[ -f "$wp_config" ]] && [[ "$needs_db" == "true" ]]; then
+                # Detect existing table prefix to preserve it (matches migrated DB)
+                source_prefix=$(grep -oP "^\s*\\\$table_prefix\s*=\s*['\"]?\K[^'\"]+" "$wp_config" | head -1)
+                wp_table_prefix="${source_prefix:-wp_}"
+                sre_info "Preserving table prefix: $wp_table_prefix"
+
+                cp "$wp_config" "${wp_config}.bak"
+
+                # Update DB credentials to local — keep prefix and salts as-is
+                sed -i "s|define( *['\"]DB_NAME['\"] *,.*|define('DB_NAME', '${MIG_DB_NAME}');|" "$wp_config"
+                sed -i "s|define( *['\"]DB_USER['\"] *,.*|define('DB_USER', '${MIG_DB_USER}');|" "$wp_config"
+                sed -i "s|define( *['\"]DB_PASSWORD['\"] *,.*|define('DB_PASSWORD', '${MIG_DB_PASS}');|" "$wp_config"
+                sed -i "s|define( *['\"]DB_HOST['\"] *,.*|define('DB_HOST', 'localhost');|" "$wp_config"
+
+                sre_success "wp-config.php updated with local DB credentials (backup: ${wp_config}.bak)"
+
+                # Update siteurl/home in DB to new domain
+                if prompt_yesno "Update WordPress siteurl/home to http://${MIG_DOMAIN} in DB?" "yes"; then
+                    $mysql_cmd "$MIG_DB_NAME" -e \
+                        "UPDATE \`${wp_table_prefix}options\` SET option_value='http://${MIG_DOMAIN}' WHERE option_name IN ('siteurl','home');" 2>/dev/null \
+                        && sre_success "DB siteurl/home updated to http://${MIG_DOMAIN}" \
+                        || sre_warning "Could not update siteurl/home (may need manual update via wp-cli search-replace)"
+                fi
+            else
+                sre_warning "wp-config.php not found at $wp_config — skipping config update"
+            fi
+            ;;
+
+        static)
+            sre_info "Static site — no post-migration steps needed"
+            sre_info "Files served directly from: ${local_root}"
             ;;
     esac
 

@@ -295,6 +295,9 @@ case "$web_server" in
         if grep -q 'fastcgi_pass' "$vhost_conf" 2>/dev/null; then
             if grep -q 'pluginfile.php\|moodledata' "$vhost_conf" 2>/dev/null; then
                 vhost_type="moodle"
+            elif grep -q 'wp-config\.php\|wp-content' "$vhost_conf" 2>/dev/null \
+                 || [[ -f "${doc_root}/wp-config.php" ]]; then
+                vhost_type="wordpress"
             else
                 vhost_type="laravel"
             fi
@@ -302,6 +305,8 @@ case "$web_server" in
             vhost_type="nuxt"
         elif grep -q 'try_files.*index.html' "$vhost_conf" 2>/dev/null; then
             vhost_type="vue"
+        elif grep -q 'try_files.*=404' "$vhost_conf" 2>/dev/null; then
+            vhost_type="static"
         fi
 
         sre_info "Detected vhost type: $vhost_type"
@@ -396,7 +401,12 @@ NGINX_CONF
 
             # Read inner content from original template (clean, no injected bits)
             apache_type="laravel"
-            grep -qi 'moodle\|pluginfile' "$vhost_conf" 2>/dev/null && apache_type="moodle"
+            if grep -qi 'moodle\|pluginfile' "$vhost_conf" 2>/dev/null; then
+                apache_type="moodle"
+            elif grep -qi 'wp-config\|wp-content' "$vhost_conf" 2>/dev/null \
+                 || [[ -f "${doc_root}/wp-config.php" ]]; then
+                apache_type="wordpress"
+            fi
             apache_template="${SCRIPT_DIR}/vhost/templates/apache-${apache_type}.conf"
             [[ ! -f "$apache_template" ]] && apache_template="${SCRIPT_DIR}/vhost/templates/apache-laravel.conf"
 
