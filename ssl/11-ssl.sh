@@ -14,32 +14,44 @@ CURRENT_STEP=11
 
 SSL_DOMAIN=""
 SSL_EMAIL=""
+SSL_PREFER_WILDCARD="yes"   # auto-detect existing wildcard cert before LE
+SSL_WILDCARD_DIR=""         # extra search dir for non-LE wildcard certs
+SSL_FORCE_LE="false"        # skip wildcard detection entirely
 
 sre_show_help() {
     cat <<EOF
 Usage: sudo bash $0 [OPTIONS]
 
 Step 11: SSL Certificate Setup
-  Obtains a Let's Encrypt certificate via Certbot for a domain
-  and configures the web server for HTTPS with HTTP→HTTPS redirect.
+  Configures HTTPS for a domain with HTTP→HTTPS redirect.
 
-  Uses certbot certonly (webroot method) — does not rely on the
-  certbot nginx/apache plugin rewriting your vhost config.
+  Cert source precedence (highest first):
+    1. Existing WILDCARD certificate covering the domain
+       Searches /etc/letsencrypt/live/* and any --wildcard-dir.
+    2. Existing exact-match certificate at /etc/letsencrypt/live/<domain>
+    3. Let's Encrypt via Certbot (webroot, then standalone fallback)
+
+  Uses certbot certonly (webroot method) when issuing — does not rely on
+  the certbot nginx/apache plugin rewriting your vhost config.
 
 Prerequisites: Virtual host (step 8) must exist for the domain.
 
 Options:
-  --domain <name>   Domain name (required, or prompted)
-  --email <addr>    Email for Let's Encrypt registration (required, or prompted)
-  --dry-run         Print planned actions without executing
-  --yes             Accept defaults without prompting
-  --config          Override config file path
-  --log             Override log file path
-  --help            Show this help
+  --domain <name>      Domain name (required, or prompted)
+  --email <addr>       Email for Let's Encrypt (required only if no wildcard)
+  --wildcard-dir <p>   Extra dir to scan for non-LE wildcard certs.
+                       Layout: <p>/<base.domain>/{fullchain.pem,privkey.pem}
+  --no-wildcard        Skip wildcard detection, force Let's Encrypt
+  --dry-run            Print planned actions without executing
+  --yes                Accept defaults without prompting
+  --config             Override config file path
+  --log                Override log file path
+  --help               Show this help
 
 Examples:
   sudo bash $0 --domain app.example.com --email admin@example.com
-  sudo bash $0 --domain app.example.com --email admin@example.com --dry-run
+  sudo bash $0 --domain app.example.com --no-wildcard --email admin@example.com
+  sudo bash $0 --domain app.example.com --wildcard-dir /etc/ssl/wildcards
 EOF
 }
 
@@ -50,8 +62,10 @@ sre_parse_args "11-ssl.sh" "${_raw_args[@]}"
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --domain) ((_i++)); SSL_DOMAIN="${_raw_args[$_i]:-}" ;;
-        --email)  ((_i++)); SSL_EMAIL="${_raw_args[$_i]:-}" ;;
+        --domain)        ((_i++)); SSL_DOMAIN="${_raw_args[$_i]:-}" ;;
+        --email)         ((_i++)); SSL_EMAIL="${_raw_args[$_i]:-}" ;;
+        --wildcard-dir)  ((_i++)); SSL_WILDCARD_DIR="${_raw_args[$_i]:-}" ;;
+        --no-wildcard)   SSL_FORCE_LE="true"; SSL_PREFER_WILDCARD="no" ;;
     esac
     ((_i++))
 done
@@ -115,13 +129,7 @@ if [[ -z "$SSL_DOMAIN" ]]; then
     [[ -z "$SSL_DOMAIN" ]] && { sre_error "Domain is required."; exit 1; }
 fi
 
-if [[ -z "$SSL_EMAIL" ]]; then
-    SSL_EMAIL=$(prompt_input "Email for Let's Encrypt registration" "me@abdullah.link")
-    [[ -z "$SSL_EMAIL" ]] && { sre_error "Email is required."; exit 1; }
-fi
-
 sre_info "Domain:     $SSL_DOMAIN"
-sre_info "Email:      $SSL_EMAIL"
 sre_info "Web server: $web_server"
 
 # --- Locate existing vhost config ---
@@ -176,7 +184,174 @@ fi
 
 # --- Check for existing certificate ---
 cert_dir="/etc/letsencrypt/live/${SSL_DOMAIN}"
-if [[ -d "$cert_dir" ]]; then
+
+################################################################################
+# Wildcard certificate detection
+#
+# If a wildcard cert (e.g. *.example.com) covers the domain, reuse it instead
+# of requesting a new Let's Encrypt cert. Skips Certbot entirely on hit.
+#
+# Search locations (in order):
+#   1. /etc/letsencrypt/live/*           — LE-issued wildcards
+#   2. $SSL_WILDCARD_DIR/<base>/         — manually-installed wildcards
+#   3. /etc/ssl/wildcards/<base>/        — default extra location
+#
+# A cert "matches" the domain if its SANs include *.<parent> for any parent
+# label of the domain, OR the bare parent itself.
+################################################################################
+
+SSL_USE_WILDCARD="false"
+SSL_WILDCARD_CERT=""
+SSL_WILDCARD_KEY=""
+SSL_WILDCARD_SOURCE=""
+
+# Build list of parent domains that a wildcard could match.
+# For app.staging.example.com, candidates are:
+#   *.staging.example.com  (matches app)
+#   *.example.com          (matches staging.example.com — only if domain has 3+ labels with that parent)
+# Wildcards match exactly one label so we generate one entry per ancestor with
+# at least one label below it.
+_build_wildcard_candidates() {
+    local d="$1"
+    local result=()
+    # Strip first label until 1 label remains
+    while [[ "$d" == *.* ]]; do
+        local parent="${d#*.}"
+        # Only meaningful if parent itself has a dot (skip "tld" alone)
+        [[ "$parent" == *.* ]] || break
+        result+=("*.${parent}")
+        d="$parent"
+    done
+    printf '%s\n' "${result[@]}"
+}
+
+# Verify a cert+key pair covers the domain via a wildcard SAN match
+# Args: cert_path
+# Returns 0 + prints matching SAN if match, 1 otherwise
+_cert_covers_domain() {
+    local cert="$1" domain="$2"
+    [[ ! -r "$cert" ]] && return 1
+    command -v openssl &>/dev/null || return 1
+
+    # Get all SANs (DNS:foo, DNS:*.bar) from the cert
+    local sans
+    sans=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null \
+        | grep -oP 'DNS:\K[^,\s]+' || true)
+    [[ -z "$sans" ]] && return 1
+
+    # Direct exact match (rare but possible)
+    while IFS= read -r san; do
+        [[ -z "$san" ]] && continue
+        if [[ "$san" == "$domain" ]]; then
+            echo "$san"
+            return 0
+        fi
+        # Wildcard *.parent matches first label of domain only
+        if [[ "$san" == \*.* ]]; then
+            local parent="${san#*.}"
+            # Domain must end with .parent and have exactly one extra label before it
+            if [[ "$domain" == *.${parent} ]]; then
+                local prefix="${domain%.${parent}}"
+                # prefix must be a single label (no dots)
+                if [[ -n "$prefix" && "$prefix" != *.* ]]; then
+                    echo "$san"
+                    return 0
+                fi
+            fi
+        fi
+    done <<<"$sans"
+    return 1
+}
+
+# Verify cert is not expired and warn if expiring soon (<30d)
+_cert_expiry_check() {
+    local cert="$1"
+    if ! openssl x509 -in "$cert" -noout -checkend 0 &>/dev/null; then
+        sre_error "  Certificate is EXPIRED: $cert"
+        return 1
+    fi
+    if ! openssl x509 -in "$cert" -noout -checkend $((30*86400)) &>/dev/null; then
+        local enddate
+        enddate=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+        sre_warning "  Certificate expires within 30 days: $enddate"
+    fi
+    return 0
+}
+
+# Search dirs and emit matching cert paths
+_find_wildcard_cert() {
+    local domain="$1"
+    local search_dirs=()
+    [[ -d /etc/letsencrypt/live ]] && search_dirs+=(/etc/letsencrypt/live)
+    [[ -n "$SSL_WILDCARD_DIR" && -d "$SSL_WILDCARD_DIR" ]] && search_dirs+=("$SSL_WILDCARD_DIR")
+    [[ -d /etc/ssl/wildcards ]] && search_dirs+=(/etc/ssl/wildcards)
+
+    [[ ${#search_dirs[@]} -eq 0 ]] && return 1
+
+    local d cert_path key_path matched_san
+    for d in "${search_dirs[@]}"; do
+        # Each subdir holds a fullchain.pem + privkey.pem (LE convention)
+        while IFS= read -r cert_path; do
+            [[ -z "$cert_path" ]] && continue
+            [[ ! -f "$cert_path" ]] && continue
+
+            # Skip the exact-match dir for the domain we're configuring —
+            # that's not a "wildcard reuse", that's a normal renewal.
+            local subdir
+            subdir=$(basename "$(dirname "$cert_path")")
+            [[ "$subdir" == "$domain" ]] && continue
+
+            # Try matching
+            if matched_san=$(_cert_covers_domain "$cert_path" "$domain"); then
+                # Only consider it a "wildcard" hit if the matching SAN is *.something
+                # (don't auto-reuse another exact-match cert for a different domain)
+                [[ "$matched_san" != \*.* ]] && continue
+
+                # Look for sibling key
+                local certdir
+                certdir=$(dirname "$cert_path")
+                key_path="${certdir}/privkey.pem"
+                [[ ! -f "$key_path" ]] && continue
+
+                # Validate not expired
+                _cert_expiry_check "$cert_path" || continue
+
+                printf '%s|%s|%s\n' "$cert_path" "$key_path" "$matched_san"
+                return 0
+            fi
+        done < <(find "$d" -maxdepth 2 -name 'fullchain.pem' -type f 2>/dev/null)
+    done
+    return 1
+}
+
+if [[ "$SSL_FORCE_LE" != "true" ]] && [[ "$SSL_PREFER_WILDCARD" == "yes" ]]; then
+    sre_header "Checking for Existing Wildcard Certificate"
+
+    if ! command -v openssl &>/dev/null; then
+        sre_warning "openssl not found — cannot scan for wildcard certs. Falling back to Let's Encrypt."
+    else
+        sre_info "Scanning for wildcard certs covering $SSL_DOMAIN..."
+        wc_match=$(_find_wildcard_cert "$SSL_DOMAIN" || true)
+        if [[ -n "$wc_match" ]]; then
+            IFS='|' read -r SSL_WILDCARD_CERT SSL_WILDCARD_KEY matched_san <<<"$wc_match"
+            SSL_WILDCARD_SOURCE=$(dirname "$SSL_WILDCARD_CERT")
+            SSL_USE_WILDCARD="true"
+            sre_success "Found wildcard certificate covering $SSL_DOMAIN"
+            sre_info "  Matched SAN:  $matched_san"
+            sre_info "  Cert path:    $SSL_WILDCARD_CERT"
+            sre_info "  Key path:     $SSL_WILDCARD_KEY"
+
+            if ! prompt_yesno "Use this wildcard cert (skip Let's Encrypt)?" "yes"; then
+                SSL_USE_WILDCARD="false"
+                sre_info "User declined wildcard — will request Let's Encrypt cert"
+            fi
+        else
+            sre_info "No wildcard cert found — will use Let's Encrypt"
+        fi
+    fi
+fi
+
+if [[ "$SSL_USE_WILDCARD" != "true" ]] && [[ -d "$cert_dir" ]]; then
     sre_warning "Certificate already exists for $SSL_DOMAIN"
     if ! prompt_yesno "Renew/replace the certificate?" "no"; then
         sre_skipped "SSL setup skipped (certificate already exists)"
@@ -185,70 +360,100 @@ if [[ -d "$cert_dir" ]]; then
     fi
 fi
 
-# --- Install Certbot if needed ---
-if ! command -v certbot &>/dev/null; then
-    sre_info "Installing Certbot..."
-    if [[ "$SRE_DRY_RUN" != "true" ]]; then
-        case "$os_family" in
-            debian) pkg_install certbot ;;
-            rhel)   pkg_install certbot ;;
-        esac
-        sre_success "Certbot installed"
-    else
-        sre_info "[DRY-RUN] Would install certbot"
-    fi
-fi
-
-################################################################################
-# Obtain Certificate (webroot method — does not touch vhost config)
-################################################################################
-
-sre_header "Obtaining SSL Certificate"
-
-# Use a dedicated webroot dir for ACME challenges (never inside app root).
-# The vhost templates already include a location block pointing here.
+# Acme webroot used both by Let's Encrypt issuance and by the HTTP→HTTPS
+# redirect server block (so future LE renewals on top of a wildcard still work).
 acme_webroot="/var/www/letsencrypt"
 
-if [[ "$SRE_DRY_RUN" != "true" ]]; then
+if [[ "$SSL_USE_WILDCARD" == "true" ]]; then
+    sre_header "Using Existing Wildcard Certificate"
+    sre_info "  Source:  $SSL_WILDCARD_SOURCE"
+    sre_info "  Cert:    $SSL_WILDCARD_CERT"
+    sre_info "  Key:     $SSL_WILDCARD_KEY"
+    sre_info "Skipping Certbot — wildcard is renewed by whoever issued it."
 
-    # Ensure the dedicated webroot exists and is served
-    mkdir -p "${acme_webroot}/.well-known/acme-challenge"
+    # Ensure ACME webroot still exists (vhost will reference it)
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        mkdir -p "${acme_webroot}/.well-known/acme-challenge"
+    fi
+else
+    # --- Email prompt (only needed when we're actually calling Certbot) ---
+    if [[ -z "$SSL_EMAIL" ]]; then
+        SSL_EMAIL=$(prompt_input "Email for Let's Encrypt registration" "me@abdullah.link")
+        [[ -z "$SSL_EMAIL" ]] && { sre_error "Email is required."; exit 1; }
+    fi
+    sre_info "Email:      $SSL_EMAIL"
 
-    certbot_args=(
-        "certonly"
-        "--webroot"
-        "-w" "$acme_webroot"
-        "-d" "$SSL_DOMAIN"
-        "--non-interactive"
-        "--agree-tos"
-        "--email" "$SSL_EMAIL"
-    )
+    # --- Install Certbot if needed ---
+    if ! command -v certbot &>/dev/null; then
+        sre_info "Installing Certbot..."
+        if [[ "$SRE_DRY_RUN" != "true" ]]; then
+            case "$os_family" in
+                debian) pkg_install certbot ;;
+                rhel)   pkg_install certbot ;;
+            esac
+            sre_success "Certbot installed"
+        else
+            sre_info "[DRY-RUN] Would install certbot"
+        fi
+    fi
 
-    sre_info "Running: certbot ${certbot_args[*]}"
-    if ! certbot "${certbot_args[@]}"; then
-        sre_warning "Webroot method failed. Trying standalone (requires port 80 free)..."
+    ############################################################################
+    # Obtain Certificate (webroot method — does not touch vhost config)
+    ############################################################################
 
-        # Stop web server temporarily for standalone
-        case "$web_server" in
-            nginx)  systemctl stop nginx  2>/dev/null || true ;;
-            apache) case "$os_family" in
-                        debian) systemctl stop apache2 2>/dev/null || true ;;
-                        rhel)   systemctl stop httpd   2>/dev/null || true ;;
-                    esac ;;
-        esac
+    sre_header "Obtaining SSL Certificate"
 
-        certbot certonly \
-            --standalone \
-            -d "$SSL_DOMAIN" \
-            --non-interactive \
-            --agree-tos \
-            --email "$SSL_EMAIL" || {
-            sre_error "Certbot failed (both webroot and standalone)."
-            sre_error "Check:"
-            sre_error "  1. DNS: dig $SSL_DOMAIN  (must point to this server)"
-            sre_error "  2. Port 80 is open in your firewall/security group"
-            sre_error "  3. Port 443 is open in your firewall/security group"
-            # Restart web server before exiting
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+
+        # Ensure the dedicated webroot exists and is served
+        mkdir -p "${acme_webroot}/.well-known/acme-challenge"
+
+        certbot_args=(
+            "certonly"
+            "--webroot"
+            "-w" "$acme_webroot"
+            "-d" "$SSL_DOMAIN"
+            "--non-interactive"
+            "--agree-tos"
+            "--email" "$SSL_EMAIL"
+        )
+
+        sre_info "Running: certbot ${certbot_args[*]}"
+        if ! certbot "${certbot_args[@]}"; then
+            sre_warning "Webroot method failed. Trying standalone (requires port 80 free)..."
+
+            # Stop web server temporarily for standalone
+            case "$web_server" in
+                nginx)  systemctl stop nginx  2>/dev/null || true ;;
+                apache) case "$os_family" in
+                            debian) systemctl stop apache2 2>/dev/null || true ;;
+                            rhel)   systemctl stop httpd   2>/dev/null || true ;;
+                        esac ;;
+            esac
+
+            certbot certonly \
+                --standalone \
+                -d "$SSL_DOMAIN" \
+                --non-interactive \
+                --agree-tos \
+                --email "$SSL_EMAIL" || {
+                sre_error "Certbot failed (both webroot and standalone)."
+                sre_error "Check:"
+                sre_error "  1. DNS: dig $SSL_DOMAIN  (must point to this server)"
+                sre_error "  2. Port 80 is open in your firewall/security group"
+                sre_error "  3. Port 443 is open in your firewall/security group"
+                # Restart web server before exiting
+                case "$web_server" in
+                    nginx)  systemctl start nginx  2>/dev/null || true ;;
+                    apache) case "$os_family" in
+                                debian) systemctl start apache2 2>/dev/null || true ;;
+                                rhel)   systemctl start httpd   2>/dev/null || true ;;
+                            esac ;;
+                esac
+                exit 1
+            }
+
+            # Restart web server after standalone
             case "$web_server" in
                 nginx)  systemctl start nginx  2>/dev/null || true ;;
                 apache) case "$os_family" in
@@ -256,23 +461,13 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                             rhel)   systemctl start httpd   2>/dev/null || true ;;
                         esac ;;
             esac
-            exit 1
-        }
+        fi
 
-        # Restart web server after standalone
-        case "$web_server" in
-            nginx)  systemctl start nginx  2>/dev/null || true ;;
-            apache) case "$os_family" in
-                        debian) systemctl start apache2 2>/dev/null || true ;;
-                        rhel)   systemctl start httpd   2>/dev/null || true ;;
-                    esac ;;
-        esac
+        sre_success "Certificate obtained: $cert_dir"
+
+    else
+        sre_info "[DRY-RUN] Would run: certbot certonly --webroot -w $acme_webroot -d $SSL_DOMAIN ..."
     fi
-
-    sre_success "Certificate obtained: $cert_dir"
-
-else
-    sre_info "[DRY-RUN] Would run: certbot certonly --webroot -w $acme_webroot -d $SSL_DOMAIN ..."
 fi
 
 ################################################################################
@@ -281,8 +476,13 @@ fi
 
 sre_header "Writing HTTPS Vhost Config"
 
-cert_pem="${cert_dir}/fullchain.pem"
-cert_key="${cert_dir}/privkey.pem"
+if [[ "$SSL_USE_WILDCARD" == "true" ]]; then
+    cert_pem="$SSL_WILDCARD_CERT"
+    cert_key="$SSL_WILDCARD_KEY"
+else
+    cert_pem="${cert_dir}/fullchain.pem"
+    cert_key="${cert_dir}/privkey.pem"
+fi
 
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
     backup_config "$vhost_conf"
@@ -486,10 +686,11 @@ APACHE_CONF
 esac
 
 ################################################################################
-# Auto-renewal
+# Auto-renewal (only when we issued a per-domain LE cert; wildcards are
+# renewed by whoever issued them, not by us)
 ################################################################################
 
-if [[ "$SRE_DRY_RUN" != "true" ]]; then
+if [[ "$SSL_USE_WILDCARD" != "true" ]] && [[ "$SRE_DRY_RUN" != "true" ]]; then
     renewal_enabled=false
     for timer_name in certbot-renew.timer certbot.timer snap.certbot.renew.timer; do
         if systemctl list-unit-files "$timer_name" &>/dev/null 2>&1; then
@@ -503,12 +704,27 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         (crontab -l 2>/dev/null | grep -v "certbot renew"; echo "0 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx 2>/dev/null || systemctl reload apache2 2>/dev/null || true'") | crontab -
         sre_success "Auto-renewal cron added (daily 03:00)"
     fi
+elif [[ "$SSL_USE_WILDCARD" == "true" ]]; then
+    sre_info "Skipping auto-renewal setup — wildcard cert is renewed by its issuer."
+    sre_info "When the wildcard renews, reload the web server to pick up the new file:"
+    case "$web_server" in
+        nginx)  sre_info "  systemctl reload nginx" ;;
+        apache)
+            case "$os_family" in
+                debian) sre_info "  systemctl reload apache2" ;;
+                rhel)   sre_info "  systemctl reload httpd" ;;
+            esac
+            ;;
+    esac
 fi
 
 sre_success "SSL setup complete for ${SSL_DOMAIN}!"
 sre_info "  HTTP  → redirects to HTTPS"
 sre_info "  HTTPS → https://${SSL_DOMAIN}"
 sre_info "  Cert  → ${cert_pem}"
+if [[ "$SSL_USE_WILDCARD" == "true" ]]; then
+    sre_info "  Source: wildcard ($SSL_WILDCARD_SOURCE)"
+fi
 echo ""
 sre_warning "If HTTPS is still unreachable, check your firewall/security group:"
 sre_warning "  Port 443 must be open (Oracle Cloud: Security Lists → Ingress Rules)"
