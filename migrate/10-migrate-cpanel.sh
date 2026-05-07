@@ -40,6 +40,7 @@ Step 10: Migrate from cPanel/WHM Server
     full          - Rsync files + create DB + import DB + post-setup (default)
     rsync-only    - Only sync files, skip database
     db-only       - Only create DB + import, skip rsync
+    post-only     - Only run post-migration tasks (composer/npm/perms/etc.)
 
 Prerequisites:
   - Virtual host (step 8) must exist for the domain
@@ -200,23 +201,31 @@ fi
 ################################################################################
 
 if [[ -z "$MIG_MODE" ]]; then
-    MIG_MODE=$(prompt_choice "Migration mode:" "full" "rsync-only" "db-only")
+    MIG_MODE=$(prompt_choice "Migration mode:" "full" "rsync-only" "db-only" "post-only")
 fi
 
 case "$MIG_MODE" in
-    full|rsync-only|db-only) ;;
-    *) sre_error "Invalid mode: $MIG_MODE (use: full, rsync-only, db-only)"; exit 1 ;;
+    full|rsync-only|db-only|post-only) ;;
+    *) sre_error "Invalid mode: $MIG_MODE (use: full, rsync-only, db-only, post-only)"; exit 1 ;;
 esac
 
 sre_info "Mode: $MIG_MODE"
 
 do_rsync=false
 do_db=false
+do_post=true   # default: run post-migration; suppressed when MIG_SKIP_POST_SETUP=true
 case "$MIG_MODE" in
     full)       do_rsync=true; do_db=true ;;
     rsync-only) do_rsync=true ;;
     db-only)    do_db=true ;;
+    post-only)  ;; # only post-setup runs
 esac
+
+# Allow callers (e.g. bulk migrate step 15) to defer post-setup
+if [[ "${MIG_SKIP_POST_SETUP:-false}" == "true" ]]; then
+    do_post=false
+    sre_info "Post-migration setup will be skipped (MIG_SKIP_POST_SETUP=true)"
+fi
 
 ################################################################################
 # Project type
@@ -299,17 +308,19 @@ fi
 sre_info "Source: ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_PORT}"
 sre_info "Source path: $MIG_SOURCE_PATH"
 
-# Test SSH connection
-sre_info "Testing SSH connection..."
-if [[ "$SRE_DRY_RUN" != "true" ]]; then
-    if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-         -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" "echo OK" &>/dev/null; then
-        sre_error "Cannot connect to ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_PORT}"
-        sre_error "Ensure SSH key-based access is configured."
-        sre_error "Try: ssh-copy-id -p ${MIG_SOURCE_PORT} ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}"
-        exit 1
+# Test SSH connection (skip for post-only — no source server work needed)
+if [[ "$do_rsync" == "true" || "$do_db" == "true" ]]; then
+    sre_info "Testing SSH connection..."
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+             -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" "echo OK" &>/dev/null; then
+            sre_error "Cannot connect to ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}:${MIG_SOURCE_PORT}"
+            sre_error "Ensure SSH key-based access is configured."
+            sre_error "Try: ssh-copy-id -p ${MIG_SOURCE_PORT} ${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}"
+            exit 1
+        fi
+        sre_success "SSH connection OK"
     fi
-    sre_success "SSH connection OK"
 fi
 
 ################################################################################
@@ -355,6 +366,34 @@ needs_db=false
 case "$MIG_PROJECT_TYPE" in
     laravel|moodle|wordpress) [[ "$do_db" == "true" ]] && needs_db=true ;;
 esac
+
+# Post-only with DB-backed project type: resolve db_engine and mysql_cmd from saved state
+# so post-setup helpers (.env update, wwwroot/siteurl updates) can reach the DB.
+if [[ "$MIG_MODE" == "post-only" ]] && [[ "$do_post" == "true" ]] \
+        && [[ "$MIG_PROJECT_TYPE" == "laravel" || "$MIG_PROJECT_TYPE" == "moodle" || "$MIG_PROJECT_TYPE" == "wordpress" ]]; then
+    if [[ -z "$db_engine" ]] && [[ -n "$db_engines_config" && "$db_engines_config" != "none" ]]; then
+        IFS=',' read -ra _eng <<< "$db_engines_config"
+        for e in "${_eng[@]}"; do
+            e=$(echo "$e" | tr -d ' ')
+            [[ -n "$e" && "$e" != "none" ]] && db_engine="$e" && break
+        done
+        # WordPress: prefer mysql/mariadb
+        if [[ "$MIG_PROJECT_TYPE" == "wordpress" ]]; then
+            for e in "${_eng[@]}"; do
+                e=$(echo "$e" | tr -d ' ')
+                [[ "$e" == "mysql" || "$e" == "mariadb" ]] && db_engine="$e" && break
+            done
+        fi
+    fi
+    case "$db_engine" in
+        mariadb|mysql)
+            db_root_pass=""
+            [[ -f /root/.db_root_password ]] && db_root_pass=$(cat /root/.db_root_password)
+            mysql_cmd="mysql"
+            [[ -n "$db_root_pass" ]] && mysql_cmd="mysql -u root -p${db_root_pass}"
+            ;;
+    esac
+fi
 
 if [[ "$needs_db" == "true" ]]; then
     if [[ "$db_engines_config" == "none" || -z "$db_engines_config" ]]; then
@@ -733,7 +772,18 @@ fi
 
 sre_header "Post-Migration Setup"
 
-if prompt_yesno "Run post-migration setup? (composer install, config, permissions)" "yes"; then
+# Default to running post-setup unless caller deferred it.
+# Interactive runs still get a yes/no prompt; non-interactive (--yes) honors do_post.
+_run_post=false
+if [[ "$do_post" == "true" ]]; then
+    if [[ "$SRE_YES" == "true" ]]; then
+        _run_post=true
+    elif prompt_yesno "Run post-migration setup? (composer install, config, permissions)" "yes"; then
+        _run_post=true
+    fi
+fi
+
+if [[ "$_run_post" == "true" ]]; then
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
     case "$MIG_PROJECT_TYPE" in
         laravel)
@@ -1014,8 +1064,15 @@ else
 fi
 
 ################################################################################
-# FIX PERMISSIONS — always runs after migration (not optional)
+# FIX PERMISSIONS — runs after migration unless caller deferred post-setup
 ################################################################################
+
+if [[ "$do_post" != "true" ]]; then
+    sre_skipped "Permission fix deferred (MIG_SKIP_POST_SETUP=true) — bulk script will run it later"
+    mig_save_state
+    sre_info "State saved for later post-migration: $(_mig_state_file "$MIG_DOMAIN")"
+    exit 0
+fi
 
 sre_header "Fix Permissions"
 
