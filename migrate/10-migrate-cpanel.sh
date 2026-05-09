@@ -266,7 +266,8 @@ if [[ -d "$MIG_STATE_DIR" ]]; then
     while IFS= read -r _host; do
         [[ -n "$_host" ]] && _prev_hosts+=("$_host")
     done < <(grep -h '^MIG_SOURCE_HOST=' "${MIG_STATE_DIR}"/*.conf 2>/dev/null \
-        | sed 's/^MIG_SOURCE_HOST="//' | sed 's/"$//' | sort -u)
+        | sed -E 's/^MIG_SOURCE_HOST=//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/' \
+        | sort -u)
 fi
 
 if [[ -z "$MIG_SOURCE_HOST" ]] || [[ "$saved_state_exists" == "true" && -z "${_raw_args[*]}" ]]; then
@@ -611,19 +612,28 @@ if [[ "$needs_db" == "true" ]]; then
                 $mysql_cmd -e "CREATE DATABASE IF NOT EXISTS \`${MIG_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
                 sre_success "Database created: $MIG_DB_NAME"
 
+                # Idempotent user creation: CREATE USER IF NOT EXISTS does NOT
+                # update the password if the user already exists. ALTER USER
+                # afterwards forces the configured password to take effect on
+                # every run, so .env and DB stay in sync after re-runs.
                 $mysql_cmd -e "CREATE USER IF NOT EXISTS '${MIG_DB_USER}'@'localhost' IDENTIFIED BY '${MIG_DB_PASS}';" 2>/dev/null
+                $mysql_cmd -e "ALTER USER '${MIG_DB_USER}'@'localhost' IDENTIFIED BY '${MIG_DB_PASS}';" 2>/dev/null
                 $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${MIG_DB_NAME}\`.* TO '${MIG_DB_USER}'@'localhost';" 2>/dev/null
                 $mysql_cmd -e "FLUSH PRIVILEGES;" 2>/dev/null
-                sre_success "Database user created: $MIG_DB_USER"
+                sre_success "Database user created/updated: $MIG_DB_USER"
                 ;;
 
             postgresql)
+                # Always reconcile password (ALTER ROLE) so re-runs keep
+                # .env and DB in sync.
                 sudo -u postgres psql -c "DO \$\$ BEGIN
                     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${MIG_DB_USER}') THEN
                         CREATE ROLE ${MIG_DB_USER} WITH LOGIN PASSWORD '${MIG_DB_PASS}';
+                    ELSE
+                        ALTER ROLE ${MIG_DB_USER} WITH LOGIN PASSWORD '${MIG_DB_PASS}';
                     END IF;
                 END \$\$;" 2>/dev/null
-                sre_success "PostgreSQL user created: $MIG_DB_USER"
+                sre_success "PostgreSQL user created/updated: $MIG_DB_USER"
 
                 if ! sudo -u postgres psql -lqt | cut -d'|' -f1 | grep -qw "$MIG_DB_NAME"; then
                     sudo -u postgres createdb -O "$MIG_DB_USER" "$MIG_DB_NAME"

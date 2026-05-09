@@ -107,13 +107,15 @@ if [[ -d /etc/sre-helpers/migrations ]]; then
     while IFS= read -r _h; do
         [[ -n "$_h" ]] && prev_hosts+=("$_h")
     done < <(grep -h '^MIG_SOURCE_HOST=' /etc/sre-helpers/migrations/*.conf 2>/dev/null \
-        | sed 's/^MIG_SOURCE_HOST="//' | sed 's/"$//' | sort -u)
+        | sed -E 's/^MIG_SOURCE_HOST=//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/' \
+        | sort -u)
 fi
 if [[ -d "$BULK_STATE_DIR" ]]; then
     while IFS= read -r _h; do
         [[ -n "$_h" ]] && prev_hosts+=("$_h")
     done < <(grep -h '^BULK_SOURCE_HOST=' "${BULK_STATE_DIR}"/*.conf 2>/dev/null \
-        | sed 's/^BULK_SOURCE_HOST="//' | sed 's/"$//' | sort -u)
+        | sed -E 's/^BULK_SOURCE_HOST=//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/' \
+        | sort -u)
 fi
 # Dedupe
 if [[ ${#prev_hosts[@]} -gt 0 ]]; then
