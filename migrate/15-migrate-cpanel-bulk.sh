@@ -70,12 +70,12 @@ sre_parse_args "15-migrate-cpanel-bulk.sh" "${_raw_args[@]}"
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --source-host) ((_i++)); BULK_SOURCE_HOST="${_raw_args[$_i]:-}" ;;
-        --source-user) ((_i++)); BULK_SOURCE_USER="${_raw_args[$_i]:-root}" ;;
-        --source-port) ((_i++)); BULK_SOURCE_PORT="${_raw_args[$_i]:-22}" ;;
-        --email)       ((_i++)); BULK_EMAIL="${_raw_args[$_i]:-}" ;;
+        --source-host) _i=$((_i + 1)); BULK_SOURCE_HOST="${_raw_args[$_i]:-}" ;;
+        --source-user) _i=$((_i + 1)); BULK_SOURCE_USER="${_raw_args[$_i]:-root}" ;;
+        --source-port) _i=$((_i + 1)); BULK_SOURCE_PORT="${_raw_args[$_i]:-22}" ;;
+        --email)       _i=$((_i + 1)); BULK_EMAIL="${_raw_args[$_i]:-}" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root

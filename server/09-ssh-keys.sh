@@ -61,14 +61,14 @@ sre_parse_args "09-ssh-keys.sh" "${_raw_args[@]}"
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --user)         ((_i++)); SSH_USER="${_raw_args[$_i]:-}" ;;
-        --type)         ((_i++)); SSH_KEY_TYPE="${_raw_args[$_i]:-ed25519}" ;;
-        --bits)         ((_i++)); SSH_KEY_BITS="${_raw_args[$_i]:-}" ;;
-        --remote-host)  ((_i++)); SSH_REMOTE_HOST="${_raw_args[$_i]:-}" ;;
-        --remote-user)  ((_i++)); SSH_REMOTE_USER="${_raw_args[$_i]:-}" ;;
-        --remote-port)  ((_i++)); SSH_REMOTE_PORT="${_raw_args[$_i]:-22}" ;;
+        --user)         _i=$((_i + 1)); SSH_USER="${_raw_args[$_i]:-}" ;;
+        --type)         _i=$((_i + 1)); SSH_KEY_TYPE="${_raw_args[$_i]:-ed25519}" ;;
+        --bits)         _i=$((_i + 1)); SSH_KEY_BITS="${_raw_args[$_i]:-}" ;;
+        --remote-host)  _i=$((_i + 1)); SSH_REMOTE_HOST="${_raw_args[$_i]:-}" ;;
+        --remote-user)  _i=$((_i + 1)); SSH_REMOTE_USER="${_raw_args[$_i]:-}" ;;
+        --remote-port)  _i=$((_i + 1)); SSH_REMOTE_PORT="${_raw_args[$_i]:-22}" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root

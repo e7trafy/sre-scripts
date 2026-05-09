@@ -104,12 +104,12 @@ sre_parse_args "13-new-project.sh" "${_raw_args[@]}"
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --domain)  ((_i++)); DEPLOY_DOMAIN="${_raw_args[$_i]:-}" ;;
-        --type)    ((_i++)); DEPLOY_TYPE="${_raw_args[$_i]:-}" ;;
-        --repo)    ((_i++)); DEPLOY_REPO_URL="${_raw_args[$_i]:-}" ;;
-        --branch)  ((_i++)); DEPLOY_BRANCH="${_raw_args[$_i]:-main}" ;;
+        --domain)  _i=$((_i + 1)); DEPLOY_DOMAIN="${_raw_args[$_i]:-}" ;;
+        --type)    _i=$((_i + 1)); DEPLOY_TYPE="${_raw_args[$_i]:-}" ;;
+        --repo)    _i=$((_i + 1)); DEPLOY_REPO_URL="${_raw_args[$_i]:-}" ;;
+        --branch)  _i=$((_i + 1)); DEPLOY_BRANCH="${_raw_args[$_i]:-main}" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root

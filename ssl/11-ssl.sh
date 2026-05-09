@@ -62,12 +62,12 @@ sre_parse_args "11-ssl.sh" "${_raw_args[@]}"
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --domain)        ((_i++)); SSL_DOMAIN="${_raw_args[$_i]:-}" ;;
-        --email)         ((_i++)); SSL_EMAIL="${_raw_args[$_i]:-}" ;;
-        --wildcard-dir)  ((_i++)); SSL_WILDCARD_DIR="${_raw_args[$_i]:-}" ;;
+        --domain)        _i=$((_i + 1)); SSL_DOMAIN="${_raw_args[$_i]:-}" ;;
+        --email)         _i=$((_i + 1)); SSL_EMAIL="${_raw_args[$_i]:-}" ;;
+        --wildcard-dir)  _i=$((_i + 1)); SSL_WILDCARD_DIR="${_raw_args[$_i]:-}" ;;
         --no-wildcard)   SSL_FORCE_LE="true"; SSL_PREFER_WILDCARD="no" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root

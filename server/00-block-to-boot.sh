@@ -129,9 +129,9 @@ FORCE_MODE=""
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --mode) ((_i++)); FORCE_MODE="${_raw_args[$_i]:-}" ;;
+        --mode) _i=$((_i + 1)); FORCE_MODE="${_raw_args[$_i]:-}" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root

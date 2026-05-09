@@ -129,21 +129,21 @@ sre_parse_args "14-backup-only.sh" "${_raw_args[@]}"
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --domain)        ((_i++)); BK_DOMAIN="${_raw_args[$_i]:-}" ;;
-        --source-host)   ((_i++)); BK_SOURCE_HOST="${_raw_args[$_i]:-}" ;;
-        --source-user)   ((_i++)); BK_SOURCE_USER="${_raw_args[$_i]:-root}" ;;
-        --source-port)   ((_i++)); BK_SOURCE_PORT="${_raw_args[$_i]:-22}" ;;
-        --source-path)   ((_i++)); BK_SOURCE_PATH="${_raw_args[$_i]:-}" ;;
-        --extra-path)    ((_i++)); BK_SOURCE_EXTRA_PATH="${_raw_args[$_i]:-}" ;;
-        --db-type)       ((_i++)); BK_DB_TYPE="${_raw_args[$_i]:-}" ;;
-        --db-name)       ((_i++)); BK_DB_NAME="${_raw_args[$_i]:-}" ;;
-        --db-user)       ((_i++)); BK_DB_USER="${_raw_args[$_i]:-}" ;;
-        --db-pass)       ((_i++)); BK_DB_PASS="${_raw_args[$_i]:-}" ;;
-        --db-host)       ((_i++)); BK_DB_HOST="${_raw_args[$_i]:-localhost}" ;;
-        --output)        ((_i++)); BK_OUTPUT_DIR="${_raw_args[$_i]:-}" ;;
-        --mode)          ((_i++)); BK_MODE="${_raw_args[$_i]:-full}" ;;
+        --domain)        _i=$((_i + 1)); BK_DOMAIN="${_raw_args[$_i]:-}" ;;
+        --source-host)   _i=$((_i + 1)); BK_SOURCE_HOST="${_raw_args[$_i]:-}" ;;
+        --source-user)   _i=$((_i + 1)); BK_SOURCE_USER="${_raw_args[$_i]:-root}" ;;
+        --source-port)   _i=$((_i + 1)); BK_SOURCE_PORT="${_raw_args[$_i]:-22}" ;;
+        --source-path)   _i=$((_i + 1)); BK_SOURCE_PATH="${_raw_args[$_i]:-}" ;;
+        --extra-path)    _i=$((_i + 1)); BK_SOURCE_EXTRA_PATH="${_raw_args[$_i]:-}" ;;
+        --db-type)       _i=$((_i + 1)); BK_DB_TYPE="${_raw_args[$_i]:-}" ;;
+        --db-name)       _i=$((_i + 1)); BK_DB_NAME="${_raw_args[$_i]:-}" ;;
+        --db-user)       _i=$((_i + 1)); BK_DB_USER="${_raw_args[$_i]:-}" ;;
+        --db-pass)       _i=$((_i + 1)); BK_DB_PASS="${_raw_args[$_i]:-}" ;;
+        --db-host)       _i=$((_i + 1)); BK_DB_HOST="${_raw_args[$_i]:-localhost}" ;;
+        --output)        _i=$((_i + 1)); BK_OUTPUT_DIR="${_raw_args[$_i]:-}" ;;
+        --mode)          _i=$((_i + 1)); BK_MODE="${_raw_args[$_i]:-full}" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root

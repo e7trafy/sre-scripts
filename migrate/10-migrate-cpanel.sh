@@ -125,15 +125,15 @@ sre_parse_args "10-migrate-cpanel.sh" "${_raw_args[@]}"
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --domain)       ((_i++)); MIG_DOMAIN="${_raw_args[$_i]:-}" ;;
-        --source-host)  ((_i++)); MIG_SOURCE_HOST="${_raw_args[$_i]:-}" ;;
-        --source-user)  ((_i++)); MIG_SOURCE_USER="${_raw_args[$_i]:-}" ;;
-        --source-port)  ((_i++)); MIG_SOURCE_PORT="${_raw_args[$_i]:-22}" ;;
-        --source-path)  ((_i++)); MIG_SOURCE_PATH="${_raw_args[$_i]:-}" ;;
-        --type)         ((_i++)); MIG_PROJECT_TYPE="${_raw_args[$_i]:-}" ;;
-        --mode)         ((_i++)); MIG_MODE="${_raw_args[$_i]:-}" ;;
+        --domain)       _i=$((_i + 1)); MIG_DOMAIN="${_raw_args[$_i]:-}" ;;
+        --source-host)  _i=$((_i + 1)); MIG_SOURCE_HOST="${_raw_args[$_i]:-}" ;;
+        --source-user)  _i=$((_i + 1)); MIG_SOURCE_USER="${_raw_args[$_i]:-}" ;;
+        --source-port)  _i=$((_i + 1)); MIG_SOURCE_PORT="${_raw_args[$_i]:-22}" ;;
+        --source-path)  _i=$((_i + 1)); MIG_SOURCE_PATH="${_raw_args[$_i]:-}" ;;
+        --type)         _i=$((_i + 1)); MIG_PROJECT_TYPE="${_raw_args[$_i]:-}" ;;
+        --mode)         _i=$((_i + 1)); MIG_MODE="${_raw_args[$_i]:-}" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root

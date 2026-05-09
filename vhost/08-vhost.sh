@@ -54,12 +54,12 @@ sre_parse_args "08-vhost.sh" "${_raw_args[@]}"
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --domain) ((_i++)); VHOST_DOMAIN="${_raw_args[$_i]:-}" ;;
-        --type)   ((_i++)); VHOST_TYPE="${_raw_args[$_i]:-}" ;;
-        --root)   ((_i++)); VHOST_ROOT="${_raw_args[$_i]:-}" ;;
-        --port)   ((_i++)); VHOST_PORT="${_raw_args[$_i]:-3000}" ;;
+        --domain) _i=$((_i + 1)); VHOST_DOMAIN="${_raw_args[$_i]:-}" ;;
+        --type)   _i=$((_i + 1)); VHOST_TYPE="${_raw_args[$_i]:-}" ;;
+        --root)   _i=$((_i + 1)); VHOST_ROOT="${_raw_args[$_i]:-}" ;;
+        --port)   _i=$((_i + 1)); VHOST_PORT="${_raw_args[$_i]:-3000}" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root

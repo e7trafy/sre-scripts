@@ -127,11 +127,11 @@ FORCE_VAR_DEV=""
 _i=0
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
-        --db-device)   ((_i++)); FORCE_DB_DEV="${_raw_args[$_i]:-}"  ;;
-        --app-device)  ((_i++)); FORCE_APP_DEV="${_raw_args[$_i]:-}" ;;
-        --var-device)  ((_i++)); FORCE_VAR_DEV="${_raw_args[$_i]:-}" ;;
+        --db-device)   _i=$((_i + 1)); FORCE_DB_DEV="${_raw_args[$_i]:-}"  ;;
+        --app-device)  _i=$((_i + 1)); FORCE_APP_DEV="${_raw_args[$_i]:-}" ;;
+        --var-device)  _i=$((_i + 1)); FORCE_VAR_DEV="${_raw_args[$_i]:-}" ;;
     esac
-    ((_i++))
+    _i=$((_i + 1))
 done
 
 require_root
