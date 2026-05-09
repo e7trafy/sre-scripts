@@ -89,21 +89,23 @@ bk_save_state() {
     mkdir -p "$BK_STATE_DIR"
     local sf
     sf=$(_bk_state_file "$BK_DOMAIN")
-    cat > "$sf" <<STATE
-# Backup-only state for ${BK_DOMAIN}
-# Saved on $(date '+%Y-%m-%d %H:%M:%S')
-BK_DOMAIN="${BK_DOMAIN}"
-BK_SOURCE_HOST="${BK_SOURCE_HOST}"
-BK_SOURCE_USER="${BK_SOURCE_USER}"
-BK_SOURCE_PORT="${BK_SOURCE_PORT}"
-BK_SOURCE_PATH="${BK_SOURCE_PATH}"
-BK_SOURCE_EXTRA_PATH="${BK_SOURCE_EXTRA_PATH}"
-BK_DB_TYPE="${BK_DB_TYPE}"
-BK_DB_NAME="${BK_DB_NAME}"
-BK_DB_USER="${BK_DB_USER}"
-BK_DB_PASS="${BK_DB_PASS}"
-BK_DB_HOST="${BK_DB_HOST}"
-STATE
+    # printf %q so passwords / paths with $ ` " etc. round-trip on source.
+    {
+        printf '# Backup-only state for %s\n' "$BK_DOMAIN"
+        printf '# Saved on %s\n'              "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'BK_DOMAIN=%q\n'               "${BK_DOMAIN:-}"
+        printf 'BK_SOURCE_HOST=%q\n'          "${BK_SOURCE_HOST:-}"
+        printf 'BK_SOURCE_USER=%q\n'          "${BK_SOURCE_USER:-}"
+        printf 'BK_SOURCE_PORT=%q\n'          "${BK_SOURCE_PORT:-22}"
+        printf 'BK_SOURCE_PATH=%q\n'          "${BK_SOURCE_PATH:-}"
+        printf 'BK_SOURCE_EXTRA_PATH=%q\n'    "${BK_SOURCE_EXTRA_PATH:-}"
+        printf 'BK_DB_TYPE=%q\n'              "${BK_DB_TYPE:-}"
+        printf 'BK_DB_NAME=%q\n'              "${BK_DB_NAME:-}"
+        printf 'BK_DB_USER=%q\n'              "${BK_DB_USER:-}"
+        printf 'BK_DB_PASS=%q\n'              "${BK_DB_PASS:-}"
+        printf 'BK_DB_HOST=%q\n'              "${BK_DB_HOST:-localhost}"
+    } > "$sf"
+    chmod 600 "$sf"
     sre_info "Backup state saved to: $sf"
 }
 

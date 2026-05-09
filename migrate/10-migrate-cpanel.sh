@@ -82,37 +82,49 @@ mig_save_state() {
     mkdir -p "$MIG_STATE_DIR"
     local sf
     sf=$(_mig_state_file "$MIG_DOMAIN")
-    cat > "$sf" <<STATE
-# Migration state for ${MIG_DOMAIN}
-# Saved on $(date '+%Y-%m-%d %H:%M:%S')
-MIG_DOMAIN="${MIG_DOMAIN}"
-MIG_PROJECT_TYPE="${MIG_PROJECT_TYPE}"
-MIG_SOURCE_HOST="${MIG_SOURCE_HOST}"
-MIG_SOURCE_USER="${MIG_SOURCE_USER}"
-MIG_SOURCE_PORT="${MIG_SOURCE_PORT}"
-MIG_SOURCE_PATH="${MIG_SOURCE_PATH}"
-MIG_SOURCE_MOODLEDATA="${MIG_SOURCE_MOODLEDATA}"
-MIG_MOODLEDATA_DIR="${moodledata_dir:-}"
-MIG_SOURCE_DB_NAME="${MIG_SOURCE_DB_NAME}"
-MIG_SOURCE_DB_USER="${MIG_SOURCE_DB_USER}"
-MIG_SOURCE_DB_PASS="${MIG_SOURCE_DB_PASS}"
-MIG_DB_NAME="${MIG_DB_NAME}"
-MIG_DB_USER="${MIG_DB_USER}"
-MIG_DB_PASS="${MIG_DB_PASS}"
-STATE
+    # Use printf %q so passwords / paths with $ ` " etc. round-trip safely.
+    {
+        printf '# Migration state for %s\n' "$MIG_DOMAIN"
+        printf '# Saved on %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'MIG_DOMAIN=%q\n'              "${MIG_DOMAIN:-}"
+        printf 'MIG_PROJECT_TYPE=%q\n'        "${MIG_PROJECT_TYPE:-}"
+        printf 'MIG_SOURCE_HOST=%q\n'         "${MIG_SOURCE_HOST:-}"
+        printf 'MIG_SOURCE_USER=%q\n'         "${MIG_SOURCE_USER:-}"
+        printf 'MIG_SOURCE_PORT=%q\n'         "${MIG_SOURCE_PORT:-22}"
+        printf 'MIG_SOURCE_PATH=%q\n'         "${MIG_SOURCE_PATH:-}"
+        printf 'MIG_SOURCE_MOODLEDATA=%q\n'   "${MIG_SOURCE_MOODLEDATA:-}"
+        printf 'MIG_MOODLEDATA_DIR=%q\n'      "${moodledata_dir:-}"
+        printf 'MIG_SOURCE_DB_NAME=%q\n'      "${MIG_SOURCE_DB_NAME:-}"
+        printf 'MIG_SOURCE_DB_USER=%q\n'      "${MIG_SOURCE_DB_USER:-}"
+        printf 'MIG_SOURCE_DB_PASS=%q\n'      "${MIG_SOURCE_DB_PASS:-}"
+        printf 'MIG_DB_NAME=%q\n'             "${MIG_DB_NAME:-}"
+        printf 'MIG_DB_USER=%q\n'             "${MIG_DB_USER:-}"
+        printf 'MIG_DB_PASS=%q\n'             "${MIG_DB_PASS:-}"
+    } > "$sf"
+    chmod 600 "$sf"
     sre_info "Migration state saved to: $sf"
 }
 
 mig_load_state() {
     local sf
     sf=$(_mig_state_file "$1")
-    if [[ -f "$sf" ]]; then
-        # shellcheck source=/dev/null
-        source "$sf"
-        sre_success "Loaded saved migration state for $1"
-        return 0
+    [[ -f "$sf" ]] || return 1
+    # shellcheck source=/dev/null
+    # Disable set -e while sourcing — a malformed state file must not kill the
+    # whole script silently. If sourcing fails, warn and act as if no state.
+    set +e
+    source "$sf" 2>/tmp/sre_state_err.$$
+    local rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+        sre_warning "Could not load state file: $sf (rc=$rc)"
+        [[ -s /tmp/sre_state_err.$$ ]] && sre_warning "  $(cat /tmp/sre_state_err.$$)"
+        rm -f /tmp/sre_state_err.$$
+        return 1
     fi
-    return 1
+    rm -f /tmp/sre_state_err.$$
+    sre_success "Loaded saved migration state for $1"
+    return 0
 }
 
 ################################################################################

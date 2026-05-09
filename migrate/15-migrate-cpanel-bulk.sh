@@ -524,23 +524,24 @@ prewrite_mig_state() {
     local moodledata_src="${10:-}"
     local sf="/etc/sre-helpers/migrations/${domain}.conf"
     mkdir -p /etc/sre-helpers/migrations
-    cat > "$sf" <<STATE
-# Pre-written by step 15 bulk migrate on $(date '+%Y-%m-%d %H:%M:%S')
-MIG_DOMAIN="${domain}"
-MIG_PROJECT_TYPE="${type}"
-MIG_SOURCE_HOST="${BULK_SOURCE_HOST}"
-MIG_SOURCE_USER="${BULK_SOURCE_USER}"
-MIG_SOURCE_PORT="${BULK_SOURCE_PORT}"
-MIG_SOURCE_PATH="${src_path}"
-MIG_SOURCE_MOODLEDATA="${moodledata_src}"
-MIG_MOODLEDATA_DIR=""
-MIG_SOURCE_DB_NAME="${src_db_n}"
-MIG_SOURCE_DB_USER="${src_db_u}"
-MIG_SOURCE_DB_PASS="${src_db_p}"
-MIG_DB_NAME="${db_n}"
-MIG_DB_USER="${db_u}"
-MIG_DB_PASS="${db_p}"
-STATE
+    # Use printf %q so passwords with $ ` " etc. round-trip safely on source.
+    {
+        printf '# Pre-written by step 15 bulk migrate on %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'MIG_DOMAIN=%q\n'              "${domain:-}"
+        printf 'MIG_PROJECT_TYPE=%q\n'        "${type:-}"
+        printf 'MIG_SOURCE_HOST=%q\n'         "${BULK_SOURCE_HOST:-}"
+        printf 'MIG_SOURCE_USER=%q\n'         "${BULK_SOURCE_USER:-}"
+        printf 'MIG_SOURCE_PORT=%q\n'         "${BULK_SOURCE_PORT:-22}"
+        printf 'MIG_SOURCE_PATH=%q\n'         "${src_path:-}"
+        printf 'MIG_SOURCE_MOODLEDATA=%q\n'   "${moodledata_src:-}"
+        printf 'MIG_MOODLEDATA_DIR=%q\n'      ""
+        printf 'MIG_SOURCE_DB_NAME=%q\n'      "${src_db_n:-}"
+        printf 'MIG_SOURCE_DB_USER=%q\n'      "${src_db_u:-}"
+        printf 'MIG_SOURCE_DB_PASS=%q\n'      "${src_db_p:-}"
+        printf 'MIG_DB_NAME=%q\n'             "${db_n:-}"
+        printf 'MIG_DB_USER=%q\n'             "${db_u:-}"
+        printf 'MIG_DB_PASS=%q\n'             "${db_p:-}"
+    } > "$sf"
     chmod 600 "$sf"
 }
 
