@@ -25,6 +25,7 @@ Step 12: Quick Fixes & Common Problems
     - Nginx / web server issues
     - Database charset
     - Locale & encoding
+    - Supervisor (Laravel queue workers / Horizon / scheduler)
 
 Options:
   --dry-run   Print planned actions without executing
@@ -1277,6 +1278,285 @@ fix_locale() {
 }
 
 ################################################################################
+# Fix: Setup / Manage Supervisor (Laravel queue workers + scheduler)
+################################################################################
+
+fix_supervisor() {
+    sre_header "Fix: Supervisor & Laravel Queue Workers"
+
+    # Resolve install paths/services for this OS family
+    local sup_pkg sup_svc sup_conf_dir
+    case "$SRE_OS_FAMILY" in
+        debian)
+            sup_pkg="supervisor"
+            sup_svc="supervisor"
+            sup_conf_dir="/etc/supervisor/conf.d"
+            ;;
+        rhel)
+            sup_pkg="supervisor"
+            sup_svc="supervisord"
+            sup_conf_dir="/etc/supervisord.d"
+            ;;
+        *)
+            sre_error "Unknown OS family: $SRE_OS_FAMILY"
+            return 1
+            ;;
+    esac
+
+    local action
+    action=$(prompt_choice "What to do?" \
+        "install"            \
+        "create-worker"      \
+        "create-horizon"     \
+        "create-scheduler"   \
+        "list-workers"       \
+        "restart-worker"     \
+        "remove-worker"      \
+        "back")
+
+    case "$action" in
+        # ── Install supervisor (idempotent) ─────────────────────────────────
+        install)
+            if command -v supervisorctl &>/dev/null && pkg_is_installed "$sup_pkg"; then
+                sre_success "Supervisor already installed"
+            else
+                if [[ "$SRE_DRY_RUN" == "true" ]]; then
+                    sre_info "[DRY-RUN] Would install: $sup_pkg"
+                else
+                    sre_info "Installing supervisor..."
+                    pkg_install "$sup_pkg" || { sre_error "Install failed"; return 1; }
+                    sre_success "Supervisor installed"
+                fi
+            fi
+
+            if [[ "$SRE_DRY_RUN" != "true" ]]; then
+                mkdir -p "$sup_conf_dir"
+                svc_enable_start "$sup_svc"
+                if systemctl is-active "$sup_svc" &>/dev/null; then
+                    sre_success "Supervisor running ($sup_svc)"
+                else
+                    sre_warning "Supervisor service not active — check: journalctl -u $sup_svc"
+                fi
+                # Mark in config so step 8/10 can offer worker setup later
+                config_set "SRE_SUPERVISOR" "true"
+            fi
+            ;;
+
+        # ── Create a Laravel queue worker for a domain ───────────────────────
+        create-worker)
+            command -v supervisorctl &>/dev/null \
+                || { sre_error "Supervisor not installed. Run 'install' first."; return 1; }
+
+            local domain proj_dir queue procs tries timeout
+            domain=$(prompt_input "Project domain" "")
+            [[ -z "$domain" ]] && { sre_error "Domain required"; return 1; }
+
+            proj_dir="/var/www/${domain}/current"
+            if [[ ! -f "${proj_dir}/artisan" ]]; then
+                sre_warning "No artisan found at ${proj_dir}/artisan"
+                proj_dir=$(prompt_input "Path to Laravel project (with artisan)" "$proj_dir")
+                [[ ! -f "${proj_dir}/artisan" ]] && { sre_error "artisan not found at $proj_dir"; return 1; }
+            fi
+
+            queue=$(prompt_input "Queue name" "default")
+            procs=$(prompt_input "Number of worker processes" "2")
+            tries=$(prompt_input "Max retries per job" "3")
+            timeout=$(prompt_input "Job timeout (seconds)" "90")
+
+            local conf_path="${sup_conf_dir}/${domain}-worker.conf"
+            sre_info "Will write: $conf_path"
+            prompt_yesno "Proceed?" "yes" || { sre_skipped "Cancelled"; return 0; }
+
+            if [[ "$SRE_DRY_RUN" == "true" ]]; then
+                sre_info "[DRY-RUN] Would write supervisor worker config + reload"
+                return 0
+            fi
+
+            mkdir -p "$sup_conf_dir"
+            mkdir -p "${proj_dir}/storage/logs"
+            cat > "$conf_path" <<WORKEREOF
+[program:${domain}-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=php ${proj_dir}/artisan queue:work --sleep=3 --tries=${tries} --timeout=${timeout} --queue=${queue}
+autostart=true
+autorestart=true
+user=www-data
+numprocs=${procs}
+redirect_stderr=true
+stdout_logfile=${proj_dir}/storage/logs/worker.log
+stopwaitsecs=3600
+WORKEREOF
+            chown www-data:www-data "${proj_dir}/storage/logs" 2>/dev/null || true
+            supervisorctl reread 2>/dev/null || true
+            supervisorctl update 2>/dev/null || true
+            sre_success "Worker installed: ${domain}-worker (${procs} procs, queue=${queue})"
+            sre_info "Tail logs: tail -f ${proj_dir}/storage/logs/worker.log"
+            ;;
+
+        # ── Create Horizon (alternative to queue:work) ───────────────────────
+        create-horizon)
+            command -v supervisorctl &>/dev/null \
+                || { sre_error "Supervisor not installed. Run 'install' first."; return 1; }
+
+            local domain proj_dir
+            domain=$(prompt_input "Project domain" "")
+            [[ -z "$domain" ]] && { sre_error "Domain required"; return 1; }
+
+            proj_dir="/var/www/${domain}/current"
+            if [[ ! -f "${proj_dir}/artisan" ]]; then
+                proj_dir=$(prompt_input "Path to Laravel project (with artisan)" "$proj_dir")
+                [[ ! -f "${proj_dir}/artisan" ]] && { sre_error "artisan not found"; return 1; }
+            fi
+
+            # Sanity: horizon installed?
+            if ! sudo -u www-data php "${proj_dir}/artisan" list 2>/dev/null | grep -q '^ *horizon'; then
+                sre_warning "Horizon doesn't appear to be installed in this project."
+                sre_warning "  composer require laravel/horizon"
+                if ! prompt_yesno "Continue anyway?" "no"; then
+                    sre_skipped "Cancelled"
+                    return 0
+                fi
+            fi
+
+            local conf_path="${sup_conf_dir}/${domain}-horizon.conf"
+            if [[ "$SRE_DRY_RUN" == "true" ]]; then
+                sre_info "[DRY-RUN] Would write $conf_path"
+                return 0
+            fi
+
+            mkdir -p "$sup_conf_dir"
+            mkdir -p "${proj_dir}/storage/logs"
+            cat > "$conf_path" <<HORIZONEOF
+[program:${domain}-horizon]
+process_name=%(program_name)s
+command=php ${proj_dir}/artisan horizon
+autostart=true
+autorestart=true
+user=www-data
+redirect_stderr=true
+stdout_logfile=${proj_dir}/storage/logs/horizon.log
+stopwaitsecs=3600
+HORIZONEOF
+            chown www-data:www-data "${proj_dir}/storage/logs" 2>/dev/null || true
+            supervisorctl reread 2>/dev/null || true
+            supervisorctl update 2>/dev/null || true
+            sre_success "Horizon installed: ${domain}-horizon"
+            sre_info "Dashboard: https://${domain}/horizon (if route enabled)"
+            ;;
+
+        # ── Laravel scheduler cron ───────────────────────────────────────────
+        create-scheduler)
+            local domain proj_dir
+            domain=$(prompt_input "Project domain" "")
+            [[ -z "$domain" ]] && { sre_error "Domain required"; return 1; }
+            proj_dir="/var/www/${domain}/current"
+            if [[ ! -f "${proj_dir}/artisan" ]]; then
+                proj_dir=$(prompt_input "Path to Laravel project (with artisan)" "$proj_dir")
+                [[ ! -f "${proj_dir}/artisan" ]] && { sre_error "artisan not found"; return 1; }
+            fi
+
+            local cron_file="/etc/cron.d/${domain//\./-}-scheduler"
+            local cron_line="* * * * * www-data cd ${proj_dir} && php artisan schedule:run >> /dev/null 2>&1"
+
+            if [[ "$SRE_DRY_RUN" == "true" ]]; then
+                sre_info "[DRY-RUN] Would write $cron_file"
+                sre_info "[DRY-RUN]   $cron_line"
+                return 0
+            fi
+
+            echo "$cron_line" > "$cron_file"
+            chmod 644 "$cron_file"
+            sre_success "Scheduler cron installed: $cron_file"
+            sre_info "Verify: sudo run-parts --test /etc/cron.d  (or check syslog after a minute)"
+            ;;
+
+        # ── Inspection / lifecycle ───────────────────────────────────────────
+        list-workers)
+            if ! command -v supervisorctl &>/dev/null; then
+                sre_warning "Supervisor not installed."
+                return 1
+            fi
+            sre_info "Configured programs in $sup_conf_dir:"
+            ls -1 "$sup_conf_dir"/*.conf 2>/dev/null | sed 's|^|  |' \
+                || sre_info "  (none)"
+            echo ""
+            sre_info "supervisorctl status:"
+            supervisorctl status 2>&1 || true
+            ;;
+
+        restart-worker)
+            command -v supervisorctl &>/dev/null \
+                || { sre_error "Supervisor not installed."; return 1; }
+
+            local progs=()
+            while IFS= read -r p; do
+                [[ -n "$p" ]] && progs+=("$p")
+            done < <(supervisorctl status 2>/dev/null | awk '{print $1}')
+
+            if [[ ${#progs[@]} -eq 0 ]]; then
+                sre_warning "No supervisor programs configured."
+                return 0
+            fi
+
+            progs+=("all")
+            local pick
+            pick=$(prompt_choice "Restart which program?" "${progs[@]}")
+
+            if [[ "$SRE_DRY_RUN" == "true" ]]; then
+                sre_info "[DRY-RUN] Would: supervisorctl restart $pick"
+                return 0
+            fi
+
+            if [[ "$pick" == "all" ]]; then
+                supervisorctl restart all
+            else
+                supervisorctl restart "$pick"
+            fi
+            sre_success "Restarted: $pick"
+            ;;
+
+        remove-worker)
+            command -v supervisorctl &>/dev/null \
+                || { sre_error "Supervisor not installed."; return 1; }
+
+            local files=()
+            while IFS= read -r f; do
+                [[ -n "$f" ]] && files+=("$(basename "$f")")
+            done < <(ls -1 "$sup_conf_dir"/*.conf 2>/dev/null)
+
+            if [[ ${#files[@]} -eq 0 ]]; then
+                sre_warning "No supervisor configs in $sup_conf_dir"
+                return 0
+            fi
+
+            local pick
+            pick=$(prompt_choice "Remove which config?" "${files[@]}" "cancel")
+            [[ "$pick" == "cancel" ]] && { sre_skipped "Cancelled"; return 0; }
+
+            local prog="${pick%.conf}"
+            sre_warning "Will stop and remove: $pick (program: $prog)"
+            prompt_yesno "Confirm removal?" "no" \
+                || { sre_skipped "Cancelled"; return 0; }
+
+            if [[ "$SRE_DRY_RUN" == "true" ]]; then
+                sre_info "[DRY-RUN] Would: stop $prog, rm $sup_conf_dir/$pick, supervisorctl update"
+                return 0
+            fi
+
+            supervisorctl stop "$prog" 2>/dev/null || true
+            rm -f "${sup_conf_dir}/${pick}"
+            supervisorctl reread 2>/dev/null || true
+            supervisorctl update 2>/dev/null || true
+            sre_success "Removed: $pick"
+            ;;
+
+        back)
+            return 0
+            ;;
+    esac
+}
+
+################################################################################
 # Main Menu
 ################################################################################
 
@@ -1296,19 +1576,21 @@ _run_fix_menu() {
             "nginx-webserver" \
             "database-charset" \
             "locale-encoding" \
+            "supervisor-queue-workers" \
             "exit")
 
         case "$fix_choice" in
-            permissions-ownership)  fix_permissions ;;
-            filesystem-acl)         fix_acl ;;
-            change-php-version)     fix_php_version ;;
-            moodle-temp-dirs)       fix_moodle_temp ;;
-            log-files)              fix_logs ;;
-            imagick-arabic)         fix_imagick ;;
-            php-limits-extensions)  fix_php ;;
-            nginx-webserver)        fix_nginx ;;
-            database-charset)       fix_db_charset ;;
-            locale-encoding)        fix_locale ;;
+            permissions-ownership)     fix_permissions ;;
+            filesystem-acl)            fix_acl ;;
+            change-php-version)        fix_php_version ;;
+            moodle-temp-dirs)          fix_moodle_temp ;;
+            log-files)                 fix_logs ;;
+            imagick-arabic)            fix_imagick ;;
+            php-limits-extensions)     fix_php ;;
+            nginx-webserver)           fix_nginx ;;
+            database-charset)          fix_db_charset ;;
+            locale-encoding)           fix_locale ;;
+            supervisor-queue-workers)  fix_supervisor ;;
             exit)
                 sre_info "Exiting fixes menu."
                 break
