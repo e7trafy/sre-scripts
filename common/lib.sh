@@ -566,6 +566,7 @@ declare -A STEP_REGISTRY=(
     [13]="deploy/13-new-project.sh"
     [14]="migrate/14-backup-only.sh"
     [15]="migrate/15-migrate-cpanel-bulk.sh"
+    [16]="clone/16-clone-project.sh"
 )
 
 declare -A STEP_NAMES=(
@@ -585,6 +586,7 @@ declare -A STEP_NAMES=(
     [13]="Deploy New Project (Git)"
     [14]="Backup-Only Capture (no restore)"
     [15]="Bulk Migrate from cPanel/WHM"
+    [16]="Clone Project (Staging Copy)"
 )
 
 _is_step_skipped() {
@@ -592,14 +594,14 @@ _is_step_skipped() {
     case "$step" in
         5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" || -z "$e" ]] && return 0 ;;
         6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
-        0|9|10|13|14|15) return 0 ;; # block volume, SSH keys, migration, deploy, backup-only, bulk-migrate are optional
+        0|9|10|13|14|15|16) return 0 ;; # block volume, SSH keys, migration, deploy, backup-only, bulk-migrate, clone are optional
     esac
     return 1
 }
 
 _is_step_optional() {
     local step="$1"
-    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" || "$step" == "13" || "$step" == "14" || "$step" == "15" ]] && return 0
+    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" || "$step" == "13" || "$step" == "14" || "$step" == "15" || "$step" == "16" ]] && return 0
     return 1
 }
 
