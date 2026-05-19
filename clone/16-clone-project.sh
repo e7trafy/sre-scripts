@@ -36,6 +36,14 @@ CL_TARGET_DOMAIN=""
 CL_MODE="full"      # full, files-only, db-only
 CL_REGEN_APP_KEY="ask"   # laravel only: ask|yes|no
 
+# Staging protection (default ON — clones are non-public by default)
+CL_PROTECT="yes"               # yes|no   --no-protect disables everything below
+CL_PROTECT_USER=""             # default: "staging"
+CL_PROTECT_PASS=""             # default: openssl rand
+CL_ALLOW_IPS=()                # --allow-ip can be repeated; entries bypass htpasswd
+CL_NOINDEX="yes"               # X-Robots-Tag noindex + robots.txt Disallow: /
+CL_HTPASSWD="yes"              # basic auth gate
+
 sre_show_help() {
     cat <<EOF
 Usage: sudo bash $0 [OPTIONS]
@@ -52,6 +60,15 @@ Options:
   --mode <mode>         full | files-only | db-only       (default: full)
   --regen-app-key       Laravel: generate a fresh APP_KEY in the clone
   --keep-app-key        Laravel: reuse the source APP_KEY
+
+Staging protection (default: ON — clones are non-public):
+  --no-protect          Disable ALL staging protection (htpasswd + noindex)
+  --no-htpasswd         Skip HTTP basic auth (keep noindex)
+  --no-noindex          Skip X-Robots-Tag + robots.txt (keep htpasswd)
+  --protect-user <u>    Basic auth username                (default: staging)
+  --protect-pass <p>    Basic auth password                (default: generated)
+  --allow-ip <cidr>     IP/CIDR that bypasses basic auth   (repeatable)
+
   --dry-run             Print planned actions only
   --yes                 Accept defaults without prompting
   --help                Show this help
@@ -74,9 +91,163 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --mode)           _i=$((_i + 1)); CL_MODE="${_raw_args[$_i]:-full}" ;;
         --regen-app-key)  CL_REGEN_APP_KEY="yes" ;;
         --keep-app-key)   CL_REGEN_APP_KEY="no" ;;
+        --no-protect)     CL_PROTECT="no"; CL_NOINDEX="no"; CL_HTPASSWD="no" ;;
+        --no-htpasswd)    CL_HTPASSWD="no" ;;
+        --no-noindex)     CL_NOINDEX="no" ;;
+        --protect-user)   _i=$((_i + 1)); CL_PROTECT_USER="${_raw_args[$_i]:-}" ;;
+        --protect-pass)   _i=$((_i + 1)); CL_PROTECT_PASS="${_raw_args[$_i]:-}" ;;
+        --allow-ip)       _i=$((_i + 1)); CL_ALLOW_IPS+=("${_raw_args[$_i]:-}") ;;
     esac
     _i=$((_i + 1))
 done
+
+################################################################################
+# Staging protection helpers
+#
+#   - Writes an HTTP basic-auth file (apache2-utils / httpd-tools)
+#   - Patches the final vhost (post-Certbot) to add:
+#       * X-Robots-Tag noindex (response header — authoritative for bots)
+#       * auth_basic + auth_basic_user_file (Nginx) or AuthType Basic (Apache)
+#       * allow <ip>/deny all with satisfy any for IP allowlist bypass
+#   - Drops a robots.txt at the doc root as belt-and-suspenders
+################################################################################
+
+# Build a single Nginx snippet to insert inside every server { } block.
+_build_nginx_protect_snippet() {
+    local htpasswd_file="$1"
+    local snippet=""
+
+    snippet+=$'\n    # --- BEGIN sre-helpers staging protection ---\n'
+
+    if [[ "$CL_NOINDEX" == "yes" ]]; then
+        snippet+=$'    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;\n'
+    fi
+
+    if [[ "$CL_HTPASSWD" == "yes" ]]; then
+        if [[ ${#CL_ALLOW_IPS[@]} -gt 0 ]]; then
+            snippet+=$'    satisfy any;\n'
+            local ip
+            for ip in "${CL_ALLOW_IPS[@]}"; do
+                [[ -n "$ip" ]] && snippet+="    allow ${ip};"$'\n'
+            done
+            snippet+=$'    deny all;\n'
+        fi
+        snippet+=$'    auth_basic           "Staging - Restricted";\n'
+        snippet+="    auth_basic_user_file ${htpasswd_file};"$'\n'
+    fi
+
+    snippet+=$'    # --- END sre-helpers staging protection ---\n'
+    printf '%s' "$snippet"
+}
+
+_build_apache_protect_snippet() {
+    local htpasswd_file="$1"
+    local snippet=""
+
+    snippet+=$'\n    # --- BEGIN sre-helpers staging protection ---\n'
+
+    if [[ "$CL_NOINDEX" == "yes" ]]; then
+        snippet+=$'    Header always set X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"\n'
+    fi
+
+    if [[ "$CL_HTPASSWD" == "yes" ]]; then
+        snippet+=$'    <Location "/">\n'
+        snippet+=$'        AuthType Basic\n'
+        snippet+=$'        AuthName "Staging - Restricted"\n'
+        snippet+="        AuthUserFile ${htpasswd_file}"$'\n'
+        if [[ ${#CL_ALLOW_IPS[@]} -gt 0 ]]; then
+            snippet+=$'        <RequireAny>\n'
+            snippet+=$'            Require valid-user\n'
+            local ip
+            for ip in "${CL_ALLOW_IPS[@]}"; do
+                [[ -n "$ip" ]] && snippet+="            Require ip ${ip}"$'\n'
+            done
+            snippet+=$'        </RequireAny>\n'
+        else
+            snippet+=$'        Require valid-user\n'
+        fi
+        snippet+=$'    </Location>\n'
+    fi
+
+    snippet+=$'    # --- END sre-helpers staging protection ---\n'
+    printf '%s' "$snippet"
+}
+
+# Patch a vhost file: insert the snippet immediately before the last `}` of every
+# server block (Nginx) or before each </VirtualHost> (Apache). Idempotent: removes
+# any prior BEGIN/END block first.
+_inject_protection_into_vhost() {
+    local vhost_file="$1" snippet="$2" ws="$3"
+
+    [[ ! -f "$vhost_file" ]] && return 1
+
+    # Strip any prior block (so re-runs don't stack snippets)
+    sed -i '/# --- BEGIN sre-helpers staging protection ---/,/# --- END sre-helpers staging protection ---/d' "$vhost_file"
+
+    # Write snippet to a temp file (multi-line, safer than r-flag with stdin)
+    local tmp; tmp=$(mktemp)
+    printf '%s' "$snippet" > "$tmp"
+
+    case "$ws" in
+        nginx)
+            # Track brace depth char-by-char. Inject snippet just before the
+            # closing brace of any top-level server { ... } block.
+            awk -v snippet_file="$tmp" '
+                BEGIN {
+                    while ((getline ln < snippet_file) > 0) snippet = snippet ln "\n"
+                    close(snippet_file)
+                    in_server = 0
+                    depth = 0
+                    buf = ""
+                }
+                {
+                    buf = $0
+                    out = ""
+                    n = length(buf)
+                    for (i = 1; i <= n; i++) {
+                        c = substr(buf, i, 1)
+                        if (!in_server && c == "{") {
+                            # Check the chars before this { for "server"
+                            tail = substr(buf, 1, i - 1)
+                            if (tail ~ /(^|[^A-Za-z_])server[[:space:]]*$/) {
+                                in_server = 1
+                                depth = 1
+                                out = out c
+                                continue
+                            }
+                        }
+                        if (in_server) {
+                            if (c == "{") depth++
+                            else if (c == "}") {
+                                depth--
+                                if (depth == 0) {
+                                    # Insert snippet before this closing brace
+                                    out = out "\n" snippet
+                                    in_server = 0
+                                }
+                            }
+                        }
+                        out = out c
+                    }
+                    print out
+                }
+            ' "$vhost_file" > "${vhost_file}.tmp" && mv "${vhost_file}.tmp" "$vhost_file"
+            ;;
+        apache)
+            awk -v snippet_file="$tmp" '
+                BEGIN {
+                    while ((getline line < snippet_file) > 0) snippet = snippet line "\n"
+                    close(snippet_file)
+                }
+                /<\/VirtualHost>/ { printf "%s", snippet }
+                { print }
+            ' "$vhost_file" > "${vhost_file}.tmp" && mv "${vhost_file}.tmp" "$vhost_file"
+            ;;
+    esac
+
+    rm -f "$tmp"
+    return 0
+}
 
 require_root
 sre_header "Step 16: Clone Project (Staging Copy)"
@@ -332,6 +503,16 @@ if [[ "$do_files" == "true" ]]; then
 fi
 if [[ "$do_db" == "true" ]]; then
     sre_info "  DB:    $src_db_name  →  $tgt_db_name"
+fi
+
+if [[ "$CL_PROTECT" == "yes" ]] && [[ "$CL_NOINDEX" == "yes" || "$CL_HTPASSWD" == "yes" ]]; then
+    protect_bits=()
+    [[ "$CL_NOINDEX"  == "yes" ]] && protect_bits+=("noindex")
+    [[ "$CL_HTPASSWD" == "yes" ]] && protect_bits+=("htpasswd")
+    [[ ${#CL_ALLOW_IPS[@]} -gt 0 ]] && protect_bits+=("allow:${CL_ALLOW_IPS[*]}")
+    sre_info "  Protect: ${protect_bits[*]}"
+else
+    sre_warning "  Protect: DISABLED — clone will be publicly reachable"
 fi
 
 if ! prompt_yesno "Proceed with cloning?" "yes"; then
@@ -735,12 +916,123 @@ chmod 600 "$clone_state"
 sre_info "Clone state: $clone_state"
 
 ################################################################################
-# Offer SSL
+# Offer SSL  (run BEFORE protection injection — certbot may rewrite the vhost)
 ################################################################################
 
 if prompt_yesno "Setup SSL for $CL_TARGET_DOMAIN now?" "yes"; then
     bash "${SRE_SCRIPTS_DIR}/ssl/11-ssl.sh" --domain "$CL_TARGET_DOMAIN" --yes \
         || sre_warning "SSL setup didn't complete — re-run manually if needed"
+fi
+
+################################################################################
+# Staging protection (noindex + htpasswd + IP allowlist)
+#
+# Applied AFTER SSL so we patch the final cert-aware vhost. Inserts into every
+# server { } block (HTTP + HTTPS), so https://staging is gated even if certbot
+# added a fresh SSL server block.
+################################################################################
+
+if [[ "$CL_PROTECT" == "yes" ]] && [[ "$CL_NOINDEX" == "yes" || "$CL_HTPASSWD" == "yes" ]]; then
+    sre_header "Staging Protection"
+
+    htpasswd_file=""
+
+    # --- htpasswd file ---
+    if [[ "$CL_HTPASSWD" == "yes" ]]; then
+        # Ensure htpasswd binary
+        if ! command -v htpasswd &>/dev/null; then
+            case "$os_family" in
+                debian) pkg_install apache2-utils ;;
+                rhel)   pkg_install httpd-tools ;;
+            esac
+        fi
+
+        if ! command -v htpasswd &>/dev/null; then
+            sre_warning "htpasswd not available — disabling basic auth"
+            CL_HTPASSWD="no"
+        else
+            [[ -z "$CL_PROTECT_USER" ]] && CL_PROTECT_USER="staging"
+            if [[ -z "$CL_PROTECT_PASS" ]]; then
+                CL_PROTECT_PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 18)
+            fi
+
+            # Per-domain htpasswd file (Nginx-friendly path; Apache reads it too)
+            htpasswd_file="/etc/nginx/htpasswd-${CL_TARGET_DOMAIN}"
+            [[ "$web_server" == "apache" ]] && htpasswd_file="/etc/apache2/htpasswd-${CL_TARGET_DOMAIN}"
+            [[ "$os_family" == "rhel" && "$web_server" == "apache" ]] && htpasswd_file="/etc/httpd/htpasswd-${CL_TARGET_DOMAIN}"
+
+            htpasswd -bc "$htpasswd_file" "$CL_PROTECT_USER" "$CL_PROTECT_PASS" >/dev/null
+            chmod 640 "$htpasswd_file"
+            chown root:www-data "$htpasswd_file" 2>/dev/null || true
+            sre_success "Basic auth credentials written: $htpasswd_file"
+        fi
+    fi
+
+    # --- Build + inject snippet ---
+    case "$web_server" in
+        nginx)  snippet=$(_build_nginx_protect_snippet  "$htpasswd_file") ;;
+        apache) snippet=$(_build_apache_protect_snippet "$htpasswd_file") ;;
+    esac
+
+    if _inject_protection_into_vhost "$tgt_vhost" "$snippet" "$web_server"; then
+        sre_success "Protection directives injected into $tgt_vhost"
+    else
+        sre_warning "Could not patch vhost — apply manually"
+    fi
+
+    # --- robots.txt (belt-and-suspenders, survives if header gets stripped) ---
+    if [[ "$CL_NOINDEX" == "yes" ]]; then
+        # Write into the target doc root (or current/public for Laravel)
+        robots_target="${tgt_doc_root}/robots.txt"
+        if [[ -d "$tgt_doc_root" ]]; then
+            cat > "$robots_target" <<ROBOTS
+# Staging clone — do not index
+User-agent: *
+Disallow: /
+ROBOTS
+            chown www-data:www-data "$robots_target" 2>/dev/null || true
+            chmod 644 "$robots_target"
+            sre_success "robots.txt written: $robots_target"
+        else
+            sre_warning "Doc root missing — robots.txt skipped"
+        fi
+    fi
+
+    # --- Test config + reload ---
+    case "$web_server" in
+        nginx)
+            if nginx -t 2>&1 | tail -2; then
+                svc_reload nginx && sre_success "Nginx reloaded with protection"
+            else
+                sre_error "Nginx config test failed after injection — review $tgt_vhost"
+            fi
+            ;;
+        apache)
+            test_cmd="apachectl configtest"
+            [[ "$os_family" == "rhel" ]] && test_cmd="httpd -t"
+            if $test_cmd 2>&1 | tail -2; then
+                case "$os_family" in
+                    debian) svc_reload apache2 ;;
+                    rhel)   svc_reload httpd ;;
+                esac
+                sre_success "Apache reloaded with protection"
+            else
+                sre_error "Apache config test failed after injection — review $tgt_vhost"
+            fi
+            ;;
+    esac
+
+    # --- Append creds to clone state file ---
+    if [[ -f "$clone_state" ]]; then
+        {
+            printf 'CL_PROTECT=%q\n'        "yes"
+            printf 'CL_PROTECT_USER=%q\n'   "${CL_PROTECT_USER:-}"
+            printf 'CL_PROTECT_PASS=%q\n'   "${CL_PROTECT_PASS:-}"
+            printf 'CL_HTPASSWD_FILE=%q\n'  "${htpasswd_file:-}"
+            printf 'CL_ALLOW_IPS=%q\n'      "${CL_ALLOW_IPS[*]:-}"
+        } >> "$clone_state"
+        chmod 600 "$clone_state"
+    fi
 fi
 
 ################################################################################
@@ -764,9 +1056,29 @@ fi
 echo ""
 sre_warning "Save the DB password!"
 echo ""
+
+if [[ "$CL_PROTECT" == "yes" ]] && [[ "$CL_NOINDEX" == "yes" || "$CL_HTPASSWD" == "yes" ]]; then
+    sre_header "Staging Protection Active"
+    [[ "$CL_NOINDEX"  == "yes" ]] && sre_info "  noindex:  X-Robots-Tag header + robots.txt (Disallow: /)"
+    if [[ "$CL_HTPASSWD" == "yes" ]]; then
+        sre_info "  Basic auth user: $CL_PROTECT_USER"
+        sre_info "  Basic auth pass: $CL_PROTECT_PASS"
+        sre_warning "  Save the basic-auth password!"
+    fi
+    if [[ ${#CL_ALLOW_IPS[@]} -gt 0 ]]; then
+        sre_info "  IP allowlist (no auth needed): ${CL_ALLOW_IPS[*]}"
+    fi
+    echo ""
+fi
+
 sre_info "Next steps:"
 sre_info "  1. Point ${CL_TARGET_DOMAIN} DNS at this server (or rely on wildcard)"
 sre_info "  2. Visit http://${CL_TARGET_DOMAIN} (or https if SSL was configured)"
-sre_info "  3. Verify app loads cleanly, then test against the clone instead of prod"
+if [[ "$CL_HTPASSWD" == "yes" ]]; then
+    sre_info "  3. Browser will prompt for basic auth — use the creds above"
+    sre_info "  4. Verify app loads cleanly, then test against the clone instead of prod"
+else
+    sre_info "  3. Verify app loads cleanly, then test against the clone instead of prod"
+fi
 
 recommend_next_step "$CURRENT_STEP"
