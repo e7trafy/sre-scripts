@@ -588,7 +588,7 @@ declare -A STEP_NAMES=(
     [13]="Deploy New Project (Git)"
     [14]="Backup-Only Capture (no restore)"
     [15]="Bulk Migrate from cPanel/WHM"
-    [16]="Clone Project (Staging Copy)"
+    [16]="Clone Project (Stage or Live Copy)"
     [17]="phpMyAdmin (Optional)"
     [18]="Install Custom SSL (Wildcard / Single)"
 )

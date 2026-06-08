@@ -1,28 +1,44 @@
 #!/bin/bash
 ################################################################################
-# SRE Helpers - Step 16: Clone Project (Staging Copy)
+# SRE Helpers - Step 16: Clone Project
 #
 # Clones an existing provisioned site on this server into a new project under
-# a different domain. Useful for spinning up a staging copy of production.
+# a different domain. Two purposes are supported:
+#
+#   --stage : non-public staging copy. Defaults to ON: noindex headers,
+#             htpasswd gate, robots.txt disallow. APP_ENV gets flipped to
+#             "staging" for Laravel. Default target is <slug>-stage.<rest>.
+#   --live  : a second public copy of the same app under a different domain.
+#             No protection by default, no APP_ENV flip, target domain must
+#             be supplied (no auto-default — there's no sensible one).
 #
 # What it does:
 #   1. Detect source project type (laravel/moodle/wordpress/nuxt/vue/static)
 #      and its document root from the existing vhost.
-#   2. Copy files via rsync (handles release/current symlink layout).
-#   3. Copy database into a fresh DB + user with a new generated password.
-#   4. Rewrite app config for the new domain + DB:
-#        Laravel    → .env (DB_*, APP_URL, APP_KEY refresh optional)
-#        WordPress  → wp-config.php DB_* + ${prefix}options.siteurl/home
-#        Moodle     → config.php wwwroot/dataroot/DB + ${prefix}config.wwwroot
-#   5. Create a new vhost (delegates to step 8 --yes).
-#   6. Fix permissions.
-#   7. Offer SSL via step 11.
+#   2. Resolve the target URL scheme BEFORE any rewrite: probes the source
+#      vhost for SSL; if the source serves https, the clone's APP_URL /
+#      wwwroot / siteurl will be written as https from the start. This is
+#      load-bearing for Moodle — a wwwroot whose scheme doesn't match the
+#      served URL causes redirect loops and broken logins.
+#   3. Copy files via rsync (handles release/current symlink layout).
+#   4. Copy database into a fresh DB + user with a new generated password.
+#   5. Rewrite app config for the new domain + DB + scheme:
+#        Laravel    → .env (DB_*, APP_URL); APP_ENV=staging only for --stage
+#        WordPress  → wp-config.php DB_*, ${prefix}options.siteurl/home, and
+#                     a full wp search-replace (incl. serialized data) when
+#                     wp-cli is available
+#        Moodle     → config.php wwwroot/dataroot/DB AND tempdir/cachedir/
+#                     localcachedir/backuptempdir if they point inside the
+#                     source tree; admin/cli/purge_caches.php after rewrite
+#   6. Create a new vhost (delegates to step 8 --yes).
+#   7. Fix permissions.
+#   8. Offer SSL via step 11 (mandatory if scheme was detected as https).
 #
 # What it does NOT do:
-#   - Touch DNS (you point the new domain at this server yourself, or use the
-#     same wildcard cert + a *.staging.<base> name).
-#   - Touch the source files or source database. The clone is read-only on the
-#     source side.
+#   - Touch DNS (you point the new domain at this server yourself, or use
+#     the same wildcard cert).
+#   - Touch the source files or source database. The clone is read-only on
+#     the source side.
 ################################################################################
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,26 +49,35 @@ CURRENT_STEP=16
 
 CL_SOURCE_DOMAIN=""
 CL_TARGET_DOMAIN=""
-CL_MODE="full"      # full, files-only, db-only
+CL_PURPOSE=""            # stage | live  (prompted if unset)
+CL_MODE="full"           # full, files-only, db-only
 CL_REGEN_APP_KEY="ask"   # laravel only: ask|yes|no
+CL_TGT_SCHEME=""         # http | https  (auto-detected from source vhost)
 
-# Staging protection (default ON — clones are non-public by default)
-CL_PROTECT="yes"               # yes|no   --no-protect disables everything below
-CL_PROTECT_USER=""             # default: "staging"
-CL_PROTECT_PASS=""             # default: openssl rand
-CL_ALLOW_IPS=()                # --allow-ip can be repeated; entries bypass htpasswd
-CL_NOINDEX="yes"               # X-Robots-Tag noindex + robots.txt Disallow: /
-CL_HTPASSWD="yes"              # basic auth gate
+# Protection — DEFAULTS are set after --purpose is resolved (live = off, stage = on)
+CL_PROTECT=""               # yes|no   --no-protect / --protect overrides
+CL_PROTECT_USER=""
+CL_PROTECT_PASS=""
+CL_ALLOW_IPS=()
+CL_NOINDEX=""               # X-Robots-Tag noindex + robots.txt Disallow: /
+CL_HTPASSWD=""              # basic auth gate
 
 sre_show_help() {
     cat <<EOF
 Usage: sudo bash $0 [OPTIONS]
 
-Step 16: Clone Project (Staging Copy)
+Step 16: Clone Project
 
   Copies an existing provisioned site on this server into a new project under
-  a different domain. Files + database get cloned, app config is rewritten
-  for the new domain, a new vhost is created.
+  a different domain. Works for laravel / moodle / wordpress / nuxt / vue /
+  static. Files + database get cloned, app config is rewritten for the new
+  domain + scheme, a new vhost is created.
+
+Purpose:
+  --stage               Non-public staging clone (default protection ON,
+                        APP_ENV=staging for Laravel, default target -stage.<rest>)
+  --live                Public live clone under a different domain
+                        (no protection, no APP_ENV flip, --target required)
 
 Options:
   --source <domain>     Source domain to clone (or prompted)
@@ -60,9 +85,12 @@ Options:
   --mode <mode>         full | files-only | db-only       (default: full)
   --regen-app-key       Laravel: generate a fresh APP_KEY in the clone
   --keep-app-key        Laravel: reuse the source APP_KEY
+  --scheme <s>          Force target URL scheme: http | https | auto
+                        (default: auto — copies the scheme of the source vhost)
 
-Staging protection (default: ON — clones are non-public):
-  --no-protect          Disable ALL staging protection (htpasswd + noindex)
+Protection (default: ON for --stage, OFF for --live):
+  --protect             Force protection ON regardless of purpose
+  --no-protect          Force protection OFF (htpasswd + noindex)
   --no-htpasswd         Skip HTTP basic auth (keep noindex)
   --no-noindex          Skip X-Robots-Tag + robots.txt (keep htpasswd)
   --protect-user <u>    Basic auth username                (default: staging)
@@ -74,9 +102,17 @@ Staging protection (default: ON — clones are non-public):
   --help                Show this help
 
 Examples:
-  sudo bash $0
-  sudo bash $0 --source app.example.com --target staging.example.com
-  sudo bash $0 --source shop.example.com --target shop-stage.example.com --mode files-only
+  # Staging copy with default -stage. suffix
+  sudo bash $0 --stage --source app.example.com
+
+  # Live copy under a second public domain (no protection)
+  sudo bash $0 --live --source app.example.com --target app2.example.com
+
+  # Live Moodle clone — scheme auto-detected from source vhost
+  sudo bash $0 --live --source learn.example.com --target learn2.example.com
+
+  # Files-only sync between two existing domains
+  sudo bash $0 --live --source app.example.com --target app2.example.com --mode files-only
 EOF
 }
 
@@ -84,6 +120,9 @@ _raw_args=("$@")
 sre_parse_args "16-clone-project.sh" "${_raw_args[@]}"
 
 _i=0
+_protect_explicit=""
+_noindex_explicit=""
+_htpasswd_explicit=""
 while [[ $_i -lt ${#_raw_args[@]} ]]; do
     case "${_raw_args[$_i]}" in
         --source)         _i=$((_i + 1)); CL_SOURCE_DOMAIN="${_raw_args[$_i]:-}" ;;
@@ -91,9 +130,13 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --mode)           _i=$((_i + 1)); CL_MODE="${_raw_args[$_i]:-full}" ;;
         --regen-app-key)  CL_REGEN_APP_KEY="yes" ;;
         --keep-app-key)   CL_REGEN_APP_KEY="no" ;;
-        --no-protect)     CL_PROTECT="no"; CL_NOINDEX="no"; CL_HTPASSWD="no" ;;
-        --no-htpasswd)    CL_HTPASSWD="no" ;;
-        --no-noindex)     CL_NOINDEX="no" ;;
+        --stage|--staging) CL_PURPOSE="stage" ;;
+        --live|--production) CL_PURPOSE="live" ;;
+        --scheme)         _i=$((_i + 1)); CL_TGT_SCHEME="${_raw_args[$_i]:-}" ;;
+        --protect)        _protect_explicit="yes"; _noindex_explicit="yes"; _htpasswd_explicit="yes" ;;
+        --no-protect)     _protect_explicit="no";  _noindex_explicit="no";  _htpasswd_explicit="no"  ;;
+        --no-htpasswd)    _htpasswd_explicit="no" ;;
+        --no-noindex)     _noindex_explicit="no" ;;
         --protect-user)   _i=$((_i + 1)); CL_PROTECT_USER="${_raw_args[$_i]:-}" ;;
         --protect-pass)   _i=$((_i + 1)); CL_PROTECT_PASS="${_raw_args[$_i]:-}" ;;
         --allow-ip)       _i=$((_i + 1)); CL_ALLOW_IPS+=("${_raw_args[$_i]:-}") ;;
@@ -132,7 +175,7 @@ _build_nginx_protect_snippet() {
             done
             snippet+=$'    deny all;\n'
         fi
-        snippet+=$'    auth_basic           "Staging - Restricted";\n'
+        snippet+=$'    auth_basic           "Restricted - Clone";\n'
         snippet+="    auth_basic_user_file ${htpasswd_file};"$'\n'
     fi
 
@@ -153,7 +196,7 @@ _build_apache_protect_snippet() {
     if [[ "$CL_HTPASSWD" == "yes" ]]; then
         snippet+=$'    <Location "/">\n'
         snippet+=$'        AuthType Basic\n'
-        snippet+=$'        AuthName "Staging - Restricted"\n'
+        snippet+=$'        AuthName "Restricted - Clone"\n'
         snippet+="        AuthUserFile ${htpasswd_file}"$'\n'
         if [[ ${#CL_ALLOW_IPS[@]} -gt 0 ]]; then
             snippet+=$'        <RequireAny>\n'
@@ -250,7 +293,7 @@ _inject_protection_into_vhost() {
 }
 
 require_root
-sre_header "Step 16: Clone Project (Staging Copy)"
+sre_header "Step 16: Clone Project"
 
 config_load || { sre_error "Config not found. Run step 1 first."; exit 2; }
 
@@ -292,6 +335,77 @@ src_vhost="${vhost_dir}/${CL_SOURCE_DOMAIN}.conf"
 [[ -f "$src_vhost" ]] || { sre_error "Source vhost not found: $src_vhost"; exit 2; }
 
 sre_info "Source domain: $CL_SOURCE_DOMAIN"
+
+################################################################################
+# Clone purpose: stage vs live
+#
+# This decides the protection defaults, whether APP_ENV gets flipped, and
+# whether we offer a default <slug>-stage. target.
+################################################################################
+
+if [[ -z "$CL_PURPOSE" ]]; then
+    sre_header "Clone Purpose"
+    purpose_choice=$(prompt_choice "What is this clone for?" \
+        "stage  — non-public staging copy (protected, APP_ENV=staging)" \
+        "live   — second public copy under a different domain (no protection)")
+    case "$purpose_choice" in
+        stage*) CL_PURPOSE="stage" ;;
+        live*)  CL_PURPOSE="live"  ;;
+    esac
+fi
+
+case "$CL_PURPOSE" in
+    stage|live) ;;
+    *) sre_error "Invalid purpose: $CL_PURPOSE"; exit 1 ;;
+esac
+
+sre_info "Purpose: $CL_PURPOSE"
+
+# Resolve protection defaults based on purpose (explicit flags win)
+if [[ "$CL_PURPOSE" == "stage" ]]; then
+    CL_PROTECT="${_protect_explicit:-yes}"
+    CL_NOINDEX="${_noindex_explicit:-yes}"
+    CL_HTPASSWD="${_htpasswd_explicit:-yes}"
+else
+    CL_PROTECT="${_protect_explicit:-no}"
+    CL_NOINDEX="${_noindex_explicit:-no}"
+    CL_HTPASSWD="${_htpasswd_explicit:-no}"
+fi
+
+################################################################################
+# Target URL scheme — detect BEFORE any config rewrite
+#
+# Probe the source vhost for an SSL listener / cert. If the source serves
+# https, we'll write https URLs from the start; the SSL step at the end
+# provisions a matching cert. This is load-bearing for Moodle: a wwwroot
+# whose scheme doesn't match the served scheme breaks logins.
+################################################################################
+
+if [[ -z "$CL_TGT_SCHEME" || "$CL_TGT_SCHEME" == "auto" ]]; then
+    case "$web_server" in
+        nginx)
+            if grep -qE 'listen\s+443|ssl_certificate' "$src_vhost" 2>/dev/null; then
+                CL_TGT_SCHEME="https"
+            else
+                CL_TGT_SCHEME="http"
+            fi
+            ;;
+        apache)
+            if grep -qE 'VirtualHost\s+\*:443|SSLEngine\s+on|SSLCertificateFile' "$src_vhost" 2>/dev/null; then
+                CL_TGT_SCHEME="https"
+            else
+                CL_TGT_SCHEME="http"
+            fi
+            ;;
+    esac
+fi
+
+case "$CL_TGT_SCHEME" in
+    http|https) ;;
+    *) sre_error "Invalid scheme: $CL_TGT_SCHEME (must be http or https or auto)"; exit 1 ;;
+esac
+
+sre_info "Target scheme: $CL_TGT_SCHEME (from source vhost)"
 
 ################################################################################
 # Detect source project type + root
@@ -367,8 +481,13 @@ sre_info "Mode: $CL_MODE  (files=$do_files, db=$do_db)"
 ################################################################################
 
 if [[ -z "$CL_TARGET_DOMAIN" ]]; then
-    default_target="${CL_SOURCE_DOMAIN%%.*}-stage.${CL_SOURCE_DOMAIN#*.}"
-    CL_TARGET_DOMAIN=$(prompt_input "Target domain for the clone" "$default_target")
+    if [[ "$CL_PURPOSE" == "stage" ]]; then
+        default_target="${CL_SOURCE_DOMAIN%%.*}-stage.${CL_SOURCE_DOMAIN#*.}"
+        CL_TARGET_DOMAIN=$(prompt_input "Target domain for the clone" "$default_target")
+    else
+        # Live clone — no sensible default. Force the user to choose explicitly.
+        CL_TARGET_DOMAIN=$(prompt_input "Target domain for the live clone (required)" "")
+    fi
 fi
 [[ -z "$CL_TARGET_DOMAIN" ]] && { sre_error "Target domain required"; exit 1; }
 
@@ -494,8 +613,10 @@ fi
 ################################################################################
 
 sre_header "Clone Plan"
+sre_info "  Purpose:       $CL_PURPOSE"
 sre_info "  Source domain: $CL_SOURCE_DOMAIN"
 sre_info "  Target domain: $CL_TARGET_DOMAIN"
+sre_info "  Target scheme: $CL_TGT_SCHEME"
 sre_info "  Type:          $src_type"
 sre_info "  Mode:          $CL_MODE"
 if [[ "$do_files" == "true" ]]; then
@@ -697,14 +818,17 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
                     sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${tgt_db_pass}|" "$tgt_env"
                     sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" "$tgt_env"
                 fi
-                sed -i "s|^APP_URL=.*|APP_URL=http://${CL_TARGET_DOMAIN}|" "$tgt_env"
-                # Mark as a clone for sanity
-                if grep -q '^APP_ENV=' "$tgt_env"; then
-                    sed -i "s|^APP_ENV=.*|APP_ENV=staging|" "$tgt_env"
-                else
-                    echo "APP_ENV=staging" >> "$tgt_env"
+                sed -i "s|^APP_URL=.*|APP_URL=${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}|" "$tgt_env"
+                # Only flip APP_ENV for staging clones — a live clone keeps the
+                # source's env (typically "production").
+                if [[ "$CL_PURPOSE" == "stage" ]]; then
+                    if grep -q '^APP_ENV=' "$tgt_env"; then
+                        sed -i "s|^APP_ENV=.*|APP_ENV=staging|" "$tgt_env"
+                    else
+                        echo "APP_ENV=staging" >> "$tgt_env"
+                    fi
                 fi
-                sre_success ".env rewritten: $tgt_env"
+                sre_success ".env rewritten: $tgt_env (APP_URL=${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN})"
 
                 # APP_KEY: regen or keep
                 if [[ "$CL_REGEN_APP_KEY" == "ask" ]]; then
@@ -749,9 +873,34 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
                 # Update siteurl + home in cloned DB
                 if [[ "$do_db" == "true" ]]; then
                     $mysql_cmd "$tgt_db_name" -e \
-                        "UPDATE \`${wp_prefix}options\` SET option_value='http://${CL_TARGET_DOMAIN}' WHERE option_name IN ('siteurl','home');" 2>/dev/null \
-                        && sre_success "WP siteurl/home → http://${CL_TARGET_DOMAIN}" \
+                        "UPDATE \`${wp_prefix}options\` SET option_value='${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}' WHERE option_name IN ('siteurl','home');" 2>/dev/null \
+                        && sre_success "WP siteurl/home → ${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}" \
                         || sre_warning "Could not update WP siteurl (run wp-cli search-replace manually)"
+
+                    # Full content rewrite (post bodies, serialized options, etc.).
+                    # Without this, a live clone keeps old-domain URLs in posts
+                    # — visible to end users. Stage clones benefit too.
+                    src_scheme="http"
+                    grep -qE 'listen\s+443|ssl_certificate' "$src_vhost" 2>/dev/null && src_scheme="https"
+
+                    if command -v wp &>/dev/null; then
+                        sre_info "Running wp search-replace (full content + serialized data)..."
+                        ( cd "${tgt_proj_base}/current" && \
+                          sudo -u www-data wp --skip-themes --skip-plugins \
+                            search-replace \
+                            "${src_scheme}://${CL_SOURCE_DOMAIN}" \
+                            "${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}" \
+                            --all-tables --precise --report-changed-only 2>&1 | tail -20 ) \
+                            && sre_success "wp search-replace complete" \
+                            || sre_warning "wp search-replace had issues — review manually"
+                        ( cd "${tgt_proj_base}/current" && \
+                          sudo -u www-data wp --skip-themes --skip-plugins cache flush 2>/dev/null || true )
+                    else
+                        sre_warning "wp-cli not installed — post bodies still contain old domain URLs."
+                        sre_warning "Install wp-cli and run:"
+                        sre_warning "  cd ${tgt_proj_base}/current && sudo -u www-data wp search-replace \\"
+                        sre_warning "    '${src_scheme}://${CL_SOURCE_DOMAIN}' '${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}' --all-tables"
+                    fi
                 fi
             fi
             ;;
@@ -766,22 +915,65 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
                     sed -i "s|\(\$CFG->dbuser\s*=\s*\)['\"][^'\"]*['\"]|\1'${tgt_db_user}'|" "$tgt_mcf"
                     sed -i "s|\(\$CFG->dbpass\s*=\s*\)['\"][^'\"]*['\"]|\1'${tgt_db_pass}'|" "$tgt_mcf"
                 fi
-                # wwwroot + dataroot for new domain
-                sed -i "s|\(\$CFG->wwwroot\s*=\s*\)['\"][^'\"]*['\"]|\1'http://${CL_TARGET_DOMAIN}'|" "$tgt_mcf"
+
+                # wwwroot — uses the resolved scheme. THIS is the load-bearing
+                # fix: Moodle requires wwwroot's scheme to match the served URL.
+                sed -i "s|\(\$CFG->wwwroot\s*=\s*\)['\"][^'\"]*['\"]|\1'${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}'|" "$tgt_mcf"
+
+                # dataroot
                 if [[ -n "${CL_TGT_MOODLEDATA:-}" ]]; then
                     sed -i "s|\(\$CFG->dataroot\s*=\s*\)['\"][^'\"]*['\"]|\1'${CL_TGT_MOODLEDATA}'|" "$tgt_mcf"
                 fi
-                sre_success "Moodle config.php rewritten"
 
-                # Update wwwroot in mdl_config
+                # tempdir / cachedir / localcachedir / backuptempdir — if the
+                # source config sets them as absolute paths under the source
+                # tree, they still point at the source after the file copy.
+                # Rewrite to the matching path under the target tree.
+                for setting in tempdir cachedir localcachedir backuptempdir; do
+                    old_val=$(grep -oE "\\\$CFG->${setting}\s*=\s*['\"][^'\"]+" "$tgt_mcf" | head -1 | sed "s|.*['\"]||")
+                    [[ -z "$old_val" ]] && continue
+
+                    new_val=""
+                    if [[ "$old_val" == "${src_proj_base}"* ]]; then
+                        # Path is under the source project tree → rewrite to target tree
+                        new_val="${tgt_proj_base}${old_val#${src_proj_base}}"
+                    elif [[ -n "${CL_TGT_MOODLEDATA:-}" ]]; then
+                        # See if it's under source moodledata
+                        if [[ -n "${mdldata:-}" && "$old_val" == "${mdldata}"* ]]; then
+                            new_val="${CL_TGT_MOODLEDATA}${old_val#${mdldata}}"
+                        fi
+                    fi
+
+                    if [[ -n "$new_val" ]]; then
+                        sed -i "s|\(\$CFG->${setting}\s*=\s*\)['\"][^'\"]*['\"]|\1'${new_val}'|" "$tgt_mcf"
+                        sre_info "  rewrote \$CFG->${setting}: ${old_val} → ${new_val}"
+                        # Make sure target dir exists
+                        mkdir -p "$new_val"
+                        chown -R www-data:www-data "$new_val"
+                    fi
+                done
+
+                sre_success "Moodle config.php rewritten (wwwroot=${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN})"
+
+                # The DB-side wwwroot update is mostly a no-op (Moodle reads
+                # wwwroot from config.php, not the DB), but harmless on the
+                # rare installs that mirror it.
                 if [[ "$do_db" == "true" ]]; then
                     $mysql_cmd "$tgt_db_name" -e \
-                        "UPDATE \`${moodle_prefix}config\` SET value='http://${CL_TARGET_DOMAIN}' WHERE name='wwwroot';" 2>/dev/null \
-                        && sre_success "Moodle DB wwwroot → http://${CL_TARGET_DOMAIN}" \
-                        || sre_warning "Could not update mdl_config.wwwroot"
+                        "UPDATE \`${moodle_prefix}config\` SET value='${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}' WHERE name='wwwroot';" 2>/dev/null || true
 
-                    # Purge caches table contents so first request rebuilds
+                    # Wipe stale version markers so first request rebuilds caches
                     $mysql_cmd "$tgt_db_name" -e "DELETE FROM \`${moodle_prefix}config_plugins\` WHERE name='version' AND plugin LIKE 'cache%';" 2>/dev/null || true
+                fi
+
+                # Hard purge via Moodle's own CLI — clears localcache + DB caches.
+                # Skips silently if the CLI doesn't load (e.g. DB not reachable yet).
+                if command -v php &>/dev/null && [[ -f "${tgt_proj_base}/public_html/admin/cli/purge_caches.php" ]]; then
+                    sre_info "Purging Moodle caches via admin/cli/purge_caches.php..."
+                    ( cd "${tgt_proj_base}/public_html" && \
+                      sudo -u www-data php admin/cli/purge_caches.php 2>&1 | tail -5 ) \
+                        && sre_success "Moodle caches purged" \
+                        || sre_warning "Moodle cache purge had warnings — run manually after install"
                 fi
             fi
             ;;
@@ -904,6 +1096,8 @@ clone_state="/etc/sre-helpers/clones/${CL_TARGET_DOMAIN}.conf"
     printf '# Clone created %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     printf 'CL_SOURCE_DOMAIN=%q\n'  "$CL_SOURCE_DOMAIN"
     printf 'CL_TARGET_DOMAIN=%q\n'  "$CL_TARGET_DOMAIN"
+    printf 'CL_PURPOSE=%q\n'        "$CL_PURPOSE"
+    printf 'CL_TGT_SCHEME=%q\n'     "$CL_TGT_SCHEME"
     printf 'CL_PROJECT_TYPE=%q\n'   "$src_type"
     printf 'CL_MODE=%q\n'           "$CL_MODE"
     printf 'CL_TGT_DB_NAME=%q\n'    "${tgt_db_name:-}"
@@ -917,23 +1111,36 @@ sre_info "Clone state: $clone_state"
 
 ################################################################################
 # Offer SSL  (run BEFORE protection injection — certbot may rewrite the vhost)
+#
+# If the target scheme was resolved as https, SSL is mandatory: app config was
+# already written with https URLs, so without a cert the site will return mixed
+# content / TLS errors. We strongly default to yes; explicitly warn if declined.
 ################################################################################
 
-if prompt_yesno "Setup SSL for $CL_TARGET_DOMAIN now?" "yes"; then
+ssl_prompt="Setup SSL for $CL_TARGET_DOMAIN now?"
+if [[ "$CL_TGT_SCHEME" == "https" ]]; then
+    ssl_prompt="App config was written with https URLs. Provision SSL for $CL_TARGET_DOMAIN now? (strongly recommended)"
+fi
+
+if prompt_yesno "$ssl_prompt" "yes"; then
     bash "${SRE_SCRIPTS_DIR}/ssl/11-ssl.sh" --domain "$CL_TARGET_DOMAIN" --yes \
         || sre_warning "SSL setup didn't complete — re-run manually if needed"
+elif [[ "$CL_TGT_SCHEME" == "https" ]]; then
+    sre_warning "App config has https URLs but no cert was provisioned."
+    sre_warning "The clone will not load until you run:"
+    sre_warning "  sudo bash ${SRE_SCRIPTS_DIR}/ssl/11-ssl.sh --domain $CL_TARGET_DOMAIN"
 fi
 
 ################################################################################
 # Staging protection (noindex + htpasswd + IP allowlist)
 #
 # Applied AFTER SSL so we patch the final cert-aware vhost. Inserts into every
-# server { } block (HTTP + HTTPS), so https://staging is gated even if certbot
-# added a fresh SSL server block.
+# server { } block (HTTP + HTTPS), so the clone stays protected even if
+# certbot added a fresh SSL server block.
 ################################################################################
 
 if [[ "$CL_PROTECT" == "yes" ]] && [[ "$CL_NOINDEX" == "yes" || "$CL_HTPASSWD" == "yes" ]]; then
-    sre_header "Staging Protection"
+    sre_header "Clone Protection"
 
     htpasswd_file=""
 
@@ -1043,8 +1250,10 @@ sre_header "Clone Complete"
 
 sre_success "$CL_SOURCE_DOMAIN  →  $CL_TARGET_DOMAIN"
 echo ""
+sre_info "  Purpose:       $CL_PURPOSE"
 sre_info "  Type:          $src_type"
 sre_info "  Mode:          $CL_MODE"
+sre_info "  Target URL:    ${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}"
 sre_info "  Target root:   $tgt_proj_base"
 sre_info "  Target doc:    $tgt_doc_root"
 if [[ "$do_db" == "true" ]]; then
@@ -1058,7 +1267,7 @@ sre_warning "Save the DB password!"
 echo ""
 
 if [[ "$CL_PROTECT" == "yes" ]] && [[ "$CL_NOINDEX" == "yes" || "$CL_HTPASSWD" == "yes" ]]; then
-    sre_header "Staging Protection Active"
+    sre_header "Clone Protection Active"
     [[ "$CL_NOINDEX"  == "yes" ]] && sre_info "  noindex:  X-Robots-Tag header + robots.txt (Disallow: /)"
     if [[ "$CL_HTPASSWD" == "yes" ]]; then
         sre_info "  Basic auth user: $CL_PROTECT_USER"
@@ -1073,12 +1282,17 @@ fi
 
 sre_info "Next steps:"
 sre_info "  1. Point ${CL_TARGET_DOMAIN} DNS at this server (or rely on wildcard)"
-sre_info "  2. Visit http://${CL_TARGET_DOMAIN} (or https if SSL was configured)"
+sre_info "  2. Visit ${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}"
 if [[ "$CL_HTPASSWD" == "yes" ]]; then
     sre_info "  3. Browser will prompt for basic auth — use the creds above"
-    sre_info "  4. Verify app loads cleanly, then test against the clone instead of prod"
+    sre_info "  4. Verify app loads cleanly"
 else
-    sre_info "  3. Verify app loads cleanly, then test against the clone instead of prod"
+    sre_info "  3. Verify app loads cleanly"
+fi
+if [[ "$CL_PURPOSE" == "live" ]]; then
+    echo ""
+    sre_info "  This is a LIVE clone. The source and target are independent —"
+    sre_info "  changes on one will NOT propagate to the other."
 fi
 
 recommend_next_step "$CURRENT_STEP"
