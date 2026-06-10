@@ -100,6 +100,13 @@ Protection (default: ON for --stage, OFF for --live):
   --protect-pass <p>    Basic auth password                (default: generated)
   --allow-ip <cidr>     IP/CIDR that bypasses basic auth   (repeatable)
 
+Resume:
+  --resume              Resume a previously-interrupted clone of the same
+                        target. Reuses persisted DB name/user/password and
+                        skips already-completed phases.
+  --no-resume           Force a fresh run even when a .progress file exists.
+                        Implies --force.
+
   --dry-run             Print planned actions only
   --yes                 Accept defaults without prompting
   --force               Allow overwriting an existing target non-interactively
@@ -107,6 +114,13 @@ Protection (default: ON for --stage, OFF for --live):
                         vhost already exist; default-no prompt would otherwise
                         silently exit)
   --help                Show this help
+
+Tip:
+  Clones can take a while (rsync + mysqldump on large sites). Run under
+  tmux/screen or with nohup so an SSH disconnect doesn't kill the clone:
+    tmux new -s clone -d 'sudo bash $0 --live --source A --target B --yes --force'
+    # then: tmux attach -t clone
+  If it does get killed, re-run the SAME command and the script auto-resumes.
 
 Examples:
   # Staging copy with default -stage. suffix
@@ -148,9 +162,14 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --protect-pass)   _i=$((_i + 1)); CL_PROTECT_PASS="${_raw_args[$_i]:-}" ;;
         --allow-ip)       _i=$((_i + 1)); CL_ALLOW_IPS+=("${_raw_args[$_i]:-}") ;;
         --force|-f)       SRE_FORCE="true" ;;
+        --resume)         CL_RESUME_MODE="yes" ;;
+        --no-resume)      CL_RESUME_MODE="no"; SRE_FORCE="true" ;;
     esac
     _i=$((_i + 1))
 done
+
+# Default-init optional vars so set -u doesn't trip on first reference
+CL_RESUME_MODE="${CL_RESUME_MODE:-auto}"   # auto|yes|no
 
 ################################################################################
 # Staging protection helpers
@@ -670,6 +689,115 @@ fi
 tgt_vhost="${vhost_dir}/${CL_TARGET_DOMAIN}.conf"
 tgt_proj_base="/var/www/${CL_TARGET_DOMAIN}"
 
+################################################################################
+# Resume detection
+#
+# Look for a .progress file from a prior (interrupted) clone of the same
+# target. If source+target match, switch to resume mode: reuse the persisted
+# tgt_db_name/user/password so we don't orphan the half-imported DB, and
+# skip phases that have been marked complete.
+################################################################################
+
+CLONE_STATE_DIR="/etc/sre-helpers/clones"
+mkdir -p "$CLONE_STATE_DIR"
+CLONE_PROGRESS="${CLONE_STATE_DIR}/${CL_TARGET_DOMAIN}.progress"
+CLONE_STATE="${CLONE_STATE_DIR}/${CL_TARGET_DOMAIN}.conf"
+
+CLONE_RESUMING="no"
+# All phase-completion flags default to "" (= not done)
+PHASE_INIT_DONE=""
+PHASE_FILES_DONE=""
+PHASE_DB_DONE=""
+PHASE_CONFIG_DONE=""
+PHASE_VHOST_DONE=""
+PHASE_SSL_DONE=""
+PHASE_PROTECT_DONE=""
+PHASE_PERMS_DONE=""
+PHASE_FINISH_DONE=""
+
+if [[ -f "$CLONE_PROGRESS" ]]; then
+    # Source the file in a subshell first so we can check it without polluting
+    # our env in case it's stale / wrong target.
+    saved_src=$(grep -m1 '^CL_SOURCE_DOMAIN=' "$CLONE_PROGRESS" 2>/dev/null | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    saved_tgt=$(grep -m1 '^CL_TARGET_DOMAIN=' "$CLONE_PROGRESS" 2>/dev/null | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+
+    if [[ "$saved_src" == "$CL_SOURCE_DOMAIN" && "$saved_tgt" == "$CL_TARGET_DOMAIN" ]]; then
+        sre_header "Detected Previous Clone Attempt"
+        sre_info "  Progress file: $CLONE_PROGRESS"
+        # Show what's already done
+        if grep -q '^PHASE_FILES_DONE=' "$CLONE_PROGRESS";   then sre_info "    [DONE] files copied"; fi
+        if grep -q '^PHASE_DB_DONE=' "$CLONE_PROGRESS";      then sre_info "    [DONE] database imported"; fi
+        if grep -q '^PHASE_CONFIG_DONE=' "$CLONE_PROGRESS";  then sre_info "    [DONE] app config rewritten"; fi
+        if grep -q '^PHASE_VHOST_DONE=' "$CLONE_PROGRESS";   then sre_info "    [DONE] vhost created"; fi
+        if grep -q '^PHASE_SSL_DONE=' "$CLONE_PROGRESS";     then sre_info "    [DONE] SSL configured"; fi
+        if grep -q '^PHASE_PROTECT_DONE=' "$CLONE_PROGRESS"; then sre_info "    [DONE] protection applied"; fi
+        if grep -q '^PHASE_PERMS_DONE=' "$CLONE_PROGRESS";   then sre_info "    [DONE] permissions fixed"; fi
+
+        # Decide resume vs fresh
+        case "$CL_RESUME_MODE" in
+            yes)
+                CLONE_RESUMING="yes"
+                sre_info "Resume mode: explicit --resume"
+                ;;
+            no)
+                CLONE_RESUMING="no"
+                sre_warning "Resume mode disabled by --no-resume → discarding previous progress"
+                rm -f "$CLONE_PROGRESS"
+                ;;
+            auto)
+                if prompt_yesno "Resume from where it left off?" "yes"; then
+                    CLONE_RESUMING="yes"
+                else
+                    CLONE_RESUMING="no"
+                    rm -f "$CLONE_PROGRESS"
+                fi
+                ;;
+        esac
+
+        if [[ "$CLONE_RESUMING" == "yes" ]]; then
+            # Pull persisted state into the current shell. Disable set -e while
+            # sourcing — a bad line shouldn't kill us; we warn and continue.
+            set +e
+            source "$CLONE_PROGRESS" 2>/tmp/sre_progress_err.$$
+            _rc=$?
+            set -e
+            if [[ $_rc -ne 0 ]]; then
+                sre_warning "Could not fully parse $CLONE_PROGRESS (see /tmp/sre_progress_err.$$)"
+                sre_warning "Continuing — phases will be re-run as needed."
+            fi
+            sre_success "Resuming clone of $CL_SOURCE_DOMAIN → $CL_TARGET_DOMAIN"
+            sre_info  "  Target DB:   ${tgt_db_name:-<not yet set>}"
+            sre_info  "  Target user: ${tgt_db_user:-<not yet set>}"
+        fi
+    else
+        sre_warning "Found $CLONE_PROGRESS but it's for a DIFFERENT clone (${saved_src:-?} → ${saved_tgt:-?})."
+        sre_warning "Will not auto-resume. Pass --no-resume to discard, or remove the file manually."
+    fi
+fi
+
+# Progress-file writer (key=quoted-value via printf %q)
+progress_set() {
+    local key="$1" value="$2"
+    # Strip any prior line for this key
+    if [[ -f "$CLONE_PROGRESS" ]] && grep -q "^${key}=" "$CLONE_PROGRESS" 2>/dev/null; then
+        sed -i "/^${key}=/d" "$CLONE_PROGRESS"
+    fi
+    printf '%s=%q\n' "$key" "$value" >> "$CLONE_PROGRESS"
+    chmod 600 "$CLONE_PROGRESS"
+}
+
+progress_mark_phase() {
+    local phase="$1"
+    progress_set "PHASE_${phase}_DONE" "$(date '+%Y-%m-%d %H:%M:%S')"
+    eval "PHASE_${phase}_DONE=1"
+}
+
+progress_phase_done() {
+    local phase="$1"
+    local var="PHASE_${phase}_DONE"
+    [[ -n "${!var:-}" ]]
+}
+
 # Refuse to overwrite an existing target unless user confirms.
 #
 # Important: under --yes / SRE_YES, prompt_yesno returns the DEFAULT. Because
@@ -677,7 +805,10 @@ tgt_proj_base="/var/www/${CL_TARGET_DOMAIN}"
 # previously exited silently here AFTER the "Detected type" line — leaving
 # any stale vhost from a prior failed/broken clone in place. To proceed
 # non-interactively, pass --force.
-if [[ -d "$tgt_proj_base" || -f "$tgt_vhost" ]]; then
+#
+# Resume case: we skip this guard entirely — the existing target IS the
+# in-progress clone we're trying to finish.
+if [[ "$CLONE_RESUMING" != "yes" ]] && [[ -d "$tgt_proj_base" || -f "$tgt_vhost" ]]; then
     sre_warning "Target already exists: $tgt_proj_base (or vhost $tgt_vhost)"
 
     # If a stale vhost is here from a previous (wrong-type) clone, surface it
@@ -820,17 +951,41 @@ fi
 
 ################################################################################
 # Target DB plan
+#
+# CRITICAL: generated values are persisted to $CLONE_PROGRESS the moment they
+# exist. On resume we reload them instead of regenerating — otherwise a
+# resumed run would create a SECOND DB with new credentials while the
+# already-written .env / config.php point at the FIRST DB.
 ################################################################################
 
-# Build a new DB name + user (truncate at 32 chars for mysql limits; 16 for user)
-ts=$(date +%y%m%d%H%M)
-_san() { echo "$1" | tr '.-' '_' | tr '[:upper:]' '[:lower:]'; }
-tgt_db_base="$(_san "${CL_TARGET_DOMAIN%%.*}")"
-tgt_db_name="${tgt_db_base}_clone_${ts}"
-tgt_db_name="${tgt_db_name:0:60}"
-tgt_db_user="${tgt_db_base}_c${ts: -6}"
-tgt_db_user="${tgt_db_user:0:32}"
-tgt_db_pass=$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)
+if [[ "$CLONE_RESUMING" == "yes" ]] && [[ -n "${tgt_db_name:-}" && -n "${tgt_db_user:-}" && -n "${tgt_db_pass:-}" ]]; then
+    sre_info "Resuming with persisted target DB creds: $tgt_db_name / $tgt_db_user"
+    # ts is informational only after this point; keep whatever was persisted
+    ts="${ts:-$(date +%y%m%d%H%M)}"
+else
+    # Build a new DB name + user (truncate at 32 chars for mysql limits)
+    ts=$(date +%y%m%d%H%M)
+    _san() { echo "$1" | tr '.-' '_' | tr '[:upper:]' '[:lower:]'; }
+    tgt_db_base="$(_san "${CL_TARGET_DOMAIN%%.*}")"
+    tgt_db_name="${tgt_db_base}_clone_${ts}"
+    tgt_db_name="${tgt_db_name:0:60}"
+    tgt_db_user="${tgt_db_base}_c${ts: -6}"
+    tgt_db_user="${tgt_db_user:0:32}"
+    tgt_db_pass=$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)
+
+    # Persist immediately so an interrupt before the DB phase still preserves
+    # the names/credentials for a clean resume.
+    progress_set "CL_SOURCE_DOMAIN" "$CL_SOURCE_DOMAIN"
+    progress_set "CL_TARGET_DOMAIN" "$CL_TARGET_DOMAIN"
+    progress_set "ts"               "$ts"
+    progress_set "tgt_db_name"      "$tgt_db_name"
+    progress_set "tgt_db_user"      "$tgt_db_user"
+    progress_set "tgt_db_pass"      "$tgt_db_pass"
+    progress_set "src_type"         "$src_type"
+    progress_set "tgt_doc_root"     "$tgt_doc_root"
+    progress_set "CL_TGT_SCHEME"    "$CL_TGT_SCHEME"
+    progress_set "CL_PURPOSE"       "$CL_PURPOSE"
+fi
 
 if [[ "$do_db" == "true" ]]; then
     sre_info "Target DB:     ${tgt_db_name}"
@@ -876,29 +1031,59 @@ if [[ "$SRE_DRY_RUN" == "true" ]]; then
 fi
 
 ################################################################################
-# COPY FILES
+# Phase counter for progress display
 ################################################################################
 
-if [[ "$do_files" == "true" ]]; then
-    sre_header "Copying Files"
+CLONE_TOTAL_PHASES=7   # files, db, config, vhost, ssl, protect, perms
+CLONE_PHASE_NUM=0
+
+phase_header() {
+    local label="$1"
+    CLONE_PHASE_NUM=$((CLONE_PHASE_NUM + 1))
+    sre_header "[${CLONE_PHASE_NUM}/${CLONE_TOTAL_PHASES}] ${label}"
+}
+
+phase_skipped() {
+    local label="$1"
+    CLONE_PHASE_NUM=$((CLONE_PHASE_NUM + 1))
+    sre_info "[${CLONE_PHASE_NUM}/${CLONE_TOTAL_PHASES}] ${label} — already done, skipping"
+}
+
+################################################################################
+# COPY FILES
+#
+# rsync is idempotent: re-running skips already-transferred files.
+# --partial keeps a partially-transferred file's bytes on disk and resumes
+# from that offset on the next run (instead of restarting from zero).
+# So this whole phase is safe to re-run unconditionally — we still mark it
+# done so resumes that get past it can skip the (still-fast) re-traversal.
+################################################################################
+
+if [[ "$do_files" == "true" ]] && ! progress_phase_done FILES; then
+    phase_header "Copying Files"
 
     mkdir -p "$tgt_proj_base"
 
     case "$src_type" in
         laravel)
             # Source uses release-based layout: copy releases/* + shared, rebuild current symlink
-            tgt_release_dir="${tgt_proj_base}/releases/$(date +%Y%m%d%H%M%S)"
-            mkdir -p "$tgt_release_dir" "${tgt_proj_base}/shared"
+            mkdir -p "${tgt_proj_base}/shared"
 
             # Resolve actual source files (current -> releases/X)
             src_release_actual=$(readlink -f "${src_proj_base}/current" 2>/dev/null || echo "${src_proj_base}/current")
+            # Reuse the same target release dir across resumes (persisted)
+            if [[ -z "${tgt_release_dir:-}" || ! -d "${tgt_release_dir:-/nonexistent}" ]]; then
+                tgt_release_dir="${tgt_proj_base}/releases/$(date +%Y%m%d%H%M%S)"
+                progress_set "tgt_release_dir" "$tgt_release_dir"
+            fi
+            mkdir -p "$tgt_release_dir"
             sre_info "Copying release content: ${src_release_actual}/ → ${tgt_release_dir}/"
-            rsync -aH --info=progress2 "${src_release_actual}/" "${tgt_release_dir}/"
+            rsync -aH --partial --info=progress2 "${src_release_actual}/" "${tgt_release_dir}/"
 
             # Copy shared (mostly .env + storage)
             if [[ -d "${src_proj_base}/shared" ]]; then
                 sre_info "Copying shared/ → ${tgt_proj_base}/shared/"
-                rsync -aH "${src_proj_base}/shared/" "${tgt_proj_base}/shared/"
+                rsync -aH --partial "${src_proj_base}/shared/" "${tgt_proj_base}/shared/"
             fi
 
             # current symlink
@@ -923,7 +1108,7 @@ if [[ "$do_files" == "true" ]]; then
                 rsync_excludes+=("--exclude=${rel_mdldata}")
                 sre_info "Excluding internal moodledata: $rel_mdldata"
             fi
-            rsync -aH --info=progress2 "${rsync_excludes[@]}" "${src_proj_base}/" "${tgt_proj_base}/"
+            rsync -aH --partial --info=progress2 "${rsync_excludes[@]}" "${src_proj_base}/" "${tgt_proj_base}/"
 
             # Copy moodledata separately (it can be huge — ask)
             tgt_mdldata="${tgt_proj_base}/moodledata"
@@ -933,7 +1118,7 @@ if [[ "$do_files" == "true" ]]; then
             if [[ -n "$mdldata" && -d "$mdldata" ]]; then
                 if prompt_yesno "Copy moodledata ($(du -sh "$mdldata" 2>/dev/null | cut -f1)) to ${tgt_mdldata}?" "yes"; then
                     mkdir -p "$tgt_mdldata"
-                    rsync -aH --info=progress2 "${mdldata}/" "${tgt_mdldata}/"
+                    rsync -aH --partial --info=progress2 "${mdldata}/" "${tgt_mdldata}/"
                     sre_success "Moodledata copied"
                 else
                     mkdir -p "$tgt_mdldata"
@@ -942,8 +1127,10 @@ if [[ "$do_files" == "true" ]]; then
             else
                 mkdir -p "$tgt_mdldata"
             fi
-            # Stash for later config rewrite
+            # Stash for later config rewrite — persist for resume
             CL_TGT_MOODLEDATA="$tgt_mdldata"
+            progress_set "CL_TGT_MOODLEDATA" "$CL_TGT_MOODLEDATA"
+            progress_set "mdldata"           "${mdldata:-}"
             ;;
 
         wordpress|nuxt|vue|static)
@@ -951,33 +1138,48 @@ if [[ "$do_files" == "true" ]]; then
             if [[ -d "${src_proj_base}/current" && ! -L "${src_proj_base}/current" ]]; then
                 # Edge case: current is a real dir not a symlink — copy as-is
                 sre_info "Copying ${src_proj_base}/ → ${tgt_proj_base}/ (flat layout)"
-                rsync -aH --info=progress2 "${src_proj_base}/" "${tgt_proj_base}/"
+                rsync -aH --partial --info=progress2 "${src_proj_base}/" "${tgt_proj_base}/"
             elif [[ -L "${src_proj_base}/current" ]]; then
                 src_release_actual=$(readlink -f "${src_proj_base}/current")
-                tgt_release_dir="${tgt_proj_base}/releases/$(date +%Y%m%d%H%M%S)"
+                if [[ -z "${tgt_release_dir:-}" || ! -d "${tgt_release_dir:-/nonexistent}" ]]; then
+                    tgt_release_dir="${tgt_proj_base}/releases/$(date +%Y%m%d%H%M%S)"
+                    progress_set "tgt_release_dir" "$tgt_release_dir"
+                fi
                 mkdir -p "$tgt_release_dir"
                 sre_info "Copying ${src_release_actual}/ → ${tgt_release_dir}/"
-                rsync -aH --info=progress2 "${src_release_actual}/" "${tgt_release_dir}/"
+                rsync -aH --partial --info=progress2 "${src_release_actual}/" "${tgt_release_dir}/"
                 ln -sfn "$tgt_release_dir" "${tgt_proj_base}/current"
             else
                 # No release layout — copy doc_root contents
                 mkdir -p "${tgt_proj_base}/current"
                 sre_info "Copying ${src_doc_root}/ → ${tgt_proj_base}/current/"
-                rsync -aH --info=progress2 "${src_doc_root}/" "${tgt_proj_base}/current/"
+                rsync -aH --partial --info=progress2 "${src_doc_root}/" "${tgt_proj_base}/current/"
             fi
             ;;
     esac
 
     chown -R www-data:www-data "$tgt_proj_base"
     sre_success "Files copied to $tgt_proj_base"
+
+    # Persist the moodledata path so resume can rewrite config.php correctly
+    [[ -n "${CL_TGT_MOODLEDATA:-}" ]] && progress_set "CL_TGT_MOODLEDATA" "$CL_TGT_MOODLEDATA"
+
+    progress_mark_phase FILES
+elif [[ "$do_files" == "true" ]]; then
+    phase_skipped "Copying Files"
 fi
 
 ################################################################################
 # COPY DATABASE
+#
+# Not mid-stream resumable: mysqldump|mysql doesn't have an offset. On resume
+# we DROP DATABASE first (the name is timestamp+random so it can't collide
+# with anything real), recreate, and re-import. Atomic per-phase: marked
+# done only after import returns 0.
 ################################################################################
 
-if [[ "$do_db" == "true" ]]; then
-    sre_header "Copying Database"
+if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
+    phase_header "Copying Database"
 
     db_root_pass=""
     [[ -f /root/.db_root_password ]] && db_root_pass=$(cat /root/.db_root_password)
@@ -991,8 +1193,16 @@ if [[ "$do_db" == "true" ]]; then
                 mysqldump_cmd="mysqldump -u root -p${db_root_pass}"
             fi
 
+            # On resume, DROP first so we don't get duplicate-key errors from
+            # a half-imported DB. Target name is timestamp+random — can't
+            # collide with anything real.
+            if $mysql_cmd -e "SHOW DATABASES LIKE '${tgt_db_name}';" 2>/dev/null | grep -q "$tgt_db_name"; then
+                sre_warning "Target DB ${tgt_db_name} already exists — dropping for clean re-import"
+                $mysql_cmd -e "DROP DATABASE \`${tgt_db_name}\`;" 2>/dev/null || true
+            fi
+
             # Create target DB + user (idempotent)
-            $mysql_cmd -e "CREATE DATABASE IF NOT EXISTS \`${tgt_db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+            $mysql_cmd -e "CREATE DATABASE \`${tgt_db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
                 || { sre_error "Failed creating database ${tgt_db_name}"; exit 1; }
             $mysql_cmd -e "CREATE USER IF NOT EXISTS '${tgt_db_user}'@'localhost' IDENTIFIED BY '${tgt_db_pass}';" 2>/dev/null
             $mysql_cmd -e "ALTER USER '${tgt_db_user}'@'localhost' IDENTIFIED BY '${tgt_db_pass}';" 2>/dev/null
@@ -1000,14 +1210,39 @@ if [[ "$do_db" == "true" ]]; then
             $mysql_cmd -e "FLUSH PRIVILEGES;" 2>/dev/null
             sre_success "Target DB + user created: ${tgt_db_name} / ${tgt_db_user}"
 
-            # Dump source → import target. Stream through gzip to keep tmp footprint small.
+            # Estimate source DB size for the live progress meter
+            src_db_bytes=$($mysql_cmd -N -B -e \
+                "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema='${src_db_name}';" 2>/dev/null || echo 0)
+            if [[ "$src_db_bytes" =~ ^[0-9]+$ ]] && [[ "$src_db_bytes" -gt 0 ]]; then
+                sre_info "Source DB size (approx): $(numfmt --to=iec --suffix=B $src_db_bytes 2>/dev/null || echo "${src_db_bytes}B")"
+            fi
+
+            # Dump source → import target. If pv is installed, pipe through
+            # it for a live progress meter. Use PIPESTATUS to detect failures
+            # in either side of the pipe (set -o pipefail is on from lib.sh).
             sre_info "Dumping ${src_db_name} → importing into ${tgt_db_name}..."
-            $mysqldump_cmd --single-transaction --quick --routines --triggers \
-                "$src_db_name" | $mysql_cmd "$tgt_db_name"
+            if command -v pv &>/dev/null; then
+                if [[ "$src_db_bytes" -gt 0 ]]; then
+                    $mysqldump_cmd --single-transaction --quick --routines --triggers \
+                        "$src_db_name" | pv -s "$src_db_bytes" -N "DB stream" | $mysql_cmd "$tgt_db_name"
+                else
+                    $mysqldump_cmd --single-transaction --quick --routines --triggers \
+                        "$src_db_name" | pv -N "DB stream" | $mysql_cmd "$tgt_db_name"
+                fi
+            else
+                $mysqldump_cmd --single-transaction --quick --routines --triggers \
+                    "$src_db_name" | $mysql_cmd "$tgt_db_name"
+            fi
             sre_success "Database copied"
             ;;
 
         postgresql)
+            # Drop on resume — same rationale as mysql branch
+            if sudo -u postgres psql -lqt | cut -d'|' -f1 | grep -qw "$tgt_db_name"; then
+                sre_warning "Target DB ${tgt_db_name} already exists — dropping for clean re-import"
+                sudo -u postgres dropdb "$tgt_db_name" 2>/dev/null || true
+            fi
+
             sudo -u postgres psql -c "DO \$\$ BEGIN
                 IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${tgt_db_user}') THEN
                     CREATE ROLE ${tgt_db_user} WITH LOGIN PASSWORD '${tgt_db_pass}';
@@ -1015,12 +1250,15 @@ if [[ "$do_db" == "true" ]]; then
                     ALTER ROLE ${tgt_db_user} WITH LOGIN PASSWORD '${tgt_db_pass}';
                 END IF;
             END \$\$;" 2>/dev/null
-            sudo -u postgres psql -lqt | cut -d'|' -f1 | grep -qw "$tgt_db_name" \
-                || sudo -u postgres createdb -O "$tgt_db_user" "$tgt_db_name"
+            sudo -u postgres createdb -O "$tgt_db_user" "$tgt_db_name"
             sre_success "Target role/db created: ${tgt_db_name} / ${tgt_db_user}"
 
             sre_info "Dumping ${src_db_name} → importing into ${tgt_db_name}..."
-            sudo -u postgres pg_dump "$src_db_name" | sudo -u postgres psql "$tgt_db_name" >/dev/null
+            if command -v pv &>/dev/null; then
+                sudo -u postgres pg_dump "$src_db_name" | pv -N "DB stream" | sudo -u postgres psql "$tgt_db_name" >/dev/null
+            else
+                sudo -u postgres pg_dump "$src_db_name" | sudo -u postgres psql "$tgt_db_name" >/dev/null
+            fi
             sre_success "Database copied"
             ;;
 
@@ -1029,14 +1267,22 @@ if [[ "$do_db" == "true" ]]; then
             exit 1
             ;;
     esac
+
+    progress_mark_phase DB
+elif [[ "$do_db" == "true" ]]; then
+    phase_skipped "Copying Database"
 fi
 
 ################################################################################
 # Rewrite app config for new domain + DB
+#
+# Idempotent: sed patterns replace whatever's currently there. The .preclone.bak
+# files are guarded — a re-run won't overwrite the original-source backup with
+# an already-rewritten version.
 ################################################################################
 
-if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
-    sre_header "Rewriting App Config"
+if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
+    phase_header "Rewriting App Config"
 
     case "$src_type" in
         laravel)
@@ -1044,7 +1290,7 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
             # Prefer shared/.env if present (release layout)
             [[ -f "${tgt_proj_base}/shared/.env" ]] && tgt_env="${tgt_proj_base}/shared/.env"
             if [[ -f "$tgt_env" ]]; then
-                cp "$tgt_env" "${tgt_env}.preclone.bak"
+                [[ -f "${tgt_env}.preclone.bak" ]] || cp "$tgt_env" "${tgt_env}.preclone.bak"
                 if [[ "$do_db" == "true" ]]; then
                     sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${tgt_db_name}|" "$tgt_env"
                     sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${tgt_db_user}|" "$tgt_env"
@@ -1094,7 +1340,7 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
         wordpress)
             tgt_wpc="${tgt_proj_base}/current/wp-config.php"
             if [[ -f "$tgt_wpc" ]]; then
-                cp "$tgt_wpc" "${tgt_wpc}.preclone.bak"
+                [[ -f "${tgt_wpc}.preclone.bak" ]] || cp "$tgt_wpc" "${tgt_wpc}.preclone.bak"
                 if [[ "$do_db" == "true" ]]; then
                     sed -i "s|define( *['\"]DB_NAME['\"] *,.*|define('DB_NAME', '${tgt_db_name}');|" "$tgt_wpc"
                     sed -i "s|define( *['\"]DB_USER['\"] *,.*|define('DB_USER', '${tgt_db_user}');|" "$tgt_wpc"
@@ -1143,7 +1389,7 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
             # to the legacy public_html/ location if unknown.
             tgt_mcf="${tgt_moodle_config:-${tgt_proj_base}/public_html/config.php}"
             if [[ -f "$tgt_mcf" ]]; then
-                cp "$tgt_mcf" "${tgt_mcf}.preclone.bak"
+                [[ -f "${tgt_mcf}.preclone.bak" ]] || cp "$tgt_mcf" "${tgt_mcf}.preclone.bak"
                 if [[ "$do_db" == "true" ]]; then
                     # Update dbname/dbuser/dbpass — keep dbtype/prefix
                     sed -i "s|\(\$CFG->dbname\s*=\s*\)['\"][^'\"]*['\"]|\1'${tgt_db_name}'|" "$tgt_mcf"
@@ -1219,13 +1465,21 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
             sre_info "$src_type: no app config rewrite needed (static/HTML)"
             ;;
     esac
+    progress_mark_phase CONFIG
+elif progress_phase_done CONFIG; then
+    phase_skipped "Rewriting App Config"
 fi
 
 ################################################################################
 # Create new vhost via step 8
 ################################################################################
 
-sre_header "Creating Vhost for Target Domain"
+if progress_phase_done VHOST; then
+    phase_skipped "Creating Vhost for Target Domain"
+    # Restore CL_TGT_PORT for downstream PM2/finishing logic if it was persisted
+    : "${CL_TGT_PORT:=}"
+else
+    phase_header "Creating Vhost for Target Domain"
 
 # Pick a unique Nuxt port if needed
 vhost_args=( --domain "$CL_TARGET_DOMAIN" --type "$src_type" --yes )
@@ -1298,6 +1552,11 @@ if [[ -f "$tgt_vhost" ]]; then
     sre_success "Vhost written: $tgt_vhost (type=$src_type)"
 fi
 
+    # Persist port (for nuxt) so resumed finishing-touches PM2 start uses the same port
+    [[ -n "${CL_TGT_PORT:-}" ]] && progress_set "CL_TGT_PORT" "$CL_TGT_PORT"
+    progress_mark_phase VHOST
+fi   # end VHOST phase guard
+
 ################################################################################
 # Type-specific finishing touches
 ################################################################################
@@ -1335,45 +1594,50 @@ esac
 # Fix permissions
 ################################################################################
 
-sre_header "Fix Permissions"
+if ! progress_phase_done PERMS; then
+    phase_header "Fix Permissions"
 
-require_acl
+    require_acl
 
-chown -R www-data:www-data "$tgt_proj_base"
-find "$tgt_proj_base" -type d -exec chmod 755 {} \;
-find "$tgt_proj_base" -type f -exec chmod 644 {} \;
-setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX "$tgt_proj_base"
+    chown -R www-data:www-data "$tgt_proj_base"
+    find "$tgt_proj_base" -type d -exec chmod 755 {} \;
+    find "$tgt_proj_base" -type f -exec chmod 644 {} \;
+    setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX "$tgt_proj_base"
 
-case "$src_type" in
-    laravel)
-        for wd in "${tgt_proj_base}/current/storage" "${tgt_proj_base}/current/bootstrap/cache" "${tgt_proj_base}/shared/storage"; do
-            [[ -d "$wd" ]] && chmod -R 775 "$wd"
-        done
-        [[ -f "${tgt_proj_base}/current/.env" ]] && chmod 640 "${tgt_proj_base}/current/.env"
-        [[ -f "${tgt_proj_base}/shared/.env" ]]  && chmod 640 "${tgt_proj_base}/shared/.env"
-        [[ -f "${tgt_proj_base}/current/artisan" ]] && chmod 755 "${tgt_proj_base}/current/artisan"
-        ;;
-    moodle)
-        # Lock down target Moodle config.php (mirrored path; falls back to public_html)
-        for _mcf_path in "${tgt_moodle_config:-}" "${tgt_proj_base}/public_html/config.php" "${tgt_doc_root}/config.php"; do
-            [[ -n "$_mcf_path" && -f "$_mcf_path" ]] && chmod 640 "$_mcf_path" && break
-        done
-        if [[ -n "${CL_TGT_MOODLEDATA:-}" && -d "$CL_TGT_MOODLEDATA" ]]; then
-            chown -R www-data:www-data "$CL_TGT_MOODLEDATA"
-            chmod -R 2770 "$CL_TGT_MOODLEDATA"
-            setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX "$CL_TGT_MOODLEDATA"
-        fi
-        ;;
-    wordpress)
-        if [[ -d "${tgt_proj_base}/current/wp-content" ]]; then
-            chmod -R 775 "${tgt_proj_base}/current/wp-content"
-            setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX "${tgt_proj_base}/current/wp-content"
-        fi
-        [[ -f "${tgt_proj_base}/current/wp-config.php" ]] && chmod 640 "${tgt_proj_base}/current/wp-config.php"
-        ;;
-esac
+    case "$src_type" in
+        laravel)
+            for wd in "${tgt_proj_base}/current/storage" "${tgt_proj_base}/current/bootstrap/cache" "${tgt_proj_base}/shared/storage"; do
+                [[ -d "$wd" ]] && chmod -R 775 "$wd"
+            done
+            [[ -f "${tgt_proj_base}/current/.env" ]] && chmod 640 "${tgt_proj_base}/current/.env"
+            [[ -f "${tgt_proj_base}/shared/.env" ]]  && chmod 640 "${tgt_proj_base}/shared/.env"
+            [[ -f "${tgt_proj_base}/current/artisan" ]] && chmod 755 "${tgt_proj_base}/current/artisan"
+            ;;
+        moodle)
+            # Lock down target Moodle config.php (mirrored path; falls back to public_html)
+            for _mcf_path in "${tgt_moodle_config:-}" "${tgt_proj_base}/public_html/config.php" "${tgt_doc_root}/config.php"; do
+                [[ -n "$_mcf_path" && -f "$_mcf_path" ]] && chmod 640 "$_mcf_path" && break
+            done
+            if [[ -n "${CL_TGT_MOODLEDATA:-}" && -d "$CL_TGT_MOODLEDATA" ]]; then
+                chown -R www-data:www-data "$CL_TGT_MOODLEDATA"
+                chmod -R 2770 "$CL_TGT_MOODLEDATA"
+                setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX "$CL_TGT_MOODLEDATA"
+            fi
+            ;;
+        wordpress)
+            if [[ -d "${tgt_proj_base}/current/wp-content" ]]; then
+                chmod -R 775 "${tgt_proj_base}/current/wp-content"
+                setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX "${tgt_proj_base}/current/wp-content"
+            fi
+            [[ -f "${tgt_proj_base}/current/wp-config.php" ]] && chmod 640 "${tgt_proj_base}/current/wp-config.php"
+            ;;
+    esac
 
-sre_success "Permissions applied"
+    sre_success "Permissions applied"
+    progress_mark_phase PERMS
+else
+    phase_skipped "Fix Permissions"
+fi
 
 ################################################################################
 # Save clone state
@@ -1406,18 +1670,26 @@ sre_info "Clone state: $clone_state"
 # content / TLS errors. We strongly default to yes; explicitly warn if declined.
 ################################################################################
 
-ssl_prompt="Setup SSL for $CL_TARGET_DOMAIN now?"
-if [[ "$CL_TGT_SCHEME" == "https" ]]; then
-    ssl_prompt="App config was written with https URLs. Provision SSL for $CL_TARGET_DOMAIN now? (strongly recommended)"
-fi
+if ! progress_phase_done SSL; then
+    phase_header "SSL Setup"
 
-if prompt_yesno "$ssl_prompt" "yes"; then
-    bash "${SRE_SCRIPTS_DIR}/ssl/11-ssl.sh" --domain "$CL_TARGET_DOMAIN" --yes \
-        || sre_warning "SSL setup didn't complete — re-run manually if needed"
-elif [[ "$CL_TGT_SCHEME" == "https" ]]; then
-    sre_warning "App config has https URLs but no cert was provisioned."
-    sre_warning "The clone will not load until you run:"
-    sre_warning "  sudo bash ${SRE_SCRIPTS_DIR}/ssl/11-ssl.sh --domain $CL_TARGET_DOMAIN"
+    ssl_prompt="Setup SSL for $CL_TARGET_DOMAIN now?"
+    if [[ "$CL_TGT_SCHEME" == "https" ]]; then
+        ssl_prompt="App config was written with https URLs. Provision SSL for $CL_TARGET_DOMAIN now? (strongly recommended)"
+    fi
+
+    if prompt_yesno "$ssl_prompt" "yes"; then
+        bash "${SRE_SCRIPTS_DIR}/ssl/11-ssl.sh" --domain "$CL_TARGET_DOMAIN" --yes \
+            || sre_warning "SSL setup didn't complete — re-run manually if needed"
+    elif [[ "$CL_TGT_SCHEME" == "https" ]]; then
+        sre_warning "App config has https URLs but no cert was provisioned."
+        sre_warning "The clone will not load until you run:"
+        sre_warning "  sudo bash ${SRE_SCRIPTS_DIR}/ssl/11-ssl.sh --domain $CL_TARGET_DOMAIN"
+    fi
+
+    progress_mark_phase SSL
+else
+    phase_skipped "SSL Setup"
 fi
 
 ################################################################################
@@ -1428,8 +1700,10 @@ fi
 # certbot added a fresh SSL server block.
 ################################################################################
 
-if [[ "$CL_PROTECT" == "yes" ]] && [[ "$CL_NOINDEX" == "yes" || "$CL_HTPASSWD" == "yes" ]]; then
-    sre_header "Clone Protection"
+if progress_phase_done PROTECT; then
+    phase_skipped "Clone Protection"
+elif [[ "$CL_PROTECT" == "yes" ]] && [[ "$CL_NOINDEX" == "yes" || "$CL_HTPASSWD" == "yes" ]]; then
+    phase_header "Clone Protection"
 
     htpasswd_file=""
 
@@ -1529,7 +1803,21 @@ ROBOTS
         } >> "$clone_state"
         chmod 600 "$clone_state"
     fi
+
+    progress_mark_phase PROTECT
+else
+    # Protection wasn't requested for this purpose — still mark complete so
+    # resume doesn't pause on it.
+    progress_mark_phase PROTECT
 fi
+
+################################################################################
+# All phases done — clear the progress file. The durable record lives in
+# $clone_state ($CLONE_STATE_DIR/<target>.conf).
+################################################################################
+
+progress_mark_phase FINISH
+rm -f "$CLONE_PROGRESS"
 
 ################################################################################
 # Summary
