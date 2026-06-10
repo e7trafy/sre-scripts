@@ -106,12 +106,21 @@ Database table skipping (DB phase only):
   --skip-table <name>   Skip rows from this table (repeatable)
   --skip-tables <list>  Comma-separated list of tables to skip
   --skip-tables-file <f>  Read table names from a file (one per line, # comments OK)
+  --pick-tables         Interactively show source tables sorted by size and pick
+                        which to skip + the mode per table
   --skip-mode <m>       What to do with skipped tables, without prompting:
                           schema-only    — keep CREATE TABLE, drop the rows
                           skip-entirely  — no CREATE, no rows (app must not query it)
                           ask            — prompt per table (default)
   Common targets: Moodle mdl_logstore_standard_log, mdl_sessions, mdl_cache_flags;
                   Laravel sessions, jobs, failed_jobs, cache, telescope_entries
+
+Reset (start fresh after a botched clone):
+  --reset               WIPE everything for the target (DB + user, /var/www/<target>,
+                        vhost, htpasswd, SSL cert, .progress + .conf state files)
+                        then run the clone from scratch. Destructive — requires
+                        explicit confirmation unless --yes --force are also set.
+  --reset-dry-run       Print what --reset would delete; exit without touching anything.
 
 Protection (default: ON for --stage, OFF for --live):
   --protect             Force protection ON regardless of purpose
@@ -213,12 +222,17 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --force|-f)       SRE_FORCE="true" ;;
         --resume)         CL_RESUME_MODE="yes" ;;
         --no-resume)      CL_RESUME_MODE="no"; SRE_FORCE="true" ;;
+        --reset)          CL_RESET="yes" ;;
+        --reset-dry-run)  CL_RESET="dry-run" ;;
+        --pick-tables)    CL_PICK_TABLES="yes" ;;
     esac
     _i=$((_i + 1))
 done
 
 # Default-init optional vars so set -u doesn't trip on first reference
 CL_RESUME_MODE="${CL_RESUME_MODE:-auto}"   # auto|yes|no
+CL_RESET="${CL_RESET:-no}"                 # no | yes | dry-run
+CL_PICK_TABLES="${CL_PICK_TABLES:-no}"     # no | yes
 
 ################################################################################
 # Staging protection helpers
@@ -751,6 +765,161 @@ CLONE_STATE_DIR="/etc/sre-helpers/clones"
 mkdir -p "$CLONE_STATE_DIR"
 CLONE_PROGRESS="${CLONE_STATE_DIR}/${CL_TARGET_DOMAIN}.progress"
 CLONE_STATE="${CLONE_STATE_DIR}/${CL_TARGET_DOMAIN}.conf"
+
+################################################################################
+# --reset : wipe everything we know about for this target, then continue.
+#
+# Removes (in order):
+#   1. Persisted DB + user from any prior run (read from .progress / .conf)
+#   2. /var/www/<target>/  (entire project tree)
+#   3. Vhost in sites-available/ + symlink in sites-enabled/ + any .bak siblings
+#   4. htpasswd file at the standard per-domain path
+#   5. SSL: /etc/letsencrypt/live|archive|renewal/<target>* (skipped if cert
+#      is shared by a wildcard — only deletes exact-name dirs)
+#   6. .progress and .conf state files
+#
+# Source side is never touched.
+################################################################################
+
+if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
+    sre_header "Reset: Wiping Everything For ${CL_TARGET_DOMAIN}"
+
+    if [[ "$CL_RESET" == "dry-run" ]]; then
+        sre_warning "Dry-run — nothing will actually be deleted."
+    fi
+
+    # Try to read DB name/user from any prior state so we drop the right one
+    _reset_db_name=""
+    _reset_db_user=""
+    for _sf in "$CLONE_PROGRESS" "$CLONE_STATE"; do
+        if [[ -r "$_sf" ]]; then
+            _v=$(grep -m1 '^tgt_db_name=' "$_sf" 2>/dev/null | sed -E "s/^tgt_db_name=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/")
+            [[ -n "$_v" && -z "$_reset_db_name" ]] && _reset_db_name="$_v"
+            _v=$(grep -m1 '^CL_TGT_DB_NAME=' "$_sf" 2>/dev/null | sed -E "s/^CL_TGT_DB_NAME=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/")
+            [[ -n "$_v" && -z "$_reset_db_name" ]] && _reset_db_name="$_v"
+            _v=$(grep -m1 '^tgt_db_user=' "$_sf" 2>/dev/null | sed -E "s/^tgt_db_user=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/")
+            [[ -n "$_v" && -z "$_reset_db_user" ]] && _reset_db_user="$_v"
+            _v=$(grep -m1 '^CL_TGT_DB_USER=' "$_sf" 2>/dev/null | sed -E "s/^CL_TGT_DB_USER=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/")
+            [[ -n "$_v" && -z "$_reset_db_user" ]] && _reset_db_user="$_v"
+        fi
+    done
+
+    sre_info "Will remove (if present):"
+    [[ -n "$_reset_db_name" ]] && sre_info "  DB:           $_reset_db_name"
+    [[ -n "$_reset_db_user" ]] && sre_info "  DB user:      ${_reset_db_user}@localhost"
+    sre_info "  Project dir:  ${tgt_proj_base}/"
+    sre_info "  Vhost conf:   ${tgt_vhost}"
+    _enabled_link="${tgt_vhost/sites-available/sites-enabled}"
+    [[ "$_enabled_link" != "$tgt_vhost" ]] && sre_info "  Enabled link: $_enabled_link"
+    for _htpd in "/etc/nginx/htpasswd-${CL_TARGET_DOMAIN}" "/etc/apache2/htpasswd-${CL_TARGET_DOMAIN}" "/etc/httpd/htpasswd-${CL_TARGET_DOMAIN}"; do
+        [[ -f "$_htpd" ]] && sre_info "  htpasswd:     $_htpd"
+    done
+    for _le in "/etc/letsencrypt/live/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/archive/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/renewal/${CL_TARGET_DOMAIN}.conf"; do
+        [[ -e "$_le" ]] && sre_info "  Let's Encrypt: $_le"
+    done
+    [[ -f "$CLONE_PROGRESS" ]] && sre_info "  Progress:     $CLONE_PROGRESS"
+    [[ -f "$CLONE_STATE" ]]    && sre_info "  State:        $CLONE_STATE"
+
+    if [[ "$CL_RESET" == "dry-run" ]]; then
+        sre_info "Dry-run complete. Pass --reset (without --reset-dry-run) to actually delete."
+        exit 0
+    fi
+
+    # Confirm unless --yes + --force already given
+    if [[ "$SRE_YES" != "true" || "$SRE_FORCE" != "true" ]]; then
+        if ! prompt_yesno "Proceed with DESTRUCTIVE reset?" "no"; then
+            sre_skipped "Reset cancelled."
+            exit 4
+        fi
+    else
+        sre_warning "--yes --force given: proceeding with destructive reset without prompt"
+    fi
+
+    # 1. Drop DB + user
+    if [[ -n "$_reset_db_name" || -n "$_reset_db_user" ]]; then
+        _db_root_pass=""
+        [[ -f /root/.db_root_password ]] && _db_root_pass=$(cat /root/.db_root_password)
+        _mysql_cmd="mysql"
+        [[ -n "$_db_root_pass" ]] && _mysql_cmd="mysql -u root -p${_db_root_pass}"
+        if [[ -n "$_reset_db_name" ]]; then
+            $_mysql_cmd -e "DROP DATABASE IF EXISTS \`${_reset_db_name}\`;" 2>/dev/null \
+                && sre_success "Dropped DB: $_reset_db_name" \
+                || sre_warning "Could not drop DB $_reset_db_name (may not exist or auth failed)"
+        fi
+        if [[ -n "$_reset_db_user" ]]; then
+            $_mysql_cmd -e "DROP USER IF EXISTS '${_reset_db_user}'@'localhost';" 2>/dev/null \
+                && sre_success "Dropped user: ${_reset_db_user}@localhost" \
+                || sre_warning "Could not drop user ${_reset_db_user}@localhost"
+        fi
+        # Also try postgres — best effort, ignore errors
+        if command -v psql &>/dev/null && [[ -n "$_reset_db_name" ]]; then
+            sudo -u postgres dropdb --if-exists "$_reset_db_name" 2>/dev/null && sre_success "Dropped PG DB: $_reset_db_name" || true
+            sudo -u postgres psql -c "DROP ROLE IF EXISTS ${_reset_db_user};" 2>/dev/null || true
+        fi
+    fi
+
+    # 2. Wipe project tree
+    if [[ -d "$tgt_proj_base" ]]; then
+        # Safety: refuse to delete an obviously-wrong path
+        case "$tgt_proj_base" in
+            /var/www/*) rm -rf "$tgt_proj_base" && sre_success "Removed: $tgt_proj_base" ;;
+            *)          sre_error "Refusing to rm -rf '$tgt_proj_base' (not under /var/www/)"; exit 1 ;;
+        esac
+    fi
+    # Also try moodledata at the alternate location
+    for _md in "/u02/appdata/${CL_TARGET_DOMAIN}"; do
+        [[ -d "$_md" ]] && rm -rf "$_md" && sre_success "Removed: $_md"
+    done
+
+    # 3. Vhost files (+ enabled symlink + any backup .bak siblings)
+    if [[ -f "$tgt_vhost" ]]; then
+        rm -f "$tgt_vhost" && sre_success "Removed: $tgt_vhost"
+    fi
+    if [[ "$_enabled_link" != "$tgt_vhost" && -L "$_enabled_link" ]]; then
+        rm -f "$_enabled_link" && sre_success "Removed: $_enabled_link"
+    fi
+    # Wildcard cleanup for backup files
+    for _bak in "${tgt_vhost}".*.bak "${tgt_vhost}.bak"; do
+        [[ -e "$_bak" ]] && rm -f "$_bak" && sre_success "Removed: $_bak"
+    done
+
+    # 4. htpasswd
+    for _htpd in "/etc/nginx/htpasswd-${CL_TARGET_DOMAIN}" "/etc/apache2/htpasswd-${CL_TARGET_DOMAIN}" "/etc/httpd/htpasswd-${CL_TARGET_DOMAIN}"; do
+        [[ -f "$_htpd" ]] && rm -f "$_htpd" && sre_success "Removed: $_htpd"
+    done
+
+    # 5. Let's Encrypt (exact-name match only; wildcards untouched)
+    if command -v certbot &>/dev/null; then
+        if [[ -e "/etc/letsencrypt/live/${CL_TARGET_DOMAIN}" ]]; then
+            certbot delete --non-interactive --cert-name "${CL_TARGET_DOMAIN}" 2>/dev/null \
+                && sre_success "Deleted LE cert: ${CL_TARGET_DOMAIN}" \
+                || sre_warning "certbot delete failed for ${CL_TARGET_DOMAIN}"
+        fi
+    else
+        # No certbot: clean dirs by hand
+        for _le in "/etc/letsencrypt/live/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/archive/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/renewal/${CL_TARGET_DOMAIN}.conf"; do
+            [[ -e "$_le" ]] && rm -rf "$_le" && sre_success "Removed: $_le"
+        done
+    fi
+
+    # 6. State files
+    [[ -f "$CLONE_PROGRESS" ]] && rm -f "$CLONE_PROGRESS" && sre_success "Removed: $CLONE_PROGRESS"
+    [[ -f "$CLONE_STATE" ]]    && rm -f "$CLONE_STATE"    && sre_success "Removed: $CLONE_STATE"
+
+    # Reload web server so removed vhost stops being served
+    case "$web_server" in
+        nginx)  svc_reload nginx 2>/dev/null && sre_info "Nginx reloaded" || true ;;
+        apache) case "$os_family" in
+                    debian) svc_reload apache2 2>/dev/null || true ;;
+                    rhel)   svc_reload httpd   2>/dev/null || true ;;
+                esac ;;
+    esac
+
+    sre_success "Reset complete — continuing with fresh clone"
+
+    # Reset wipes any previous progress, so resume must not kick in
+    CL_RESUME_MODE="no"
+fi
 
 CLONE_RESUMING="no"
 # All phase-completion flags default to "" (= not done)
@@ -1313,6 +1482,113 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
             if [[ -n "$db_root_pass" ]]; then
                 mysql_cmd="mysql -u root -p${db_root_pass}"
                 mysqldump_cmd="mysqldump -u root -p${db_root_pass}"
+            fi
+
+            ####################################################################
+            # --pick-tables : interactive size-sorted picker
+            #
+            # Queries information_schema for the source DB's tables ordered by
+            # size, shows them with human-readable sizes, prompts to mark which
+            # to skip and what mode to use. Names selected here get appended to
+            # CL_SKIP_INPUT and flow through the normal mode-resolution path.
+            ####################################################################
+            if [[ "$CL_PICK_TABLES" == "yes" ]]; then
+                sre_header "Interactive table picker"
+                sre_info "Querying source DB sizes..."
+
+                # Pull NAME, BYTES, ROWS for all base tables, largest first
+                _tbl_data=$($mysql_cmd -N -B -e "
+                    SELECT
+                        table_name,
+                        COALESCE(data_length + index_length, 0) AS bytes,
+                        COALESCE(table_rows, 0) AS rows_est
+                    FROM information_schema.tables
+                    WHERE table_schema = '${src_db_name}'
+                      AND table_type = 'BASE TABLE'
+                    ORDER BY bytes DESC;
+                " 2>/dev/null)
+
+                if [[ -z "$_tbl_data" ]]; then
+                    sre_warning "Could not list tables in ${src_db_name} — skipping picker."
+                else
+                    # Convert into parallel arrays
+                    _pick_names=()
+                    _pick_bytes=()
+                    _pick_rows=()
+                    while IFS=$'\t' read -r _n _b _r; do
+                        [[ -z "$_n" ]] && continue
+                        _pick_names+=("$_n")
+                        _pick_bytes+=("$_b")
+                        _pick_rows+=("$_r")
+                    done <<<"$_tbl_data"
+
+                    sre_info "Source tables (largest first):"
+                    printf '\n  %3s  %-50s  %10s  %12s\n' '#' 'Table' 'Size' 'Rows' >&2
+                    printf '  %3s  %-50s  %10s  %12s\n' '---' '-----' '----' '----' >&2
+                    for _i in "${!_pick_names[@]}"; do
+                        _hsize=$(numfmt --to=iec --suffix=B "${_pick_bytes[$_i]}" 2>/dev/null || echo "${_pick_bytes[$_i]}B")
+                        printf '  %3d  %-50s  %10s  %12s\n' \
+                            $((_i + 1)) "${_pick_names[$_i]}" "$_hsize" "${_pick_rows[$_i]}" >&2
+                    done
+                    echo "" >&2
+
+                    sre_info "Enter table NUMBERS to skip, comma-separated (e.g. 1,3,5)."
+                    sre_info "Or enter ranges like 1-5,8. Empty input = skip nothing."
+                    read -r -p "Tables to skip: " _pick_choice
+                    _pick_choice="${_pick_choice// /}"
+
+                    if [[ -n "$_pick_choice" ]]; then
+                        # Expand ranges
+                        _picked_idx=()
+                        IFS=',' read -ra _parts <<<"$_pick_choice"
+                        for _part in "${_parts[@]}"; do
+                            if [[ "$_part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                                _from=${BASH_REMATCH[1]}
+                                _to=${BASH_REMATCH[2]}
+                                for _j in $(seq "$_from" "$_to"); do _picked_idx+=("$_j"); done
+                            elif [[ "$_part" =~ ^[0-9]+$ ]]; then
+                                _picked_idx+=("$_part")
+                            else
+                                sre_warning "Ignoring invalid token: $_part"
+                            fi
+                        done
+
+                        # Per-selected-table: ask schema-only vs skip-entirely
+                        # (use --skip-mode if it's set to a non-ask value, else ask)
+                        for _idx in "${_picked_idx[@]}"; do
+                            if (( _idx < 1 || _idx > ${#_pick_names[@]} )); then
+                                sre_warning "Out of range: $_idx"
+                                continue
+                            fi
+                            _name="${_pick_names[$((_idx - 1))]}"
+                            _hsize=$(numfmt --to=iec --suffix=B "${_pick_bytes[$((_idx - 1))]}" 2>/dev/null || echo "?")
+
+                            case "$CL_SKIP_MODE" in
+                                schema-only)   CL_SKIP_SCHEMA_ONLY+=("$_name") ; sre_info "  $_name ($_hsize) → schema-only" ;;
+                                skip-entirely) CL_SKIP_FULL+=("$_name")        ; sre_info "  $_name ($_hsize) → skip-entirely" ;;
+                                ask)
+                                    _mode=$(prompt_choice "How to skip '$_name' ($_hsize)?" \
+                                        "schema-only (keep CREATE TABLE, drop rows)" \
+                                        "skip-entirely (no CREATE, no rows)" \
+                                        "cancel (don't skip this one)")
+                                    case "$_mode" in
+                                        schema-only*)   CL_SKIP_SCHEMA_ONLY+=("$_name") ;;
+                                        skip-entirely*) CL_SKIP_FULL+=("$_name") ;;
+                                        cancel*)        sre_info "  $_name: not skipping" ;;
+                                    esac
+                                    ;;
+                            esac
+                        done
+
+                        # Set mode to a non-ask sentinel so the later resolution
+                        # loop doesn't double-prompt for these
+                        if [[ ${#CL_SKIP_SCHEMA_ONLY[@]} -gt 0 || ${#CL_SKIP_FULL[@]} -gt 0 ]]; then
+                            sre_success "Picked $((${#CL_SKIP_SCHEMA_ONLY[@]} + ${#CL_SKIP_FULL[@]})) table(s) to skip"
+                        fi
+                    else
+                        sre_info "No tables picked — proceeding with full clone."
+                    fi
+                fi
             fi
 
             # Validate user-supplied tables against the source DB; warn (don't
