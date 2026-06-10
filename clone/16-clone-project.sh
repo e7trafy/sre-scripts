@@ -62,6 +62,9 @@ CL_ALLOW_IPS=()
 CL_NOINDEX=""               # X-Robots-Tag noindex + robots.txt Disallow: /
 CL_HTPASSWD=""              # basic auth gate
 
+# Initialize optional flags so `set -u` doesn't blow up on first reference
+SRE_FORCE="${SRE_FORCE:-false}"
+
 sre_show_help() {
     cat <<EOF
 Usage: sudo bash $0 [OPTIONS]
@@ -416,16 +419,85 @@ sre_info "Target scheme: $CL_TGT_SCHEME (from source vhost)"
 # Detect source project type + root
 ################################################################################
 
-# Document root from existing vhost
+# Document root from existing vhost.
+#
+# Tricky: SSL-enabled nginx vhosts (after step 11) have an ACME challenge
+# block with its own `root /var/www/letsencrypt;` directive at the top of
+# the HTTP server. A naive `grep -m1 'root '` picks that line up. We use
+# awk to track brace depth and only accept top-level `root` directives,
+# preferring ones inside the HTTPS server block (listen 443) when present.
 src_doc_root=""
 case "$web_server" in
-    nginx)  src_doc_root=$(grep -m1 '^\s*root ' "$src_vhost" | awk '{print $2}' | tr -d ';') ;;
+    nginx)
+        # Pull all top-level `root` directives + which server block (80/443)
+        # they're in, then prefer the 443 block if multiple exist.
+        src_doc_root=$(awk '
+            BEGIN { depth = 0; in_server = 0; cur_listen = ""; best_443 = ""; best_80 = "" }
+            {
+                line = $0
+                n = length(line)
+                # Track listen directive
+                if (line ~ /^[[:space:]]*listen[[:space:]]+443/) cur_listen = "443"
+                else if (line ~ /^[[:space:]]*listen[[:space:]]+80/ && cur_listen == "") cur_listen = "80"
+                # Capture top-level root (depth == 1 inside a server block)
+                if (in_server && depth == 1 && line ~ /^[[:space:]]*root[[:space:]]+/) {
+                    sub(/^[[:space:]]*root[[:space:]]+/, "", line)
+                    sub(/;.*$/, "", line)
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+                    if (cur_listen == "443" && best_443 == "") best_443 = line
+                    else if (cur_listen != "443" && best_80 == "") best_80 = line
+                }
+                # Track braces (after we captured root for this line)
+                line2 = $0
+                for (i = 1; i <= length(line2); i++) {
+                    c = substr(line2, i, 1)
+                    if (c == "{") {
+                        if (!in_server) {
+                            # Detect "server {" entering
+                            tail = substr(line2, 1, i - 1)
+                            if (tail ~ /(^|[^A-Za-z_])server[[:space:]]*$/) {
+                                in_server = 1
+                                depth = 1
+                                continue
+                            }
+                        } else {
+                            depth++
+                        }
+                    } else if (c == "}" && in_server) {
+                        depth--
+                        if (depth == 0) {
+                            in_server = 0
+                            cur_listen = ""
+                        }
+                    }
+                }
+            }
+            END { print (best_443 != "" ? best_443 : best_80) }
+        ' "$src_vhost")
+        ;;
     apache) src_doc_root=$(grep -im1 'DocumentRoot' "$src_vhost" | awk '{print $2}' | tr -d '"') ;;
 esac
 
-if [[ -z "$src_doc_root" || ! -d "$src_doc_root" ]]; then
+# Reject obvious wrong picks (ACME webroot, empty, nonexistent)
+if [[ "$src_doc_root" == "/var/www/letsencrypt" || \
+      "$src_doc_root" == "/var/www/html" || \
+      -z "$src_doc_root" || ! -d "$src_doc_root" ]]; then
     sre_warning "Could not auto-detect doc root from vhost (got: $src_doc_root)"
-    src_doc_root=$(prompt_input "Source document root" "/var/www/${CL_SOURCE_DOMAIN}/current")
+
+    # Try a sensible default based on what exists under /var/www/<domain>
+    fallback_default="/var/www/${CL_SOURCE_DOMAIN}/current"
+    for cand in \
+        "/var/www/${CL_SOURCE_DOMAIN}/public_html" \
+        "/var/www/${CL_SOURCE_DOMAIN}/current/public" \
+        "/var/www/${CL_SOURCE_DOMAIN}/current" \
+        "/var/www/${CL_SOURCE_DOMAIN}"; do
+        if [[ -d "$cand" ]] && find "$cand" -maxdepth 1 -name '*.php' 2>/dev/null | head -1 | grep -q .; then
+            fallback_default="$cand"
+            break
+        fi
+    done
+
+    src_doc_root=$(prompt_input "Source document root" "$fallback_default")
 fi
 
 # Project base on disk = /var/www/<domain>
