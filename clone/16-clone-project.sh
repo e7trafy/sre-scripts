@@ -788,40 +788,52 @@ if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
         sre_warning "Dry-run — nothing will actually be deleted."
     fi
 
-    # Try to read DB name/user from any prior state so we drop the right one
+    # Try to read DB name/user from any prior state so we drop the right one.
+    # `|| true` on every pipe: grep returns 1 when there's no match, which
+    # would trip set -o pipefail + set -e and silently exit the script.
     _reset_db_name=""
     _reset_db_user=""
     for _sf in "$CLONE_PROGRESS" "$CLONE_STATE"; do
         if [[ -r "$_sf" ]]; then
-            _v=$(grep -m1 '^tgt_db_name=' "$_sf" 2>/dev/null | sed -E "s/^tgt_db_name=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/")
-            [[ -n "$_v" && -z "$_reset_db_name" ]] && _reset_db_name="$_v"
-            _v=$(grep -m1 '^CL_TGT_DB_NAME=' "$_sf" 2>/dev/null | sed -E "s/^CL_TGT_DB_NAME=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/")
-            [[ -n "$_v" && -z "$_reset_db_name" ]] && _reset_db_name="$_v"
-            _v=$(grep -m1 '^tgt_db_user=' "$_sf" 2>/dev/null | sed -E "s/^tgt_db_user=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/")
-            [[ -n "$_v" && -z "$_reset_db_user" ]] && _reset_db_user="$_v"
-            _v=$(grep -m1 '^CL_TGT_DB_USER=' "$_sf" 2>/dev/null | sed -E "s/^CL_TGT_DB_USER=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/")
-            [[ -n "$_v" && -z "$_reset_db_user" ]] && _reset_db_user="$_v"
+            _v=$( { grep -m1 '^tgt_db_name=' "$_sf" || true; } | sed -E "s/^tgt_db_name=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/" )
+            if [[ -n "$_v" && -z "$_reset_db_name" ]]; then _reset_db_name="$_v"; fi
+            _v=$( { grep -m1 '^CL_TGT_DB_NAME=' "$_sf" || true; } | sed -E "s/^CL_TGT_DB_NAME=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/" )
+            if [[ -n "$_v" && -z "$_reset_db_name" ]]; then _reset_db_name="$_v"; fi
+            _v=$( { grep -m1 '^tgt_db_user=' "$_sf" || true; } | sed -E "s/^tgt_db_user=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/" )
+            if [[ -n "$_v" && -z "$_reset_db_user" ]]; then _reset_db_user="$_v"; fi
+            _v=$( { grep -m1 '^CL_TGT_DB_USER=' "$_sf" || true; } | sed -E "s/^CL_TGT_DB_USER=//; s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/" )
+            if [[ -n "$_v" && -z "$_reset_db_user" ]]; then _reset_db_user="$_v"; fi
         fi
     done
 
+    # Compute the enabled-symlink path up front (used in both summary + delete)
+    _enabled_link="${tgt_vhost/sites-available/sites-enabled}"
+
+    # Disable `set -e` for the whole reset block. Every check here is "does X
+    # exist?" and a missing X is the expected case on a clean target — we
+    # don't want a failed `[[ -n "$x" ]]` test to kill the script under set -e.
+    set +e
+
     sre_info "Will remove (if present):"
-    [[ -n "$_reset_db_name" ]] && sre_info "  DB:           $_reset_db_name"
-    [[ -n "$_reset_db_user" ]] && sre_info "  DB user:      ${_reset_db_user}@localhost"
+    if [[ -n "$_reset_db_name" ]]; then sre_info "  DB:           $_reset_db_name"; fi
+    if [[ -n "$_reset_db_user" ]]; then sre_info "  DB user:      ${_reset_db_user}@localhost"; fi
     sre_info "  Project dir:  ${tgt_proj_base}/"
     sre_info "  Vhost conf:   ${tgt_vhost}"
-    _enabled_link="${tgt_vhost/sites-available/sites-enabled}"
-    [[ "$_enabled_link" != "$tgt_vhost" ]] && sre_info "  Enabled link: $_enabled_link"
+    if [[ "$_enabled_link" != "$tgt_vhost" ]]; then
+        sre_info "  Enabled link: $_enabled_link"
+    fi
     for _htpd in "/etc/nginx/htpasswd-${CL_TARGET_DOMAIN}" "/etc/apache2/htpasswd-${CL_TARGET_DOMAIN}" "/etc/httpd/htpasswd-${CL_TARGET_DOMAIN}"; do
-        [[ -f "$_htpd" ]] && sre_info "  htpasswd:     $_htpd"
+        if [[ -f "$_htpd" ]]; then sre_info "  htpasswd:     $_htpd"; fi
     done
     for _le in "/etc/letsencrypt/live/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/archive/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/renewal/${CL_TARGET_DOMAIN}.conf"; do
-        [[ -e "$_le" ]] && sre_info "  Let's Encrypt: $_le"
+        if [[ -e "$_le" ]]; then sre_info "  Let's Encrypt: $_le"; fi
     done
-    [[ -f "$CLONE_PROGRESS" ]] && sre_info "  Progress:     $CLONE_PROGRESS"
-    [[ -f "$CLONE_STATE" ]]    && sre_info "  State:        $CLONE_STATE"
+    if [[ -f "$CLONE_PROGRESS" ]]; then sre_info "  Progress:     $CLONE_PROGRESS"; fi
+    if [[ -f "$CLONE_STATE" ]];    then sre_info "  State:        $CLONE_STATE"; fi
 
     if [[ "$CL_RESET" == "dry-run" ]]; then
         sre_info "Dry-run complete. Pass --reset (without --reset-dry-run) to actually delete."
+        set -e
         exit 0
     fi
 
@@ -829,6 +841,7 @@ if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
     if [[ "$SRE_YES" != "true" || "$SRE_FORCE" != "true" ]]; then
         if ! prompt_yesno "Proceed with DESTRUCTIVE reset?" "no"; then
             sre_skipped "Reset cancelled."
+            set -e
             exit 4
         fi
     else
@@ -838,82 +851,117 @@ if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
     # 1. Drop DB + user
     if [[ -n "$_reset_db_name" || -n "$_reset_db_user" ]]; then
         _db_root_pass=""
-        [[ -f /root/.db_root_password ]] && _db_root_pass=$(cat /root/.db_root_password)
+        if [[ -f /root/.db_root_password ]]; then
+            _db_root_pass=$(cat /root/.db_root_password)
+        fi
         _mysql_cmd="mysql"
-        [[ -n "$_db_root_pass" ]] && _mysql_cmd="mysql -u root -p${_db_root_pass}"
+        if [[ -n "$_db_root_pass" ]]; then
+            _mysql_cmd="mysql -u root -p${_db_root_pass}"
+        fi
         if [[ -n "$_reset_db_name" ]]; then
-            $_mysql_cmd -e "DROP DATABASE IF EXISTS \`${_reset_db_name}\`;" 2>/dev/null \
-                && sre_success "Dropped DB: $_reset_db_name" \
-                || sre_warning "Could not drop DB $_reset_db_name (may not exist or auth failed)"
+            if $_mysql_cmd -e "DROP DATABASE IF EXISTS \`${_reset_db_name}\`;" 2>/dev/null; then
+                sre_success "Dropped DB: $_reset_db_name"
+            else
+                sre_warning "Could not drop DB $_reset_db_name (may not exist or auth failed)"
+            fi
         fi
         if [[ -n "$_reset_db_user" ]]; then
-            $_mysql_cmd -e "DROP USER IF EXISTS '${_reset_db_user}'@'localhost';" 2>/dev/null \
-                && sre_success "Dropped user: ${_reset_db_user}@localhost" \
-                || sre_warning "Could not drop user ${_reset_db_user}@localhost"
+            if $_mysql_cmd -e "DROP USER IF EXISTS '${_reset_db_user}'@'localhost';" 2>/dev/null; then
+                sre_success "Dropped user: ${_reset_db_user}@localhost"
+            else
+                sre_warning "Could not drop user ${_reset_db_user}@localhost"
+            fi
         fi
-        # Also try postgres — best effort, ignore errors
+        # PostgreSQL best-effort
         if command -v psql &>/dev/null && [[ -n "$_reset_db_name" ]]; then
-            sudo -u postgres dropdb --if-exists "$_reset_db_name" 2>/dev/null && sre_success "Dropped PG DB: $_reset_db_name" || true
-            sudo -u postgres psql -c "DROP ROLE IF EXISTS ${_reset_db_user};" 2>/dev/null || true
+            if sudo -u postgres dropdb --if-exists "$_reset_db_name" 2>/dev/null; then
+                sre_success "Dropped PG DB: $_reset_db_name"
+            fi
+            sudo -u postgres psql -c "DROP ROLE IF EXISTS ${_reset_db_user};" 2>/dev/null
         fi
     fi
 
-    # 2. Wipe project tree
+    # 2. Wipe project tree (safety: only under /var/www/)
     if [[ -d "$tgt_proj_base" ]]; then
-        # Safety: refuse to delete an obviously-wrong path
         case "$tgt_proj_base" in
-            /var/www/*) rm -rf "$tgt_proj_base" && sre_success "Removed: $tgt_proj_base" ;;
-            *)          sre_error "Refusing to rm -rf '$tgt_proj_base' (not under /var/www/)"; exit 1 ;;
+            /var/www/*)
+                rm -rf "$tgt_proj_base" && sre_success "Removed: $tgt_proj_base"
+                ;;
+            *)
+                sre_error "Refusing to rm -rf '$tgt_proj_base' (not under /var/www/)"
+                set -e
+                exit 1
+                ;;
         esac
     fi
-    # Also try moodledata at the alternate location
-    for _md in "/u02/appdata/${CL_TARGET_DOMAIN}"; do
-        [[ -d "$_md" ]] && rm -rf "$_md" && sre_success "Removed: $_md"
-    done
+    # Alternate moodledata location
+    if [[ -d "/u02/appdata/${CL_TARGET_DOMAIN}" ]]; then
+        rm -rf "/u02/appdata/${CL_TARGET_DOMAIN}" && sre_success "Removed: /u02/appdata/${CL_TARGET_DOMAIN}"
+    fi
 
-    # 3. Vhost files (+ enabled symlink + any backup .bak siblings)
+    # 3. Vhost files (+ enabled symlink + any .bak siblings)
     if [[ -f "$tgt_vhost" ]]; then
         rm -f "$tgt_vhost" && sre_success "Removed: $tgt_vhost"
     fi
     if [[ "$_enabled_link" != "$tgt_vhost" && -L "$_enabled_link" ]]; then
         rm -f "$_enabled_link" && sre_success "Removed: $_enabled_link"
     fi
-    # Wildcard cleanup for backup files
+    # Backup files (use nullglob so unmatched globs become no-ops, not literals)
+    shopt -s nullglob
     for _bak in "${tgt_vhost}".*.bak "${tgt_vhost}.bak"; do
-        [[ -e "$_bak" ]] && rm -f "$_bak" && sre_success "Removed: $_bak"
+        if [[ -e "$_bak" ]]; then
+            rm -f "$_bak" && sre_success "Removed: $_bak"
+        fi
     done
+    shopt -u nullglob
 
     # 4. htpasswd
     for _htpd in "/etc/nginx/htpasswd-${CL_TARGET_DOMAIN}" "/etc/apache2/htpasswd-${CL_TARGET_DOMAIN}" "/etc/httpd/htpasswd-${CL_TARGET_DOMAIN}"; do
-        [[ -f "$_htpd" ]] && rm -f "$_htpd" && sre_success "Removed: $_htpd"
+        if [[ -f "$_htpd" ]]; then
+            rm -f "$_htpd" && sre_success "Removed: $_htpd"
+        fi
     done
 
     # 5. Let's Encrypt (exact-name match only; wildcards untouched)
     if command -v certbot &>/dev/null; then
         if [[ -e "/etc/letsencrypt/live/${CL_TARGET_DOMAIN}" ]]; then
-            certbot delete --non-interactive --cert-name "${CL_TARGET_DOMAIN}" 2>/dev/null \
-                && sre_success "Deleted LE cert: ${CL_TARGET_DOMAIN}" \
-                || sre_warning "certbot delete failed for ${CL_TARGET_DOMAIN}"
+            if certbot delete --non-interactive --cert-name "${CL_TARGET_DOMAIN}" 2>/dev/null; then
+                sre_success "Deleted LE cert: ${CL_TARGET_DOMAIN}"
+            else
+                sre_warning "certbot delete failed for ${CL_TARGET_DOMAIN}"
+            fi
         fi
     else
-        # No certbot: clean dirs by hand
         for _le in "/etc/letsencrypt/live/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/archive/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/renewal/${CL_TARGET_DOMAIN}.conf"; do
-            [[ -e "$_le" ]] && rm -rf "$_le" && sre_success "Removed: $_le"
+            if [[ -e "$_le" ]]; then
+                rm -rf "$_le" && sre_success "Removed: $_le"
+            fi
         done
     fi
 
     # 6. State files
-    [[ -f "$CLONE_PROGRESS" ]] && rm -f "$CLONE_PROGRESS" && sre_success "Removed: $CLONE_PROGRESS"
-    [[ -f "$CLONE_STATE" ]]    && rm -f "$CLONE_STATE"    && sre_success "Removed: $CLONE_STATE"
+    if [[ -f "$CLONE_PROGRESS" ]]; then
+        rm -f "$CLONE_PROGRESS" && sre_success "Removed: $CLONE_PROGRESS"
+    fi
+    if [[ -f "$CLONE_STATE" ]]; then
+        rm -f "$CLONE_STATE" && sre_success "Removed: $CLONE_STATE"
+    fi
 
-    # Reload web server so removed vhost stops being served
+    # Reload web server so the removed vhost stops being served
     case "$web_server" in
-        nginx)  svc_reload nginx 2>/dev/null && sre_info "Nginx reloaded" || true ;;
-        apache) case "$os_family" in
-                    debian) svc_reload apache2 2>/dev/null || true ;;
-                    rhel)   svc_reload httpd   2>/dev/null || true ;;
-                esac ;;
+        nginx)
+            if svc_reload nginx 2>/dev/null; then sre_info "Nginx reloaded"; fi
+            ;;
+        apache)
+            case "$os_family" in
+                debian) svc_reload apache2 2>/dev/null ;;
+                rhel)   svc_reload httpd   2>/dev/null ;;
+            esac
+            ;;
     esac
+
+    # Restore set -e for the rest of the script
+    set -e
 
     sre_success "Reset complete — continuing with fresh clone"
 
