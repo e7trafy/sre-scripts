@@ -557,7 +557,7 @@ case "$web_server" in
             END { print (best_443 != "" ? best_443 : best_80) }
         ' "$src_vhost")
         ;;
-    apache) src_doc_root=$(grep -im1 'DocumentRoot' "$src_vhost" | awk '{print $2}' | tr -d '"') ;;
+    apache) src_doc_root=$( { grep -im1 'DocumentRoot' "$src_vhost" || true; } | awk '{print $2}' | tr -d '"') ;;
 esac
 
 # Reject obvious wrong picks (ACME webroot, empty, nonexistent)
@@ -984,8 +984,8 @@ PHASE_FINISH_DONE=""
 if [[ -f "$CLONE_PROGRESS" ]]; then
     # Source the file in a subshell first so we can check it without polluting
     # our env in case it's stale / wrong target.
-    saved_src=$(grep -m1 '^CL_SOURCE_DOMAIN=' "$CLONE_PROGRESS" 2>/dev/null | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-    saved_tgt=$(grep -m1 '^CL_TARGET_DOMAIN=' "$CLONE_PROGRESS" 2>/dev/null | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    saved_src=$( { grep -m1 '^CL_SOURCE_DOMAIN=' "$CLONE_PROGRESS" 2>/dev/null || true; } | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    saved_tgt=$( { grep -m1 '^CL_TARGET_DOMAIN=' "$CLONE_PROGRESS" 2>/dev/null || true; } | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
 
     if [[ "$saved_src" == "$CL_SOURCE_DOMAIN" && "$saved_tgt" == "$CL_TARGET_DOMAIN" ]]; then
         sre_header "Detected Previous Clone Attempt"
@@ -1160,10 +1160,12 @@ if [[ "$do_db" == "true" ]]; then
             envf="${src_proj_base}/current/.env"
             [[ -f "$envf" ]] || envf="${src_proj_base}/shared/.env"
             if [[ -f "$envf" ]]; then
-                src_db_name=$(grep -m1 '^DB_DATABASE=' "$envf" | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
-                src_db_user=$(grep -m1 '^DB_USERNAME=' "$envf" | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
-                src_db_pass=$(grep -m1 '^DB_PASSWORD=' "$envf" | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
-                conn=$(grep -m1 '^DB_CONNECTION=' "$envf" | cut -d= -f2- | tr -d '"' | tr -d "'")
+                # `|| true` on every grep so a missing key returns empty
+                # instead of tripping pipefail+set-e.
+                src_db_name=$( { grep -m1 '^DB_DATABASE=' "$envf" || true; } | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
+                src_db_user=$( { grep -m1 '^DB_USERNAME=' "$envf" || true; } | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
+                src_db_pass=$( { grep -m1 '^DB_PASSWORD=' "$envf" || true; } | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
+                conn=$( { grep -m1 '^DB_CONNECTION=' "$envf" || true; } | cut -d= -f2- | tr -d '"' | tr -d "'")
                 case "$conn" in
                     mysql|mariadb) src_db_engine="mariadb" ;;
                     pgsql|postgres|postgresql) src_db_engine="postgresql" ;;
@@ -1174,11 +1176,11 @@ if [[ "$do_db" == "true" ]]; then
         wordpress)
             wpc="${src_doc_root}/wp-config.php"
             if [[ -f "$wpc" ]]; then
-                src_db_name=$(grep -oP "define\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]?\K[^'\")]+" "$wpc" | head -1)
-                src_db_user=$(grep -oP "define\(\s*['\"]DB_USER['\"]\s*,\s*['\"]?\K[^'\")]+" "$wpc" | head -1)
-                src_db_pass=$(grep -oP "define\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]?\K[^'\")]+" "$wpc" | head -1)
+                src_db_name=$( { grep -oP "define\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]?\K[^'\")]+" "$wpc" || true; } | head -1)
+                src_db_user=$( { grep -oP "define\(\s*['\"]DB_USER['\"]\s*,\s*['\"]?\K[^'\")]+" "$wpc" || true; } | head -1)
+                src_db_pass=$( { grep -oP "define\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]?\K[^'\")]+" "$wpc" || true; } | head -1)
                 src_db_engine="mariadb"   # WP is mysql/mariadb
-                pf=$(grep -oP "^\s*\\\$table_prefix\s*=\s*['\"]?\K[^'\"]+" "$wpc" | head -1)
+                pf=$( { grep -oP "^\s*\\\$table_prefix\s*=\s*['\"]?\K[^'\"]+" "$wpc" || true; } | head -1)
                 wp_prefix="${pf:-wp_}"
             fi
             ;;
@@ -1187,12 +1189,12 @@ if [[ "$do_db" == "true" ]]; then
             # have it; fall back to doc_root.
             mcf="${src_moodle_config:-${src_doc_root}/config.php}"
             if [[ -f "$mcf" ]]; then
-                src_db_name=$(grep -oP "\\\$CFG->dbname\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" | head -1)
-                src_db_user=$(grep -oP "\\\$CFG->dbuser\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" | head -1)
-                src_db_pass=$(grep -oP "\\\$CFG->dbpass\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" | head -1)
-                pf=$(grep -oP "\\\$CFG->prefix\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" | head -1)
+                src_db_name=$( { grep -oP "\\\$CFG->dbname\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" || true; } | head -1)
+                src_db_user=$( { grep -oP "\\\$CFG->dbuser\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" || true; } | head -1)
+                src_db_pass=$( { grep -oP "\\\$CFG->dbpass\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" || true; } | head -1)
+                pf=$( { grep -oP "\\\$CFG->prefix\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" || true; } | head -1)
                 moodle_prefix="${pf:-mdl_}"
-                dbt=$(grep -oP "\\\$CFG->dbtype\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" | head -1)
+                dbt=$( { grep -oP "\\\$CFG->dbtype\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" || true; } | head -1)
                 case "$dbt" in
                     mariadb|mysqli|mysql) src_db_engine="mariadb" ;;
                     pgsql)                src_db_engine="postgresql" ;;
@@ -1363,7 +1365,7 @@ if [[ "$do_files" == "true" ]] && ! progress_phase_done FILES; then
             mdldata=""
             mcf_for_dataroot="${src_moodle_config:-${src_doc_root}/config.php}"
             if [[ -f "$mcf_for_dataroot" ]]; then
-                mdldata=$(grep -oP "\\\$CFG->dataroot\s*=\s*['\"]?\K[^'\";\s]+" "$mcf_for_dataroot" | head -1)
+                mdldata=$( { grep -oP "\\\$CFG->dataroot\s*=\s*['\"]?\K[^'\";\s]+" "$mcf_for_dataroot" || true; } | head -1)
             fi
             # Fall back to well-known locations if config.php was unreadable
             [[ -z "$mdldata" && -d "${src_proj_base}/moodledata" ]] && mdldata="${src_proj_base}/moodledata"
@@ -1955,8 +1957,12 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                 # tree, they still point at the source after the file copy.
                 # Rewrite to the matching path under the target tree.
                 for setting in tempdir cachedir localcachedir backuptempdir; do
-                    old_val=$(grep -oE "\\\$CFG->${setting}\s*=\s*['\"][^'\"]+" "$tgt_mcf" | head -1 | sed "s|.*['\"]||")
-                    [[ -z "$old_val" ]] && continue
+                    # `|| true` is load-bearing: most config.php files don't set
+                    # these explicitly (Moodle uses defaults). Without it, grep
+                    # returns 1, pipefail propagates, set -e kills the script
+                    # silently right here on the first loop iteration.
+                    old_val=$( { grep -oE "\\\$CFG->${setting}\s*=\s*['\"][^'\"]+" "$tgt_mcf" || true; } | head -1 | sed "s|.*['\"]||" )
+                    if [[ -z "$old_val" ]]; then continue; fi
 
                     new_val=""
                     if [[ "$old_val" == "${src_proj_base}"* ]]; then
@@ -2030,7 +2036,7 @@ vhost_args=( --domain "$CL_TARGET_DOMAIN" --type "$src_type" --yes )
 
 if [[ "$src_type" == "nuxt" ]]; then
     # Source port from source vhost; pick next free
-    src_port=$(grep -oP 'proxy_pass\s+http://127\.0\.0\.1:\K[0-9]+' "$src_vhost" | head -1)
+    src_port=$( { grep -oP 'proxy_pass\s+http://127\.0\.0\.1:\K[0-9]+' "$src_vhost" || true; } | head -1)
     src_port="${src_port:-3000}"
     new_port=$((src_port + 1))
     while ss -tlnp 2>/dev/null | grep -q ":${new_port} " ; do
