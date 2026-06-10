@@ -1218,6 +1218,26 @@ if [[ "$do_db" == "true" ]]; then
 fi
 
 ################################################################################
+# Build mysql_cmd / mysqldump_cmd ONCE up front (not inside the DB phase).
+#
+# The CONFIG and other later phases need to talk to MySQL too (Moodle DB
+# wwwroot update, WP search-replace, etc.). On a resume where the DB phase
+# was already marked done, those references would otherwise hit an unset
+# variable and trip set -u.
+################################################################################
+
+mysql_cmd="mysql"
+mysqldump_cmd="mysqldump"
+db_root_pass="${db_root_pass:-}"
+if [[ -z "$db_root_pass" && -f /root/.db_root_password ]]; then
+    db_root_pass=$(cat /root/.db_root_password)
+fi
+if [[ -n "$db_root_pass" ]]; then
+    mysql_cmd="mysql -u root -p${db_root_pass}"
+    mysqldump_cmd="mysqldump -u root -p${db_root_pass}"
+fi
+
+################################################################################
 # Target DB plan
 #
 # CRITICAL: generated values are persisted to $CLONE_PROGRESS the moment they
@@ -1449,8 +1469,8 @@ fi
 if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
     phase_header "Copying Database"
 
-    db_root_pass=""
-    [[ -f /root/.db_root_password ]] && db_root_pass=$(cat /root/.db_root_password)
+    # mysql_cmd / mysqldump_cmd / db_root_pass are already hoisted up top so
+    # later phases can use them on resume. Nothing to (re-)set here.
 
     ############################################################################
     # Resolve table-skip plan
@@ -1527,12 +1547,8 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
 
     case "$src_db_engine" in
         mariadb|mysql)
-            mysql_cmd="mysql"
-            mysqldump_cmd="mysqldump"
-            if [[ -n "$db_root_pass" ]]; then
-                mysql_cmd="mysql -u root -p${db_root_pass}"
-                mysqldump_cmd="mysqldump -u root -p${db_root_pass}"
-            fi
+            # mysql_cmd / mysqldump_cmd were hoisted earlier (so CONFIG phase
+            # on resume can use them too). No re-setup needed here.
 
             ####################################################################
             # --pick-tables : interactive size-sorted picker
