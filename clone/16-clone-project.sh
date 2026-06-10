@@ -1261,6 +1261,94 @@ else
     tgt_db_user="${tgt_db_user:0:32}"
     tgt_db_pass=$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)
 
+    ############################################################################
+    # Prompt for DB name + user (only if --do_db). Auto-generated values are
+    # shown as defaults — press Enter to accept.
+    #
+    # Skipped when SRE_YES=true AND SRE_FORCE=true (matches the script's
+    # established "non-interactive override" rule).
+    ############################################################################
+
+    _db_name_ok() {
+        local v="$1"
+        [[ -n "$v" && ${#v} -le 64 && "$v" =~ ^[a-zA-Z0-9_]+$ ]]
+    }
+    _db_user_ok() {
+        local v="$1"
+        [[ -n "$v" && ${#v} -le 32 && "$v" =~ ^[a-zA-Z0-9_]+$ ]]
+    }
+    _mysql_has_db() {
+        local v="$1"
+        $mysql_cmd -N -B -e \
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name='${v}' LIMIT 1;" 2>/dev/null \
+            | grep -q '^1$'
+    }
+    _mysql_has_user() {
+        local v="$1"
+        $mysql_cmd -N -B -e \
+            "SELECT 1 FROM mysql.user WHERE user='${v}' AND host='localhost' LIMIT 1;" 2>/dev/null \
+            | grep -q '^1$'
+    }
+
+    _skip_db_prompts="no"
+    if [[ "$do_db" != "true" ]]; then
+        _skip_db_prompts="yes"
+    elif [[ "$SRE_YES" == "true" && "$SRE_FORCE" == "true" ]]; then
+        _skip_db_prompts="yes"
+    fi
+
+    if [[ "$_skip_db_prompts" == "no" ]]; then
+        sre_header "Target Database Credentials"
+        sre_info "Press Enter to accept the auto-generated value, or type your own."
+
+        # --- DB name ---
+        while true; do
+            _user_db_name=$(prompt_input "Target DB name" "$tgt_db_name")
+            if ! _db_name_ok "$_user_db_name"; then
+                sre_warning "Invalid DB name. Must be 1-64 chars, [a-zA-Z0-9_] only."
+                continue
+            fi
+            if _mysql_has_db "$_user_db_name"; then
+                # Allow if it's the auto-generated value (which is timestamp+random,
+                # so a collision means a leftover from this same script — safe to
+                # reuse). Reject anything else to avoid clobbering an unrelated DB.
+                if [[ "$_user_db_name" == "$tgt_db_name" ]]; then
+                    sre_warning "DB '$_user_db_name' already exists — will DROP and recreate (auto-generated name, safe)."
+                    break
+                fi
+                sre_warning "DB '$_user_db_name' already exists in MySQL — refusing to clobber it."
+                sre_warning "Pick a different name, or drop the existing DB manually first:"
+                sre_warning "  mysql -u root -e \"DROP DATABASE \\\`${_user_db_name}\\\`;\""
+                continue
+            fi
+            tgt_db_name="$_user_db_name"
+            break
+        done
+
+        # --- DB user ---
+        while true; do
+            _user_db_user=$(prompt_input "Target DB user" "$tgt_db_user")
+            if ! _db_user_ok "$_user_db_user"; then
+                sre_warning "Invalid DB user. Must be 1-32 chars, [a-zA-Z0-9_] only."
+                continue
+            fi
+            if _mysql_has_user "$_user_db_user"; then
+                if [[ "$_user_db_user" == "$tgt_db_user" ]]; then
+                    sre_warning "User '$_user_db_user'@'localhost' already exists — will ALTER its password (auto-generated name, safe)."
+                    break
+                fi
+                sre_warning "User '$_user_db_user'@'localhost' already exists in MySQL — refusing to overwrite its password."
+                sre_warning "Pick a different name, or drop the existing user manually first:"
+                sre_warning "  mysql -u root -e \"DROP USER '${_user_db_user}'@'localhost';\""
+                continue
+            fi
+            tgt_db_user="$_user_db_user"
+            break
+        done
+
+        sre_success "Will use: DB=${tgt_db_name}, user=${tgt_db_user}"
+    fi
+
     # Persist immediately so an interrupt before the DB phase still preserves
     # the names/credentials for a clean resume.
     progress_set "CL_SOURCE_DOMAIN" "$CL_SOURCE_DOMAIN"
