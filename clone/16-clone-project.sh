@@ -59,6 +59,17 @@ CL_PROTECT=""               # yes|no   --no-protect / --protect overrides
 CL_PROTECT_USER=""
 CL_PROTECT_PASS=""
 CL_ALLOW_IPS=()
+
+# Table-skip plan for the DB phase. Three lists, populated from --skip-table /
+# --skip-tables / --skip-tables-file, then refined at runtime per --skip-mode.
+#   CL_SKIP_INPUT       = raw user-supplied table names (de-duped)
+#   CL_SKIP_SCHEMA_ONLY = dump CREATE TABLE but no rows (--no-data + --where)
+#   CL_SKIP_FULL        = exclude entirely from dump (no CREATE, no rows)
+CL_SKIP_INPUT=()
+CL_SKIP_SCHEMA_ONLY=()
+CL_SKIP_FULL=()
+CL_SKIP_MODE="ask"             # ask | schema-only | skip-entirely
+CL_SKIP_TABLES_FILE=""
 CL_NOINDEX=""               # X-Robots-Tag noindex + robots.txt Disallow: /
 CL_HTPASSWD=""              # basic auth gate
 
@@ -90,6 +101,17 @@ Options:
   --keep-app-key        Laravel: reuse the source APP_KEY
   --scheme <s>          Force target URL scheme: http | https | auto
                         (default: auto — copies the scheme of the source vhost)
+
+Database table skipping (DB phase only):
+  --skip-table <name>   Skip rows from this table (repeatable)
+  --skip-tables <list>  Comma-separated list of tables to skip
+  --skip-tables-file <f>  Read table names from a file (one per line, # comments OK)
+  --skip-mode <m>       What to do with skipped tables, without prompting:
+                          schema-only    — keep CREATE TABLE, drop the rows
+                          skip-entirely  — no CREATE, no rows (app must not query it)
+                          ask            — prompt per table (default)
+  Common targets: Moodle mdl_logstore_standard_log, mdl_sessions, mdl_cache_flags;
+                  Laravel sessions, jobs, failed_jobs, cache, telescope_entries
 
 Protection (default: ON for --stage, OFF for --live):
   --protect             Force protection ON regardless of purpose
@@ -134,6 +156,18 @@ Examples:
 
   # Files-only sync between two existing domains
   sudo bash $0 --live --source app.example.com --target app2.example.com --mode files-only
+
+  # Moodle clone, skip rows from huge log/session tables (keep schema)
+  sudo bash $0 --live --source learn.example.com --target learn2.example.com \\
+    --skip-tables mdl_logstore_standard_log,mdl_sessions,mdl_cache_flags \\
+    --skip-mode schema-only
+
+  # Same, reading from a file
+  echo 'mdl_logstore_standard_log
+mdl_sessions
+mdl_cache_flags
+# Lines starting with # and blank lines are ignored' > /tmp/skip.txt
+  sudo bash $0 --live --source A --target B --skip-tables-file /tmp/skip.txt --skip-mode schema-only
 EOF
 }
 
@@ -161,6 +195,21 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --protect-user)   _i=$((_i + 1)); CL_PROTECT_USER="${_raw_args[$_i]:-}" ;;
         --protect-pass)   _i=$((_i + 1)); CL_PROTECT_PASS="${_raw_args[$_i]:-}" ;;
         --allow-ip)       _i=$((_i + 1)); CL_ALLOW_IPS+=("${_raw_args[$_i]:-}") ;;
+        --skip-table)     _i=$((_i + 1)); CL_SKIP_INPUT+=("${_raw_args[$_i]:-}") ;;
+        --skip-tables)
+            _i=$((_i + 1))
+            IFS=',' read -ra _skip_list <<<"${_raw_args[$_i]:-}"
+            for _t in "${_skip_list[@]}"; do
+                _t="${_t// /}"
+                [[ -n "$_t" ]] && CL_SKIP_INPUT+=("$_t")
+            done
+            ;;
+        --skip-tables-file)
+            _i=$((_i + 1)); CL_SKIP_TABLES_FILE="${_raw_args[$_i]:-}"
+            ;;
+        --skip-mode)
+            _i=$((_i + 1)); CL_SKIP_MODE="${_raw_args[$_i]:-ask}"
+            ;;
         --force|-f)       SRE_FORCE="true" ;;
         --resume)         CL_RESUME_MODE="yes" ;;
         --no-resume)      CL_RESUME_MODE="no"; SRE_FORCE="true" ;;
@@ -1184,6 +1233,79 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
     db_root_pass=""
     [[ -f /root/.db_root_password ]] && db_root_pass=$(cat /root/.db_root_password)
 
+    ############################################################################
+    # Resolve table-skip plan
+    #
+    # Inputs: CL_SKIP_INPUT (from --skip-table[s]), CL_SKIP_TABLES_FILE.
+    # Outputs (de-duped, validated against source DB):
+    #   CL_SKIP_SCHEMA_ONLY[]  → dump CREATE TABLE only, drop rows
+    #   CL_SKIP_FULL[]         → no CREATE, no rows
+    ############################################################################
+
+    # Validate --skip-mode
+    case "$CL_SKIP_MODE" in
+        ask|schema-only|skip-entirely) ;;
+        *) sre_error "Invalid --skip-mode: $CL_SKIP_MODE (expected: ask | schema-only | skip-entirely)"; exit 1 ;;
+    esac
+
+    # On resume, prefer the persisted plan over re-prompting. CL_SKIP_SCHEMA_ONLY
+    # and CL_SKIP_FULL are written as space-joined strings via `progress_set`
+    # earlier in this same phase; on resume they came back into the env via
+    # `source $CLONE_PROGRESS` at startup. Split them back into arrays.
+    if [[ "$CLONE_RESUMING" == "yes" ]]; then
+        # Detect the case where we have persisted plan data (string form) but
+        # current-shell arrays are empty.
+        if [[ ${#CL_SKIP_SCHEMA_ONLY[@]} -eq 0 ]] && [[ -n "${CL_SKIP_SCHEMA_ONLY_STR:-}" ]]; then
+            read -ra CL_SKIP_SCHEMA_ONLY <<<"$CL_SKIP_SCHEMA_ONLY_STR"
+        fi
+        if [[ ${#CL_SKIP_FULL[@]} -eq 0 ]] && [[ -n "${CL_SKIP_FULL_STR:-}" ]]; then
+            read -ra CL_SKIP_FULL <<<"$CL_SKIP_FULL_STR"
+        fi
+        if [[ ${#CL_SKIP_SCHEMA_ONLY[@]} -gt 0 || ${#CL_SKIP_FULL[@]} -gt 0 ]]; then
+            sre_info "Resuming with persisted skip plan:"
+            [[ ${#CL_SKIP_SCHEMA_ONLY[@]} -gt 0 ]] && sre_info "  schema-only: ${CL_SKIP_SCHEMA_ONLY[*]}"
+            [[ ${#CL_SKIP_FULL[@]} -gt 0 ]] && sre_info "  skip-entirely: ${CL_SKIP_FULL[*]}"
+            # Mark "already resolved" so the per-table prompt block skips
+            CL_SKIP_INPUT=()
+        fi
+    fi
+
+    # Load tables from file
+    if [[ -n "$CL_SKIP_TABLES_FILE" ]]; then
+        if [[ ! -r "$CL_SKIP_TABLES_FILE" ]]; then
+            sre_error "Cannot read --skip-tables-file: $CL_SKIP_TABLES_FILE"
+            exit 1
+        fi
+        while IFS= read -r _line; do
+            _line="${_line%%#*}"            # strip comments
+            _line="${_line//$'\t'/}"
+            _line="${_line//$'\r'/}"
+            _line="${_line// /}"
+            [[ -z "$_line" ]] && continue
+            CL_SKIP_INPUT+=("$_line")
+        done <"$CL_SKIP_TABLES_FILE"
+    fi
+
+    # De-duplicate input
+    if [[ ${#CL_SKIP_INPUT[@]} -gt 0 ]]; then
+        declare -A _seen_assoc=()
+        _dedup=()
+        for _t in "${CL_SKIP_INPUT[@]}"; do
+            [[ -z "$_t" ]] && continue
+            if [[ -z "${_seen_assoc[$_t]:-}" ]]; then
+                _seen_assoc[$_t]=1
+                _dedup+=("$_t")
+            fi
+        done
+        CL_SKIP_INPUT=("${_dedup[@]}")
+        unset _seen_assoc _dedup
+    fi
+
+    if [[ ${#CL_SKIP_INPUT[@]} -gt 0 ]]; then
+        sre_info "Skip-table input (${#CL_SKIP_INPUT[@]}): ${CL_SKIP_INPUT[*]}"
+        sre_info "Skip mode: $CL_SKIP_MODE"
+    fi
+
     case "$src_db_engine" in
         mariadb|mysql)
             mysql_cmd="mysql"
@@ -1191,6 +1313,56 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
             if [[ -n "$db_root_pass" ]]; then
                 mysql_cmd="mysql -u root -p${db_root_pass}"
                 mysqldump_cmd="mysqldump -u root -p${db_root_pass}"
+            fi
+
+            # Validate user-supplied tables against the source DB; warn (don't
+            # fail) on unknowns — user may have typoed, but mysqldump --ignore-table
+            # on a missing name is harmless.
+            if [[ ${#CL_SKIP_INPUT[@]} -gt 0 ]]; then
+                _src_tables=$($mysql_cmd -N -B -e \
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema='${src_db_name}' AND table_type='BASE TABLE';" 2>/dev/null)
+                if [[ -n "$_src_tables" ]]; then
+                    _missing=()
+                    for _t in "${CL_SKIP_INPUT[@]}"; do
+                        if ! grep -qx -- "$_t" <<<"$_src_tables"; then
+                            _missing+=("$_t")
+                        fi
+                    done
+                    if [[ ${#_missing[@]} -gt 0 ]]; then
+                        sre_warning "These skip-table entries don't exist in ${src_db_name}: ${_missing[*]}"
+                        sre_warning "(They'll be passed to mysqldump anyway; will be no-ops.)"
+                    fi
+                fi
+            fi
+
+            # Per-table mode resolution
+            for _t in "${CL_SKIP_INPUT[@]}"; do
+                case "$CL_SKIP_MODE" in
+                    schema-only)   CL_SKIP_SCHEMA_ONLY+=("$_t") ;;
+                    skip-entirely) CL_SKIP_FULL+=("$_t") ;;
+                    ask)
+                        _decision=$(prompt_choice "Skip table '$_t' — how?" \
+                            "schema-only (keep CREATE TABLE, drop rows)" \
+                            "skip-entirely (no CREATE, no rows)" \
+                            "include (don't skip)")
+                        case "$_decision" in
+                            schema-only*)   CL_SKIP_SCHEMA_ONLY+=("$_t") ;;
+                            skip-entirely*) CL_SKIP_FULL+=("$_t") ;;
+                            include*)       sre_info "  including '$_t' (no skip)" ;;
+                        esac
+                        ;;
+                esac
+            done
+
+            # Persist for resume
+            progress_set "CL_SKIP_SCHEMA_ONLY_STR" "${CL_SKIP_SCHEMA_ONLY[*]:-}"
+            progress_set "CL_SKIP_FULL_STR"        "${CL_SKIP_FULL[*]:-}"
+
+            if [[ ${#CL_SKIP_SCHEMA_ONLY[@]} -gt 0 ]]; then
+                sre_info "Will dump schema only (no rows) for: ${CL_SKIP_SCHEMA_ONLY[*]}"
+            fi
+            if [[ ${#CL_SKIP_FULL[@]} -gt 0 ]]; then
+                sre_info "Will skip entirely (no CREATE, no rows): ${CL_SKIP_FULL[*]}"
             fi
 
             # On resume, DROP first so we don't get duplicate-key errors from
@@ -1217,22 +1389,42 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
                 sre_info "Source DB size (approx): $(numfmt --to=iec --suffix=B $src_db_bytes 2>/dev/null || echo "${src_db_bytes}B")"
             fi
 
+            # Build dump arg vector. --ignore-table applies to BOTH skip lists
+            # during the main dump (no rows, no CREATE). For schema-only tables
+            # we then run a SECOND dump with --no-data so the CREATE TABLEs are
+            # restored but rows stay out.
+            _dump_base=( --single-transaction --quick --routines --triggers )
+            _dump_ignore=()
+            for _t in "${CL_SKIP_SCHEMA_ONLY[@]}" "${CL_SKIP_FULL[@]}"; do
+                _dump_ignore+=( "--ignore-table=${src_db_name}.${_t}" )
+            done
+
             # Dump source → import target. If pv is installed, pipe through
             # it for a live progress meter. Use PIPESTATUS to detect failures
             # in either side of the pipe (set -o pipefail is on from lib.sh).
             sre_info "Dumping ${src_db_name} → importing into ${tgt_db_name}..."
             if command -v pv &>/dev/null; then
                 if [[ "$src_db_bytes" -gt 0 ]]; then
-                    $mysqldump_cmd --single-transaction --quick --routines --triggers \
+                    $mysqldump_cmd "${_dump_base[@]}" "${_dump_ignore[@]}" \
                         "$src_db_name" | pv -s "$src_db_bytes" -N "DB stream" | $mysql_cmd "$tgt_db_name"
                 else
-                    $mysqldump_cmd --single-transaction --quick --routines --triggers \
+                    $mysqldump_cmd "${_dump_base[@]}" "${_dump_ignore[@]}" \
                         "$src_db_name" | pv -N "DB stream" | $mysql_cmd "$tgt_db_name"
                 fi
             else
-                $mysqldump_cmd --single-transaction --quick --routines --triggers \
+                $mysqldump_cmd "${_dump_base[@]}" "${_dump_ignore[@]}" \
                     "$src_db_name" | $mysql_cmd "$tgt_db_name"
             fi
+
+            # Second pass: re-add CREATE TABLE for the schema-only set (no rows)
+            if [[ ${#CL_SKIP_SCHEMA_ONLY[@]} -gt 0 ]]; then
+                sre_info "Adding empty schema for: ${CL_SKIP_SCHEMA_ONLY[*]}"
+                $mysqldump_cmd --no-data --skip-triggers --skip-add-drop-table \
+                    "$src_db_name" "${CL_SKIP_SCHEMA_ONLY[@]}" | $mysql_cmd "$tgt_db_name" \
+                    && sre_success "Schemas re-imported (empty)" \
+                    || sre_warning "Schema re-import had issues — some tables may be missing"
+            fi
+
             sre_success "Database copied"
             ;;
 
@@ -1253,11 +1445,39 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
             sudo -u postgres createdb -O "$tgt_db_user" "$tgt_db_name"
             sre_success "Target role/db created: ${tgt_db_name} / ${tgt_db_user}"
 
+            # Resolve table-skip plan for PostgreSQL
+            for _t in "${CL_SKIP_INPUT[@]}"; do
+                case "$CL_SKIP_MODE" in
+                    schema-only)   CL_SKIP_SCHEMA_ONLY+=("$_t") ;;
+                    skip-entirely) CL_SKIP_FULL+=("$_t") ;;
+                    ask)
+                        _decision=$(prompt_choice "Skip table '$_t' — how?" \
+                            "schema-only (keep CREATE TABLE, drop rows)" \
+                            "skip-entirely (no CREATE, no rows)" \
+                            "include (don't skip)")
+                        case "$_decision" in
+                            schema-only*)   CL_SKIP_SCHEMA_ONLY+=("$_t") ;;
+                            skip-entirely*) CL_SKIP_FULL+=("$_t") ;;
+                        esac
+                        ;;
+                esac
+            done
+            progress_set "CL_SKIP_SCHEMA_ONLY_STR" "${CL_SKIP_SCHEMA_ONLY[*]:-}"
+            progress_set "CL_SKIP_FULL_STR"        "${CL_SKIP_FULL[*]:-}"
+
+            _pg_dump_extra=()
+            for _t in "${CL_SKIP_SCHEMA_ONLY[@]}"; do
+                _pg_dump_extra+=( "--exclude-table-data=${_t}" )
+            done
+            for _t in "${CL_SKIP_FULL[@]}"; do
+                _pg_dump_extra+=( "--exclude-table=${_t}" )
+            done
+
             sre_info "Dumping ${src_db_name} → importing into ${tgt_db_name}..."
             if command -v pv &>/dev/null; then
-                sudo -u postgres pg_dump "$src_db_name" | pv -N "DB stream" | sudo -u postgres psql "$tgt_db_name" >/dev/null
+                sudo -u postgres pg_dump "${_pg_dump_extra[@]}" "$src_db_name" | pv -N "DB stream" | sudo -u postgres psql "$tgt_db_name" >/dev/null
             else
-                sudo -u postgres pg_dump "$src_db_name" | sudo -u postgres psql "$tgt_db_name" >/dev/null
+                sudo -u postgres pg_dump "${_pg_dump_extra[@]}" "$src_db_name" | sudo -u postgres psql "$tgt_db_name" >/dev/null
             fi
             sre_success "Database copied"
             ;;
@@ -1658,6 +1878,8 @@ clone_state="/etc/sre-helpers/clones/${CL_TARGET_DOMAIN}.conf"
     printf 'CL_TGT_DB_PASS=%q\n'    "${tgt_db_pass:-}"
     printf 'CL_TGT_PORT=%q\n'       "${CL_TGT_PORT:-}"
     printf 'CL_TGT_MOODLEDATA=%q\n' "${CL_TGT_MOODLEDATA:-}"
+    printf 'CL_SKIP_SCHEMA_ONLY=%q\n' "${CL_SKIP_SCHEMA_ONLY[*]:-}"
+    printf 'CL_SKIP_FULL=%q\n'        "${CL_SKIP_FULL[*]:-}"
 } > "$clone_state"
 chmod 600 "$clone_state"
 sre_info "Clone state: $clone_state"
@@ -1837,6 +2059,12 @@ if [[ "$do_db" == "true" ]]; then
     sre_info "  Target DB:     $tgt_db_name"
     sre_info "  Target DB user:$tgt_db_user"
     sre_info "  Target DB pass:$tgt_db_pass"
+    if [[ ${#CL_SKIP_SCHEMA_ONLY[@]:-0} -gt 0 ]]; then
+        sre_info "  Skipped (schema only):  ${CL_SKIP_SCHEMA_ONLY[*]}"
+    fi
+    if [[ ${#CL_SKIP_FULL[@]:-0} -gt 0 ]]; then
+        sre_info "  Skipped (entirely):     ${CL_SKIP_FULL[*]}"
+    fi
 fi
 [[ "$src_type" == "nuxt" ]] && sre_info "  Nuxt port:     ${CL_TGT_PORT:-?}"
 echo ""
