@@ -428,12 +428,62 @@ src_proj_base="/var/www/${CL_SOURCE_DOMAIN}"
 
 # Detect type: try config files first, then vhost markers
 src_type=""
+src_moodle_config=""   # populated if we find Moodle's config.php (may not be in doc_root)
+
+# Run config.php detection as root via sudo because some installs lock the
+# file to 640 owned by www-data, and a bare grep would silently miss it.
+_grep_root() {
+    if [[ $EUID -eq 0 ]]; then
+        grep -q "$@"
+    else
+        sudo -n grep -q "$@" 2>/dev/null
+    fi
+}
+
+# Hunt for a Moodle config.php anywhere reasonable. Order:
+#   1. doc_root/config.php
+#   2. doc_root/../config.php             (some installs put doc root one below)
+#   3. project base + first 3 levels      (find -maxdepth 3)
+# A real Moodle config.php has $CFG->dbtype.
+_find_moodle_config() {
+    local candidates=(
+        "${src_doc_root}/config.php"
+        "${src_doc_root%/}/../config.php"
+        "${src_proj_base}/config.php"
+        "${src_proj_base}/public_html/config.php"
+        "${src_proj_base}/current/config.php"
+        "${src_proj_base}/html/config.php"
+        "${src_proj_base}/www/config.php"
+    )
+    for c in "${candidates[@]}"; do
+        if [[ -f "$c" ]] && _grep_root '\$CFG->dbtype' "$c"; then
+            readlink -f "$c"
+            return 0
+        fi
+    done
+
+    # Broader fall-back: scan up to depth 3 for any config.php that has $CFG->dbtype
+    local found
+    found=$(find "$src_proj_base" -maxdepth 3 -type f -name config.php 2>/dev/null \
+        | while IFS= read -r f; do
+              _grep_root '\$CFG->dbtype' "$f" && echo "$f" && break
+          done | head -1)
+    [[ -n "$found" ]] && { readlink -f "$found"; return 0; }
+    return 1
+}
+
 # laravel: doc_root ends in /current/public → release layout
 if [[ -f "${src_proj_base}/current/artisan" ]]; then
     src_type="laravel"
 elif [[ -f "${src_doc_root}/wp-config.php" ]]; then
     src_type="wordpress"
-elif [[ -f "${src_doc_root}/config.php" ]] && grep -q '\$CFG->dbtype' "${src_doc_root}/config.php" 2>/dev/null; then
+elif src_moodle_config=$(_find_moodle_config); then
+    src_type="moodle"
+    sre_info "Found Moodle config.php: $src_moodle_config"
+elif [[ -d "${src_proj_base}/moodledata" ]] || [[ -d "/u02/appdata/${CL_SOURCE_DOMAIN}/moodledata" ]]; then
+    # Couldn't read config.php but moodledata directory exists → still Moodle.
+    sre_warning "moodledata/ found but config.php couldn't be read — treating as Moodle anyway."
+    sre_warning "If permissions are tight on config.php (640 root or www-data), run this script as root."
     src_type="moodle"
 elif grep -q 'proxy_pass.*127\.0\.0\.1' "$src_vhost" 2>/dev/null; then
     src_type="nuxt"
@@ -443,9 +493,53 @@ else
     src_type="static"
 fi
 
+# For Moodle, override the moodle-config path used later in the rewrite step
+# so we don't assume it sits at <doc_root>/config.php.
+if [[ "$src_type" == "moodle" && -n "$src_moodle_config" ]]; then
+    src_moodle_config_dir=$(dirname "$src_moodle_config")
+fi
+
 sre_info "Detected type: $src_type"
 sre_info "Source root:   $src_proj_base"
 sre_info "Source doc:    $src_doc_root"
+
+# Sanity check: if we ended up with "static" but the project base has lots of
+# PHP / dynamic content, something is off — warn loudly so the user doesn't
+# silently end up cloning nothing useful.
+if [[ "$src_type" == "static" ]]; then
+    php_count=$(find "$src_proj_base" -maxdepth 3 -type f -name '*.php' 2>/dev/null | head -5 | wc -l)
+    if [[ "$php_count" -gt 0 ]]; then
+        sre_warning "Type detected as 'static' but found PHP files under $src_proj_base."
+        sre_warning "If this is actually Laravel/Moodle/WordPress, the layout doesn't match what"
+        sre_warning "the detector expects. Likely causes:"
+        sre_warning "  - config.php / wp-config.php is not at the doc root"
+        sre_warning "  - file permissions block detection (run as root)"
+        sre_warning "  - artisan / wp-config.php / Moodle config.php is named/located unusually"
+        sre_warning ""
+        sre_warning "Doc root:  $src_doc_root"
+        sre_warning "Files at doc root:"
+        ls -la "$src_doc_root" 2>/dev/null | head -10 | sed 's/^/    /'
+
+        forced=$(prompt_choice "Force a specific type?" "laravel" "moodle" "wordpress" "keep static")
+        case "$forced" in
+            laravel|moodle|wordpress)
+                src_type="$forced"
+                sre_info "Forced type: $src_type"
+                # Re-run Moodle config probe so downstream uses the right path
+                if [[ "$src_type" == "moodle" ]]; then
+                    src_moodle_config=$(_find_moodle_config) || src_moodle_config=""
+                    if [[ -n "$src_moodle_config" ]]; then
+                        src_moodle_config_dir=$(dirname "$src_moodle_config")
+                        sre_info "Found Moodle config.php after force: $src_moodle_config"
+                    else
+                        sre_warning "Couldn't locate config.php — DB creds will be prompted."
+                    fi
+                fi
+                ;;
+            *) ;;
+        esac
+    fi
+fi
 
 ################################################################################
 # Mode
@@ -508,15 +602,33 @@ if [[ -d "$tgt_proj_base" || -f "$tgt_vhost" ]]; then
     fi
 fi
 
-# Mirror source paths into target
+# Mirror source paths into target. For Moodle the source layout can vary
+# (public_html, no subdir, current/, etc) — mirror what the source actually
+# uses so target file paths line up with the rsync result.
 case "$src_type" in
     laravel)   tgt_doc_root="${tgt_proj_base}/current/public" ;;
-    moodle)    tgt_doc_root="${tgt_proj_base}/public_html" ;;
+    moodle)
+        if [[ "$src_doc_root" == "${src_proj_base}/"* ]]; then
+            tgt_doc_root="${tgt_proj_base}/${src_doc_root#${src_proj_base}/}"
+        else
+            tgt_doc_root="${tgt_proj_base}/public_html"
+        fi
+        ;;
     wordpress) tgt_doc_root="${tgt_proj_base}/current" ;;
     nuxt)      tgt_doc_root="${tgt_proj_base}/current" ;;
     vue)       tgt_doc_root="${tgt_proj_base}/current/dist" ;;
     static)    tgt_doc_root="${tgt_proj_base}/current" ;;
 esac
+
+# Compute the target Moodle config.php path mirroring source layout
+tgt_moodle_config=""
+if [[ "$src_type" == "moodle" && -n "$src_moodle_config" ]]; then
+    if [[ "$src_moodle_config" == "${src_proj_base}/"* ]]; then
+        tgt_moodle_config="${tgt_proj_base}/${src_moodle_config#${src_proj_base}/}"
+    else
+        tgt_moodle_config="${tgt_doc_root}/config.php"
+    fi
+fi
 
 sre_info "Target root:   $tgt_proj_base"
 sre_info "Target doc:    $tgt_doc_root"
@@ -561,7 +673,9 @@ if [[ "$do_db" == "true" ]]; then
             fi
             ;;
         moodle)
-            mcf="${src_doc_root}/config.php"
+            # Use the config.php path discovered during type-detection if we
+            # have it; fall back to doc_root.
+            mcf="${src_moodle_config:-${src_doc_root}/config.php}"
             if [[ -f "$mcf" ]]; then
                 src_db_name=$(grep -oP "\\\$CFG->dbname\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" | head -1)
                 src_db_user=$(grep -oP "\\\$CFG->dbuser\s*=\s*['\"]?\K[^'\";\s]+" "$mcf" | head -1)
@@ -574,6 +688,8 @@ if [[ "$do_db" == "true" ]]; then
                     pgsql)                src_db_engine="postgresql" ;;
                     *)                    src_db_engine="mariadb" ;;
                 esac
+            else
+                sre_warning "Moodle config.php not found at $mcf — DB creds will be prompted."
             fi
             ;;
     esac
@@ -681,9 +797,13 @@ if [[ "$do_files" == "true" ]]; then
             sre_info "Copying ${src_proj_base}/ → ${tgt_proj_base}/ (excluding moodledata)"
             # Don't copy moodledata directly — find its actual location from config
             mdldata=""
-            if [[ -f "${src_doc_root}/config.php" ]]; then
-                mdldata=$(grep -oP "\\\$CFG->dataroot\s*=\s*['\"]?\K[^'\";\s]+" "${src_doc_root}/config.php" | head -1)
+            mcf_for_dataroot="${src_moodle_config:-${src_doc_root}/config.php}"
+            if [[ -f "$mcf_for_dataroot" ]]; then
+                mdldata=$(grep -oP "\\\$CFG->dataroot\s*=\s*['\"]?\K[^'\";\s]+" "$mcf_for_dataroot" | head -1)
             fi
+            # Fall back to well-known locations if config.php was unreadable
+            [[ -z "$mdldata" && -d "${src_proj_base}/moodledata" ]] && mdldata="${src_proj_base}/moodledata"
+            [[ -z "$mdldata" && -d "/u02/appdata/${CL_SOURCE_DOMAIN}/moodledata" ]] && mdldata="/u02/appdata/${CL_SOURCE_DOMAIN}/moodledata"
             rsync_excludes=()
             if [[ -n "$mdldata" && "$mdldata" == "${src_proj_base}/"* ]]; then
                 rel_mdldata="${mdldata#${src_proj_base}/}"
@@ -906,7 +1026,9 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
             ;;
 
         moodle)
-            tgt_mcf="${tgt_proj_base}/public_html/config.php"
+            # Use the mirrored target config path computed earlier; fall back
+            # to the legacy public_html/ location if unknown.
+            tgt_mcf="${tgt_moodle_config:-${tgt_proj_base}/public_html/config.php}"
             if [[ -f "$tgt_mcf" ]]; then
                 cp "$tgt_mcf" "${tgt_mcf}.preclone.bak"
                 if [[ "$do_db" == "true" ]]; then
@@ -968,9 +1090,11 @@ if [[ "$do_files" == "true" || "$do_db" == "true" ]]; then
 
                 # Hard purge via Moodle's own CLI — clears localcache + DB caches.
                 # Skips silently if the CLI doesn't load (e.g. DB not reachable yet).
-                if command -v php &>/dev/null && [[ -f "${tgt_proj_base}/public_html/admin/cli/purge_caches.php" ]]; then
+                # Walk up from config.php to find the Moodle root (admin/ should sit beside config.php).
+                moodle_root=$(dirname "$tgt_mcf")
+                if command -v php &>/dev/null && [[ -f "${moodle_root}/admin/cli/purge_caches.php" ]]; then
                     sre_info "Purging Moodle caches via admin/cli/purge_caches.php..."
-                    ( cd "${tgt_proj_base}/public_html" && \
+                    ( cd "$moodle_root" && \
                       sudo -u www-data php admin/cli/purge_caches.php 2>&1 | tail -5 ) \
                         && sre_success "Moodle caches purged" \
                         || sre_warning "Moodle cache purge had warnings — run manually after install"
@@ -1068,7 +1192,10 @@ case "$src_type" in
         [[ -f "${tgt_proj_base}/current/artisan" ]] && chmod 755 "${tgt_proj_base}/current/artisan"
         ;;
     moodle)
-        [[ -f "${tgt_proj_base}/public_html/config.php" ]] && chmod 640 "${tgt_proj_base}/public_html/config.php"
+        # Lock down target Moodle config.php (mirrored path; falls back to public_html)
+        for _mcf_path in "${tgt_moodle_config:-}" "${tgt_proj_base}/public_html/config.php" "${tgt_doc_root}/config.php"; do
+            [[ -n "$_mcf_path" && -f "$_mcf_path" ]] && chmod 640 "$_mcf_path" && break
+        done
         if [[ -n "${CL_TGT_MOODLEDATA:-}" && -d "$CL_TGT_MOODLEDATA" ]]; then
             chown -R www-data:www-data "$CL_TGT_MOODLEDATA"
             chmod -R 2770 "$CL_TGT_MOODLEDATA"
