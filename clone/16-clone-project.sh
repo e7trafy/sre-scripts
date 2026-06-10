@@ -99,6 +99,10 @@ Protection (default: ON for --stage, OFF for --live):
 
   --dry-run             Print planned actions only
   --yes                 Accept defaults without prompting
+  --force               Allow overwriting an existing target non-interactively
+                        (required with --yes when /var/www/<target> or its
+                        vhost already exist; default-no prompt would otherwise
+                        silently exit)
   --help                Show this help
 
 Examples:
@@ -140,6 +144,7 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --protect-user)   _i=$((_i + 1)); CL_PROTECT_USER="${_raw_args[$_i]:-}" ;;
         --protect-pass)   _i=$((_i + 1)); CL_PROTECT_PASS="${_raw_args[$_i]:-}" ;;
         --allow-ip)       _i=$((_i + 1)); CL_ALLOW_IPS+=("${_raw_args[$_i]:-}") ;;
+        --force|-f)       SRE_FORCE="true" ;;
     esac
     _i=$((_i + 1))
 done
@@ -593,11 +598,47 @@ fi
 tgt_vhost="${vhost_dir}/${CL_TARGET_DOMAIN}.conf"
 tgt_proj_base="/var/www/${CL_TARGET_DOMAIN}"
 
-# Refuse to overwrite an existing target unless user confirms
+# Refuse to overwrite an existing target unless user confirms.
+#
+# Important: under --yes / SRE_YES, prompt_yesno returns the DEFAULT. Because
+# overwrite is destructive its default is "no", so a non-interactive re-run
+# previously exited silently here AFTER the "Detected type" line — leaving
+# any stale vhost from a prior failed/broken clone in place. To proceed
+# non-interactively, pass --force.
 if [[ -d "$tgt_proj_base" || -f "$tgt_vhost" ]]; then
     sre_warning "Target already exists: $tgt_proj_base (or vhost $tgt_vhost)"
-    if ! prompt_yesno "Overwrite the existing target? (DESTRUCTIVE)" "no"; then
-        sre_skipped "Clone cancelled — target exists."
+
+    # If a stale vhost is here from a previous (wrong-type) clone, surface it
+    # — it's the most common cause of the "detected as moodle but served as
+    # static" report.
+    if [[ -f "$tgt_vhost" ]]; then
+        stale_type=""
+        if grep -q 'fastcgi_pass' "$tgt_vhost" 2>/dev/null; then
+            if grep -q 'moodledata\|pluginfile' "$tgt_vhost" 2>/dev/null; then
+                stale_type="moodle"
+            elif grep -q 'wp-config\|wp-content' "$tgt_vhost" 2>/dev/null; then
+                stale_type="wordpress"
+            else
+                stale_type="laravel"
+            fi
+        elif grep -q 'proxy_pass.*127\.0\.0\.1' "$tgt_vhost" 2>/dev/null; then
+            stale_type="nuxt"
+        elif grep -q 'try_files.*index\.html' "$tgt_vhost" 2>/dev/null; then
+            stale_type="vue"
+        else
+            stale_type="static"
+        fi
+        if [[ -n "$stale_type" && "$stale_type" != "$src_type" ]]; then
+            sre_warning "Existing vhost looks like type '$stale_type' but source is '$src_type'."
+            sre_warning "This is probably a stale vhost from an earlier broken clone."
+            sre_warning "The new clone will regenerate it as a proper $src_type vhost."
+        fi
+    fi
+
+    if [[ "$SRE_FORCE" == "true" ]]; then
+        sre_warning "--force set: proceeding with destructive overwrite."
+    elif ! prompt_yesno "Overwrite the existing target? (DESTRUCTIVE)" "no"; then
+        sre_skipped "Clone cancelled — target exists. Pass --force to overwrite non-interactively."
         exit 4
     fi
 fi
@@ -1133,8 +1174,57 @@ else
     vhost_args+=( --root "$tgt_doc_root" )
 fi
 
+sre_info "Calling step 8 with: --type $src_type --domain $CL_TARGET_DOMAIN --root $tgt_doc_root"
+sre_info "Expected template: ${web_server}-${src_type}.conf"
+
+# If a stale vhost from a wrong-type clone is in place, remove it FIRST so
+# step 8 doesn't preserve any non-template directives via the overwrite path.
+if [[ -f "$tgt_vhost" ]]; then
+    cur_type=""
+    if grep -q 'fastcgi_pass' "$tgt_vhost" 2>/dev/null; then
+        if grep -q 'moodledata\|pluginfile' "$tgt_vhost" 2>/dev/null; then
+            cur_type="moodle"
+        elif grep -q 'wp-config\|wp-content' "$tgt_vhost" 2>/dev/null; then
+            cur_type="wordpress"
+        else
+            cur_type="laravel"
+        fi
+    elif grep -q 'proxy_pass.*127\.0\.0\.1' "$tgt_vhost" 2>/dev/null; then
+        cur_type="nuxt"
+    elif grep -q 'try_files.*index\.html' "$tgt_vhost" 2>/dev/null; then
+        cur_type="vue"
+    else
+        cur_type="static"
+    fi
+    if [[ "$cur_type" != "$src_type" ]]; then
+        sre_warning "Removing stale '$cur_type' vhost before generating fresh '$src_type' vhost: $tgt_vhost"
+        # backup_config saves a timestamped .bak and removes the symlink in
+        # sites-enabled/. Step 8 will then create both fresh from the template.
+        backup_config "$tgt_vhost"
+        rm -f "$tgt_vhost"
+        # Also drop the sites-enabled symlink (Debian layout)
+        enabled_link="${tgt_vhost/sites-available/sites-enabled}"
+        [[ -L "$enabled_link" ]] && rm -f "$enabled_link"
+    fi
+fi
+
 bash "${SRE_SCRIPTS_DIR}/vhost/08-vhost.sh" "${vhost_args[@]}" \
     || { sre_error "Vhost creation failed"; exit 1; }
+
+# Verify the resulting vhost actually has the expected type's markers
+if [[ -f "$tgt_vhost" ]]; then
+    case "$src_type" in
+        moodle|laravel|wordpress|phpmyadmin)
+            if ! grep -q 'fastcgi_pass' "$tgt_vhost" 2>/dev/null; then
+                sre_error "Generated vhost is missing fastcgi_pass — it doesn't look like a $src_type vhost!"
+                sre_error "Check: $tgt_vhost"
+                sre_error "Template that should have been used: ${SRE_SCRIPTS_DIR}/vhost/templates/${web_server}-${src_type}.conf"
+                exit 1
+            fi
+            ;;
+    esac
+    sre_success "Vhost written: $tgt_vhost (type=$src_type)"
+fi
 
 ################################################################################
 # Type-specific finishing touches
