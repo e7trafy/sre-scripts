@@ -1211,7 +1211,20 @@ if [[ "$do_db" == "true" ]]; then
         src_db_name=$(prompt_input "Source DB name" "")
         src_db_user=$(prompt_input "Source DB user" "")
         src_db_pass=$(prompt_input "Source DB password" "")
-        [[ -z "$src_db_engine" ]] && src_db_engine=$(prompt_choice "Source DB engine:" "mariadb" "mysql" "postgresql")
+    fi
+
+    # Engine fallback runs INDEPENDENTLY of the name guard above. The detection
+    # branches above may populate src_db_name from .env / config.php but leave
+    # src_db_engine empty (e.g. Laravel with DB_CONNECTION=sqlite, or src_type
+    # of static/nuxt/vue/unknown that has no detection branch). Without this
+    # the script would later hit the "Unsupported source DB engine:" trap.
+    if [[ -z "$src_db_engine" ]]; then
+        if [[ "$SRE_YES" == "true" ]]; then
+            sre_warning "Source DB engine could not be detected; defaulting to mariadb (--yes mode)."
+            src_db_engine="mariadb"
+        else
+            src_db_engine=$(prompt_choice "Source DB engine:" "mariadb" "mysql" "postgresql")
+        fi
     fi
 
     sre_info "Source DB:     ${src_db_name} (${src_db_engine})"
@@ -1912,8 +1925,14 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
             sre_success "Database copied"
             ;;
 
+        "")
+            sre_error "Source DB engine is empty — auto-detection failed and no fallback fired."
+            sre_error "This is a bug: report the source project type ($src_type) and how the script was invoked."
+            sre_error "Workaround: re-run with --resume after exporting CL_SOURCE_DB_ENGINE=mariadb (or postgresql)."
+            exit 1
+            ;;
         *)
-            sre_error "Unsupported source DB engine: $src_db_engine"
+            sre_error "Unsupported source DB engine: '$src_db_engine' (expected: mariadb, mysql, postgresql)"
             exit 1
             ;;
     esac
