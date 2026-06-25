@@ -41,8 +41,18 @@ chmod +x common/lib.sh server/*.sh stack/*.sh tuning/*.sh vhost/*.sh migrate/*.s
 | 9 | `server/09-ssh-keys.sh` | Generate / import / copy SSH keys | Optional |
 | 10 | `migrate/10-migrate-cpanel.sh` | Migrate files + DB from a cPanel/WHM server | Optional |
 | 11 | `ssl/11-ssl.sh` | Obtain Let's Encrypt SSL certificate | Per project |
+| 12 | `fixes/12-fixes.sh` | Quick fixes (Arabic locale/IM7, PHP/Nginx limits, supervisor) | Optional |
+| 13 | `deploy/13-new-project.sh` | Deploy a new project from git | Optional |
+| 14 | `migrate/14-backup-only.sh` | Capture a backup from a cPanel server (no restore) | Optional |
+| 15 | `migrate/15-migrate-cpanel-bulk.sh` | Bulk-migrate many accounts from cPanel/WHM | Optional |
+| 16 | `clone/16-clone-project.sh` | Clone a provisioned project (stage or live copy) | Optional |
+| 17 | `stack/17-phpmyadmin.sh` | Install phpMyAdmin (optional, protection-on-by-default) | Optional |
+| 18 | `ssl/18-custom-ssl.sh` | Install a custom wildcard / single SSL cert across vhosts | Optional |
+| 19 | `vhost/19-mount-subpath.sh` | Mount a project as a subpath under another (e.g. `host.tld/lms`) — [docs](docs/step-19-mount-subpath.md) | Optional |
 
 Each script prints a full step map at the end showing your progress and the recommended next step.
+
+Optional steps (12–19) are runbooks for specific operations — see [`docs/`](docs/) for detailed usage of the more involved ones.
 
 ---
 
