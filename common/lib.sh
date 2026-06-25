@@ -569,6 +569,7 @@ declare -A STEP_REGISTRY=(
     [16]="clone/16-clone-project.sh"
     [17]="stack/17-phpmyadmin.sh"
     [18]="ssl/18-custom-ssl.sh"
+    [19]="vhost/19-mount-subpath.sh"
 )
 
 declare -A STEP_NAMES=(
@@ -591,6 +592,7 @@ declare -A STEP_NAMES=(
     [16]="Clone Project (Stage or Live Copy)"
     [17]="phpMyAdmin (Optional)"
     [18]="Install Custom SSL (Wildcard / Single)"
+    [19]="Mount Project as Subpath"
 )
 
 _is_step_skipped() {
@@ -598,14 +600,14 @@ _is_step_skipped() {
     case "$step" in
         5) local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" || -z "$e" ]] && return 0 ;;
         6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
-        0|9|10|13|14|15|16|17|18) return 0 ;; # all optional / on-demand steps
+        0|9|10|13|14|15|16|17|18|19) return 0 ;; # all optional / on-demand steps
     esac
     return 1
 }
 
 _is_step_optional() {
     local step="$1"
-    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" || "$step" == "13" || "$step" == "14" || "$step" == "15" || "$step" == "16" || "$step" == "17" || "$step" == "18" ]] && return 0
+    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" || "$step" == "13" || "$step" == "14" || "$step" == "15" || "$step" == "16" || "$step" == "17" || "$step" == "18" || "$step" == "19" ]] && return 0
     return 1
 }
 

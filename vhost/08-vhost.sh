@@ -253,6 +253,14 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
 
     sre_success "FACL permissions configured on $project_base"
 
+    # Create subpath snippets directory (referenced by `include` in nginx templates).
+    # An empty directory makes the include a no-op; nginx errors if the dir is missing.
+    if [[ "$web_server" == "nginx" ]]; then
+        subpath_dir="/etc/nginx/snippets/${VHOST_DOMAIN}-subpaths"
+        mkdir -p "$subpath_dir"
+        chmod 755 "$subpath_dir"
+    fi
+
     echo "$vhost_content" > "$vhost_dest"
     sre_success "Written vhost config: $vhost_dest"
 
