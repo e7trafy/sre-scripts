@@ -2581,10 +2581,13 @@ if [[ "$do_db" == "true" ]]; then
     sre_info "  Target DB:     $tgt_db_name"
     sre_info "  Target DB user:$tgt_db_user"
     sre_info "  Target DB pass:$tgt_db_pass"
-    if [[ ${#CL_SKIP_SCHEMA_ONLY[@]:-0} -gt 0 ]]; then
+    # `${#array[@]:-0}` is NOT valid bash syntax — the :- default operator
+    # only works on scalar expansions. Use ${array[@]+1} to test if the
+    # array exists, then read the length normally.
+    if [[ -n "${CL_SKIP_SCHEMA_ONLY[*]+1}" && ${#CL_SKIP_SCHEMA_ONLY[@]} -gt 0 ]]; then
         sre_info "  Skipped (schema only):  ${CL_SKIP_SCHEMA_ONLY[*]}"
     fi
-    if [[ ${#CL_SKIP_FULL[@]:-0} -gt 0 ]]; then
+    if [[ -n "${CL_SKIP_FULL[*]+1}" && ${#CL_SKIP_FULL[@]} -gt 0 ]]; then
         sre_info "  Skipped (entirely):     ${CL_SKIP_FULL[*]}"
     fi
 fi
