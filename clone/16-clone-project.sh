@@ -1162,10 +1162,26 @@ if [[ "$do_db" == "true" ]]; then
             if [[ -f "$envf" ]]; then
                 # `|| true` on every grep so a missing key returns empty
                 # instead of tripping pipefail+set-e.
-                src_db_name=$( { grep -m1 '^DB_DATABASE=' "$envf" || true; } | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
-                src_db_user=$( { grep -m1 '^DB_USERNAME=' "$envf" || true; } | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
-                src_db_pass=$( { grep -m1 '^DB_PASSWORD=' "$envf" || true; } | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' | tr -d "'")
-                conn=$( { grep -m1 '^DB_CONNECTION=' "$envf" || true; } | cut -d= -f2- | tr -d '"' | tr -d "'")
+                # Strip surrounding quotes (matched pair) AND any stray quote
+                # chars left over from malformed .env files. Also strip an
+                # inline `# comment` and trailing whitespace/CR (from CRLF
+                # endings on files edited on Windows). A stray quote in a DB
+                # name causes mysql to fail with the unhelpful
+                # "Incorrect database name 'foo\"'" error mid-pipe.
+                _env_clean() {
+                    sed -E '
+                        s/[[:space:]]+#.*$//;       # strip inline comments
+                        s/^"(.*)"[[:space:]]*$/\1/; # strip matched double-quote pair
+                        s/^'\''(.*)'\''[[:space:]]*$/\1/; # strip matched single-quote pair
+                        s/[\"'\''[:space:]]+$//;    # strip trailing stray quotes/whitespace
+                        s/^[\"'\''[:space:]]+//;    # strip leading stray quotes/whitespace
+                        s/\r$//                     # strip CR from CRLF files
+                    '
+                }
+                src_db_name=$( { grep -m1 '^DB_DATABASE=' "$envf" || true; } | cut -d= -f2- | _env_clean)
+                src_db_user=$( { grep -m1 '^DB_USERNAME=' "$envf" || true; } | cut -d= -f2- | _env_clean)
+                src_db_pass=$( { grep -m1 '^DB_PASSWORD=' "$envf" || true; } | cut -d= -f2- | _env_clean)
+                conn=$( { grep -m1 '^DB_CONNECTION=' "$envf" || true; } | cut -d= -f2- | _env_clean)
                 case "$conn" in
                     mysql|mariadb) src_db_engine="mariadb" ;;
                     pgsql|postgres|postgresql) src_db_engine="postgresql" ;;
@@ -1842,22 +1858,69 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
                 _dump_ignore+=( "--ignore-table=${src_db_name}.${_t}" )
             done
 
+            # Preflight: verify source DB actually exists. Catches the common
+            # failure mode where .env was edited badly and src_db_name has
+            # stray quotes / wrong case — would otherwise fail mid-pipe with
+            # an unreadable jumbled error.
+            if ! $mysql_cmd -N -B -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name='${src_db_name}' LIMIT 1;" 2>/dev/null | grep -q .; then
+                sre_error "Source DB '${src_db_name}' does not exist (or root can't see it)."
+                sre_error "Check the source project's config — DB name may have stray quotes."
+                sre_error "Available DBs:"
+                $mysql_cmd -N -B -e "SHOW DATABASES;" 2>/dev/null | sed 's/^/    /' | head -30
+                exit 1
+            fi
+
             # Dump source → import target. If pv is installed, pipe through
-            # it for a live progress meter. Use PIPESTATUS to detect failures
-            # in either side of the pipe (set -o pipefail is on from lib.sh).
+            # it for a live progress meter. We check PIPESTATUS afterwards
+            # because mysql happily eats malformed input and exits 0, so
+            # set -o pipefail alone doesn't catch a failed mysqldump.
             sre_info "Dumping ${src_db_name} → importing into ${tgt_db_name}..."
+
+            # Stream stderr to a tempfile so we can show it on failure.
+            _dump_err=$(mktemp)
+            _import_err=$(mktemp)
+            # shellcheck disable=SC2064
+            trap "rm -f '$_dump_err' '$_import_err'" RETURN
+
+            set +e
             if command -v pv &>/dev/null; then
                 if [[ "$src_db_bytes" -gt 0 ]]; then
                     $mysqldump_cmd "${_dump_base[@]}" "${_dump_ignore[@]}" \
-                        "$src_db_name" | pv -s "$src_db_bytes" -N "DB stream" | $mysql_cmd "$tgt_db_name"
+                        "$src_db_name" 2>"$_dump_err" \
+                        | pv -s "$src_db_bytes" -N "DB stream" \
+                        | $mysql_cmd "$tgt_db_name" 2>"$_import_err"
                 else
                     $mysqldump_cmd "${_dump_base[@]}" "${_dump_ignore[@]}" \
-                        "$src_db_name" | pv -N "DB stream" | $mysql_cmd "$tgt_db_name"
+                        "$src_db_name" 2>"$_dump_err" \
+                        | pv -N "DB stream" \
+                        | $mysql_cmd "$tgt_db_name" 2>"$_import_err"
                 fi
+                _dump_rc="${PIPESTATUS[0]}"
+                _pv_rc="${PIPESTATUS[1]}"
+                _import_rc="${PIPESTATUS[2]}"
             else
                 $mysqldump_cmd "${_dump_base[@]}" "${_dump_ignore[@]}" \
-                    "$src_db_name" | $mysql_cmd "$tgt_db_name"
+                    "$src_db_name" 2>"$_dump_err" \
+                    | $mysql_cmd "$tgt_db_name" 2>"$_import_err"
+                _dump_rc="${PIPESTATUS[0]}"
+                _pv_rc=0
+                _import_rc="${PIPESTATUS[1]}"
             fi
+            set -e
+
+            if [[ "$_dump_rc" != "0" || "$_import_rc" != "0" || "$_pv_rc" != "0" ]]; then
+                sre_error "Database copy failed (mysqldump=$_dump_rc pv=$_pv_rc mysql=$_import_rc)"
+                if [[ -s "$_dump_err" ]]; then
+                    sre_error "mysqldump stderr:"
+                    sed 's/^/    /' "$_dump_err" | head -20
+                fi
+                if [[ -s "$_import_err" ]]; then
+                    sre_error "mysql import stderr:"
+                    sed 's/^/    /' "$_import_err" | head -20
+                fi
+                exit 1
+            fi
+            rm -f "$_dump_err" "$_import_err"
 
             # Second pass: re-add CREATE TABLE for the schema-only set (no rows)
             if [[ ${#CL_SKIP_SCHEMA_ONLY[@]} -gt 0 ]]; then
