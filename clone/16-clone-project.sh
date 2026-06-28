@@ -1895,16 +1895,22 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
                         | pv -N "DB stream" \
                         | $mysql_cmd "$tgt_db_name" 2>"$_import_err"
                 fi
-                _dump_rc="${PIPESTATUS[0]}"
-                _pv_rc="${PIPESTATUS[1]}"
-                _import_rc="${PIPESTATUS[2]}"
+                # Snapshot PIPESTATUS into a local array in ONE expansion.
+                # Subsequent assignments reset PIPESTATUS, so reading
+                # PIPESTATUS[1] after `_dump_rc="${PIPESTATUS[0]}"` would
+                # be an unbound-array-index under set -u.
+                _ps=( "${PIPESTATUS[@]}" )
+                _dump_rc="${_ps[0]:-0}"
+                _pv_rc="${_ps[1]:-0}"
+                _import_rc="${_ps[2]:-0}"
             else
                 $mysqldump_cmd "${_dump_base[@]}" "${_dump_ignore[@]}" \
                     "$src_db_name" 2>"$_dump_err" \
                     | $mysql_cmd "$tgt_db_name" 2>"$_import_err"
-                _dump_rc="${PIPESTATUS[0]}"
+                _ps=( "${PIPESTATUS[@]}" )
+                _dump_rc="${_ps[0]:-0}"
                 _pv_rc=0
-                _import_rc="${PIPESTATUS[1]}"
+                _import_rc="${_ps[1]:-0}"
             fi
             set -e
 
