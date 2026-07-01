@@ -839,6 +839,8 @@ fix_php() {
 
     local issue
     issue=$(prompt_choice "What's the issue?" \
+        "moodle-preset" \
+        "max-input-vars" \
         "upload-size-too-small" \
         "memory-limit-too-low" \
         "extension-not-loaded" \
@@ -849,6 +851,185 @@ fix_php() {
     php_ver=$(config_get "SRE_PHP_VERSION" "8.3")
 
     case "$issue" in
+        # Recommended PHP settings for Moodle in one shot. Fixes the
+        # admin/environment.php "max_input_vars" test AND all the other
+        # limits Moodle checks (post_max_size, upload_max_filesize,
+        # memory_limit, max_execution_time, max_input_time).
+        moodle-preset)
+            sre_info "Applies Moodle-recommended PHP settings:"
+            sre_info "  max_input_vars = 5000"
+            sre_info "  post_max_size = 256M"
+            sre_info "  upload_max_filesize = 256M"
+            sre_info "  memory_limit = 1024M"
+            sre_info "  max_execution_time = 1200"
+            sre_info "  max_input_time = 600"
+            echo ""
+
+            local scope
+            scope=$(prompt_choice "Apply globally to all sites, or per-project (Moodle only)?" \
+                "global" "per-project")
+
+            if [[ "$scope" == "per-project" ]]; then
+                local domain
+                domain=$(prompt_input "Moodle domain (e.g. lms.upm.edu.sa)" "")
+                [[ -z "$domain" ]] && { sre_error "Domain required."; return 1; }
+
+                # Find the pool file for this domain across all installed PHP versions.
+                local pool_file=""
+                for pf in /etc/php/*/fpm/pool.d/*.conf; do
+                    [[ -f "$pf" ]] || continue
+                    if grep -q "^\[${domain}\]" "$pf" 2>/dev/null \
+                       || [[ "$(basename "$pf")" == "${domain}.conf" ]]; then
+                        pool_file="$pf"
+                        break
+                    fi
+                done
+
+                if [[ -z "$pool_file" ]]; then
+                    sre_warning "No FPM pool found for ${domain}."
+                    sre_warning "Fall back to a global php.ini change? (still works, but affects other sites)"
+                    if ! prompt_yesno "Continue with global change?" "no"; then
+                        return 1
+                    fi
+                    scope="global"
+                fi
+
+                if [[ "$scope" == "per-project" ]]; then
+                    sre_info "Pool file: $pool_file"
+                    prompt_yesno "Apply Moodle preset to this pool?" "yes" \
+                        || { sre_skipped "Cancelled."; return 0; }
+
+                    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+                        backup_config "$pool_file"
+
+                        # Idempotent: remove any prior sre-moodle-preset block, then re-add.
+                        # This keeps re-runs clean (no accumulated duplicate lines).
+                        sed -i '/# BEGIN sre-moodle-preset/,/# END sre-moodle-preset/d' "$pool_file"
+
+                        cat >> "$pool_file" <<'PRESETEOF'
+
+; BEGIN sre-moodle-preset
+php_admin_value[max_input_vars] = 5000
+php_admin_value[post_max_size] = 256M
+php_admin_value[upload_max_filesize] = 256M
+php_admin_value[memory_limit] = 1024M
+php_admin_value[max_execution_time] = 1200
+php_admin_value[max_input_time] = 600
+; END sre-moodle-preset
+PRESETEOF
+                        # Detect which PHP version owns this pool (the path has it)
+                        local pool_ver
+                        pool_ver=$(echo "$pool_file" | grep -oP '/etc/php/\K[0-9]+\.[0-9]+')
+                        [[ -z "$pool_ver" ]] && pool_ver="$php_ver"
+
+                        svc_restart "$(get_phpfpm_svc "$pool_ver")"
+                        sre_success "Moodle preset applied to ${domain} (PHP ${pool_ver})"
+                        sre_info "Verify: curl -s https://${domain}/admin/environment.php | grep max_input_vars"
+                    else
+                        sre_info "[DRY-RUN] Would append Moodle preset to $pool_file and restart PHP-FPM"
+                    fi
+                fi
+            fi
+
+            if [[ "$scope" == "global" ]]; then
+                # Apply to both FPM and CLI php.ini for all installed PHP versions.
+                # Moodle cron (CLI) also enforces these limits.
+                if [[ "$SRE_DRY_RUN" != "true" ]]; then
+                    local touched=0
+                    for ini_file in /etc/php/*/fpm/php.ini /etc/php/*/cli/php.ini /etc/php.ini; do
+                        [[ -f "$ini_file" ]] || continue
+
+                        backup_config "$ini_file"
+
+                        _set_ini() {
+                            local key="$1" val="$2" f="$3"
+                            if grep -qE "^\s*;?\s*${key}\s*=" "$f"; then
+                                sed -i "s|^\s*;\?\s*${key}\s*=.*|${key} = ${val}|" "$f"
+                            else
+                                echo "${key} = ${val}" >> "$f"
+                            fi
+                        }
+
+                        _set_ini "max_input_vars"       "5000"  "$ini_file"
+                        _set_ini "post_max_size"        "256M"  "$ini_file"
+                        _set_ini "upload_max_filesize"  "256M"  "$ini_file"
+                        _set_ini "memory_limit"         "1024M" "$ini_file"
+                        _set_ini "max_execution_time"   "1200"  "$ini_file"
+                        _set_ini "max_input_time"       "600"   "$ini_file"
+
+                        sre_success "Updated: $ini_file"
+                        ((touched++))
+                    done
+
+                    if [[ $touched -eq 0 ]]; then
+                        sre_error "No php.ini files found under /etc/php/*/ or /etc/php.ini"
+                        return 1
+                    fi
+
+                    # Restart all installed FPM versions
+                    for ver_dir in /etc/php/*/fpm; do
+                        [[ -d "$ver_dir" ]] || continue
+                        local v
+                        v=$(echo "$ver_dir" | grep -oP '/etc/php/\K[0-9]+\.[0-9]+')
+                        [[ -n "$v" ]] && svc_restart "$(get_phpfpm_svc "$v")"
+                    done
+
+                    # Also bump nginx client_max_body_size so uploads reach PHP
+                    if prompt_yesno "Also update nginx client_max_body_size to 256M?" "yes"; then
+                        local nginx_conf="/etc/nginx/conf.d/security.conf"
+                        if [[ -f "$nginx_conf" ]]; then
+                            if grep -q "client_max_body_size" "$nginx_conf"; then
+                                sed -i "s/client_max_body_size.*/client_max_body_size 256M;/" "$nginx_conf"
+                            else
+                                echo "client_max_body_size 256M;" >> "$nginx_conf"
+                            fi
+                            nginx -t 2>/dev/null && svc_reload nginx
+                            sre_success "Nginx client_max_body_size updated to 256M"
+                        else
+                            sre_warning "Nginx security.conf not found at $nginx_conf — skipped"
+                        fi
+                    fi
+
+                    sre_success "Moodle preset applied globally"
+                    sre_info "Verify from a Moodle install: /admin/environment.php should be all green"
+                else
+                    sre_info "[DRY-RUN] Would apply Moodle preset globally to php.ini + FPM restart"
+                fi
+            fi
+            ;;
+
+        # Just the max_input_vars fix on its own — the most common Moodle
+        # environment-check failure.
+        max-input-vars)
+            local new_val
+            new_val=$(prompt_input "New max_input_vars (Moodle needs >= 5000)" "5000")
+
+            if [[ "$SRE_DRY_RUN" != "true" ]]; then
+                local touched=0
+                for ini_file in "/etc/php/${php_ver}/fpm/php.ini" "/etc/php/${php_ver}/cli/php.ini" "/etc/php.ini"; do
+                    [[ -f "$ini_file" ]] || continue
+                    backup_config "$ini_file"
+                    if grep -qE '^\s*;?\s*max_input_vars\s*=' "$ini_file"; then
+                        sed -i "s|^\s*;\?\s*max_input_vars\s*=.*|max_input_vars = ${new_val}|" "$ini_file"
+                    else
+                        echo "max_input_vars = ${new_val}" >> "$ini_file"
+                    fi
+                    sre_success "Updated: $ini_file"
+                    ((touched++))
+                done
+
+                if [[ $touched -eq 0 ]]; then
+                    sre_error "No php.ini files found for PHP $php_ver"
+                    return 1
+                fi
+
+                svc_restart "$(get_phpfpm_svc "$php_ver")"
+                sre_success "max_input_vars set to ${new_val} (PHP ${php_ver})"
+            else
+                sre_info "[DRY-RUN] Would set max_input_vars=${new_val}"
+            fi
+            ;;
+
         upload-size-too-small)
             local new_size
             new_size=$(prompt_input "New upload_max_filesize (e.g. 256M, 512M)" "256M")
