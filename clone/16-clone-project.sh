@@ -751,6 +751,11 @@ fi
 
 tgt_vhost="${vhost_dir}/${CL_TARGET_DOMAIN}.conf"
 tgt_proj_base="/var/www/${CL_TARGET_DOMAIN}"
+# Isolated target? Use its project user for run-as + ownership; else legacy www-data
+tgt_run_user="www-data"
+if id "$(iso_user_for "$CL_TARGET_DOMAIN")" &>/dev/null; then
+    tgt_run_user=$(iso_user_for "$CL_TARGET_DOMAIN")
+fi
 
 ################################################################################
 # Resume detection
@@ -816,7 +821,7 @@ if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
 
     sre_info "Will remove (if present):"
     if [[ -n "$_reset_db_name" ]]; then sre_info "  DB:           $_reset_db_name"; fi
-    if [[ -n "$_reset_db_user" ]]; then sre_info "  DB user:      ${_reset_db_user}@localhost"; fi
+    if [[ -n "$_reset_db_user" ]]; then sre_info "  DB user:      ${_reset_db_user}@$(db_grant_host)"; fi
     sre_info "  Project dir:  ${tgt_proj_base}/"
     sre_info "  Vhost conf:   ${tgt_vhost}"
     if [[ "$_enabled_link" != "$tgt_vhost" ]]; then
@@ -850,14 +855,8 @@ if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
 
     # 1. Drop DB + user
     if [[ -n "$_reset_db_name" || -n "$_reset_db_user" ]]; then
-        _db_root_pass=""
-        if [[ -f /root/.db_root_password ]]; then
-            _db_root_pass=$(cat /root/.db_root_password)
-        fi
-        _mysql_cmd="mysql"
-        if [[ -n "$_db_root_pass" ]]; then
-            _mysql_cmd="mysql -u root -p${_db_root_pass}"
-        fi
+        _mysql_cmd="$(db_admin_cmd)"
+        _reset_grant_host="$(db_grant_host)"
         if [[ -n "$_reset_db_name" ]]; then
             if $_mysql_cmd -e "DROP DATABASE IF EXISTS \`${_reset_db_name}\`;" 2>/dev/null; then
                 sre_success "Dropped DB: $_reset_db_name"
@@ -866,14 +865,14 @@ if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
             fi
         fi
         if [[ -n "$_reset_db_user" ]]; then
-            if $_mysql_cmd -e "DROP USER IF EXISTS '${_reset_db_user}'@'localhost';" 2>/dev/null; then
-                sre_success "Dropped user: ${_reset_db_user}@localhost"
+            if $_mysql_cmd -e "DROP USER IF EXISTS '${_reset_db_user}'@'${_reset_grant_host}';" 2>/dev/null; then
+                sre_success "Dropped user: ${_reset_db_user}@${_reset_grant_host}"
             else
-                sre_warning "Could not drop user ${_reset_db_user}@localhost"
+                sre_warning "Could not drop user ${_reset_db_user}@${_reset_grant_host}"
             fi
         fi
-        # PostgreSQL best-effort
-        if command -v psql &>/dev/null && [[ -n "$_reset_db_name" ]]; then
+        # PostgreSQL best-effort (local only — no remote PG path yet)
+        if ! db_is_remote && command -v psql &>/dev/null && [[ -n "$_reset_db_name" ]]; then
             if sudo -u postgres dropdb --if-exists "$_reset_db_name" 2>/dev/null; then
                 sre_success "Dropped PG DB: $_reset_db_name"
             fi
@@ -1255,16 +1254,14 @@ fi
 # variable and trip set -u.
 ################################################################################
 
-mysql_cmd="mysql"
-mysqldump_cmd="mysqldump"
-db_root_pass="${db_root_pass:-}"
-if [[ -z "$db_root_pass" && -f /root/.db_root_password ]]; then
-    db_root_pass=$(cat /root/.db_root_password)
-fi
-if [[ -n "$db_root_pass" ]]; then
-    mysql_cmd="mysql -u root -p${db_root_pass}"
-    mysqldump_cmd="mysqldump -u root -p${db_root_pass}"
-fi
+mysql_cmd="$(db_admin_cmd)"
+mysqldump_cmd="$(db_dump_cmd)"
+# Host part for CREATE USER / GRANT / DROP USER on the target DB.
+clone_grant_host="$(db_grant_host)"
+sre_info "Database target: $(db_describe)"
+
+# Both source dump and target import go through the same server, so a clone
+# works unchanged in remote mode (mysqldump | mysql over the network).
 
 ################################################################################
 # Target DB plan
@@ -1315,7 +1312,7 @@ else
     _mysql_has_user() {
         local v="$1"
         $mysql_cmd -N -B -e \
-            "SELECT 1 FROM mysql.user WHERE user='${v}' AND host='localhost' LIMIT 1;" 2>/dev/null \
+            "SELECT 1 FROM mysql.user WHERE user='${v}' AND host='${clone_grant_host}' LIMIT 1;" 2>/dev/null \
             | grep -q '^1$'
     }
 
@@ -1347,7 +1344,7 @@ else
                 fi
                 sre_warning "DB '$_user_db_name' already exists in MySQL — refusing to clobber it."
                 sre_warning "Pick a different name, or drop the existing DB manually first:"
-                sre_warning "  mysql -u root -e \"DROP DATABASE \\\`${_user_db_name}\\\`;\""
+                sre_warning "  DROP DATABASE \`${_user_db_name}\`;"
                 continue
             fi
             tgt_db_name="$_user_db_name"
@@ -1363,12 +1360,12 @@ else
             fi
             if _mysql_has_user "$_user_db_user"; then
                 if [[ "$_user_db_user" == "$tgt_db_user" ]]; then
-                    sre_warning "User '$_user_db_user'@'localhost' already exists — will ALTER its password (auto-generated name, safe)."
+                    sre_warning "User '$_user_db_user'@'${clone_grant_host}' already exists — will ALTER its password (auto-generated name, safe)."
                     break
                 fi
-                sre_warning "User '$_user_db_user'@'localhost' already exists in MySQL — refusing to overwrite its password."
+                sre_warning "User '$_user_db_user'@'${clone_grant_host}' already exists in MySQL — refusing to overwrite its password."
                 sre_warning "Pick a different name, or drop the existing user manually first:"
-                sre_warning "  mysql -u root -e \"DROP USER '${_user_db_user}'@'localhost';\""
+                sre_warning "  DROP USER '${_user_db_user}'@'${clone_grant_host}';"
                 continue
             fi
             tgt_db_user="$_user_db_user"
@@ -1563,7 +1560,7 @@ if [[ "$do_files" == "true" ]] && ! progress_phase_done FILES; then
             ;;
     esac
 
-    chown -R www-data:www-data "$tgt_proj_base"
+    chown -R "$tgt_run_user:$tgt_run_user" "$tgt_proj_base"
     sre_success "Files copied to $tgt_proj_base"
 
     # Persist the moodledata path so resume can rewrite config.php correctly
@@ -1835,11 +1832,14 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
             # Create target DB + user (idempotent)
             $mysql_cmd -e "CREATE DATABASE \`${tgt_db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
                 || { sre_error "Failed creating database ${tgt_db_name}"; exit 1; }
-            $mysql_cmd -e "CREATE USER IF NOT EXISTS '${tgt_db_user}'@'localhost' IDENTIFIED BY '${tgt_db_pass}';" 2>/dev/null
-            $mysql_cmd -e "ALTER USER '${tgt_db_user}'@'localhost' IDENTIFIED BY '${tgt_db_pass}';" 2>/dev/null
-            $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${tgt_db_name}\`.* TO '${tgt_db_user}'@'localhost';" 2>/dev/null
+            $mysql_cmd -e "CREATE USER IF NOT EXISTS '${tgt_db_user}'@'${clone_grant_host}' IDENTIFIED BY '${tgt_db_pass}';" 2>/dev/null
+            $mysql_cmd -e "ALTER USER '${tgt_db_user}'@'${clone_grant_host}' IDENTIFIED BY '${tgt_db_pass}';" 2>/dev/null
+            if ! $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${tgt_db_name}\`.* TO '${tgt_db_user}'@'${clone_grant_host}';" 2>/dev/null; then
+                sre_error "Failed granting privileges to '${tgt_db_user}'@'${clone_grant_host}'"
+                exit 1
+            fi
             $mysql_cmd -e "FLUSH PRIVILEGES;" 2>/dev/null
-            sre_success "Target DB + user created: ${tgt_db_name} / ${tgt_db_user}"
+            sre_success "Target DB + user created: ${tgt_db_name} / ${tgt_db_user}@${clone_grant_host}"
 
             # Estimate source DB size for the live progress meter
             src_db_bytes=$($mysql_cmd -N -B -e \
@@ -1941,6 +1941,9 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
             ;;
 
         postgresql)
+            # PostgreSQL admin here is local peer auth only.
+            db_require_local_pg || exit 1
+
             # Drop on resume — same rationale as mysql branch
             if sudo -u postgres psql -lqt | cut -d'|' -f1 | grep -qw "$tgt_db_name"; then
                 sre_warning "Target DB ${tgt_db_name} already exists — dropping for clean re-import"
@@ -2033,7 +2036,8 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                     sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${tgt_db_name}|" "$tgt_env"
                     sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${tgt_db_user}|" "$tgt_env"
                     sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${tgt_db_pass}|" "$tgt_env"
-                    sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" "$tgt_env"
+                    sed -i "s|^DB_HOST=.*|DB_HOST=$(db_client_host)|" "$tgt_env"
+                    sed -i "s|^DB_PORT=.*|DB_PORT=$(db_client_port)|" "$tgt_env"
                 fi
                 sed -i "s|^APP_URL=.*|APP_URL=${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}|" "$tgt_env"
                 # Only flip APP_ENV for staging clones — a live clone keeps the
@@ -2056,7 +2060,7 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                     fi
                 fi
                 if [[ "$CL_REGEN_APP_KEY" == "yes" ]] && command -v php &>/dev/null; then
-                    ( cd "${tgt_proj_base}/current" && sudo -u www-data php artisan key:generate --force --no-interaction ) \
+                    ( cd "${tgt_proj_base}/current" && sudo -u "$tgt_run_user" php artisan key:generate --force --no-interaction ) \
                         && sre_success "APP_KEY regenerated" \
                         || sre_warning "APP_KEY regen failed — run manually"
                 else
@@ -2066,9 +2070,9 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                 # Cache rebuild
                 if command -v php &>/dev/null && [[ -f "${tgt_proj_base}/current/artisan" ]]; then
                     ( cd "${tgt_proj_base}/current"
-                      sudo -u www-data php artisan config:clear >/dev/null 2>&1 || true
-                      sudo -u www-data php artisan cache:clear  >/dev/null 2>&1 || true
-                      sudo -u www-data php artisan view:clear   >/dev/null 2>&1 || true
+                      sudo -u "$tgt_run_user" php artisan config:clear >/dev/null 2>&1 || true
+                      sudo -u "$tgt_run_user" php artisan cache:clear  >/dev/null 2>&1 || true
+                      sudo -u "$tgt_run_user" php artisan view:clear   >/dev/null 2>&1 || true
                     )
                     sre_success "Laravel caches cleared"
                 fi
@@ -2083,7 +2087,10 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                     sed -i "s|define( *['\"]DB_NAME['\"] *,.*|define('DB_NAME', '${tgt_db_name}');|" "$tgt_wpc"
                     sed -i "s|define( *['\"]DB_USER['\"] *,.*|define('DB_USER', '${tgt_db_user}');|" "$tgt_wpc"
                     sed -i "s|define( *['\"]DB_PASSWORD['\"] *,.*|define('DB_PASSWORD', '${tgt_db_pass}');|" "$tgt_wpc"
-                    sed -i "s|define( *['\"]DB_HOST['\"] *,.*|define('DB_HOST', 'localhost');|" "$tgt_wpc"
+                    # WordPress takes host:port in a single DB_HOST constant.
+                    _wp_host="$(db_client_host_legacy)"
+                    db_is_remote && _wp_host="${_wp_host}:$(db_client_port)"
+                    sed -i "s|define( *['\"]DB_HOST['\"] *,.*|define('DB_HOST', '${_wp_host}');|" "$tgt_wpc"
                 fi
                 sre_success "wp-config.php rewritten"
 
@@ -2103,7 +2110,7 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                     if command -v wp &>/dev/null; then
                         sre_info "Running wp search-replace (full content + serialized data)..."
                         ( cd "${tgt_proj_base}/current" && \
-                          sudo -u www-data wp --skip-themes --skip-plugins \
+                          sudo -u "$tgt_run_user" wp --skip-themes --skip-plugins \
                             search-replace \
                             "${src_scheme}://${CL_SOURCE_DOMAIN}" \
                             "${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}" \
@@ -2111,11 +2118,11 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                             && sre_success "wp search-replace complete" \
                             || sre_warning "wp search-replace had issues — review manually"
                         ( cd "${tgt_proj_base}/current" && \
-                          sudo -u www-data wp --skip-themes --skip-plugins cache flush 2>/dev/null || true )
+                          sudo -u "$tgt_run_user" wp --skip-themes --skip-plugins cache flush 2>/dev/null || true )
                     else
                         sre_warning "wp-cli not installed — post bodies still contain old domain URLs."
                         sre_warning "Install wp-cli and run:"
-                        sre_warning "  cd ${tgt_proj_base}/current && sudo -u www-data wp search-replace \\"
+                        sre_warning "  cd ${tgt_proj_base}/current && sudo -u "$tgt_run_user" wp search-replace \\"
                         sre_warning "    '${src_scheme}://${CL_SOURCE_DOMAIN}' '${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}' --all-tables"
                     fi
                 fi
@@ -2133,6 +2140,17 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                     sed -i "s|\(\$CFG->dbname\s*=\s*\)['\"][^'\"]*['\"]|\1'${tgt_db_name}'|" "$tgt_mcf"
                     sed -i "s|\(\$CFG->dbuser\s*=\s*\)['\"][^'\"]*['\"]|\1'${tgt_db_user}'|" "$tgt_mcf"
                     sed -i "s|\(\$CFG->dbpass\s*=\s*\)['\"][^'\"]*['\"]|\1'${tgt_db_pass}'|" "$tgt_mcf"
+                    # dbhost: the copied config still points wherever the SOURCE
+                    # pointed. That is correct for local→local, but wrong when
+                    # this server now talks to a remote SQL host.
+                    sed -i "s|\(\$CFG->dbhost\s*=\s*\)['\"][^'\"]*['\"]|\1'$(db_client_host_legacy)'|" "$tgt_mcf"
+                    if db_is_remote; then
+                        sre_info "Moodle dbhost → $(db_client_host_legacy)"
+                        if grep -qE '\$CFG->dboptions' "$tgt_mcf"; then
+                            sre_warning "config.php sets \$CFG->dboptions — verify 'dbport' is $(db_client_port)"
+                            sre_warning "  $tgt_mcf"
+                        fi
+                    fi
                 fi
 
                 # wwwroot — uses the resolved scheme. THIS is the load-bearing
@@ -2196,7 +2214,7 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                 if command -v php &>/dev/null && [[ -f "${moodle_root}/admin/cli/purge_caches.php" ]]; then
                     sre_info "Purging Moodle caches via admin/cli/purge_caches.php..."
                     ( cd "$moodle_root" && \
-                      sudo -u www-data php admin/cli/purge_caches.php 2>&1 | tail -5 ) \
+                      sudo -u "$tgt_run_user" php admin/cli/purge_caches.php 2>&1 | tail -5 ) \
                         && sre_success "Moodle caches purged" \
                         || sre_warning "Moodle cache purge had warnings — run manually after install"
                 fi
@@ -2327,7 +2345,7 @@ case "$src_type" in
     laravel)
         # Storage symlink (in case source didn't have one cached)
         if [[ -f "${tgt_proj_base}/current/artisan" ]]; then
-            ( cd "${tgt_proj_base}/current" && sudo -u www-data php artisan storage:link --no-interaction 2>/dev/null || true )
+            ( cd "${tgt_proj_base}/current" && sudo -u "$tgt_run_user" php artisan storage:link --no-interaction 2>/dev/null || true )
         fi
         ;;
 esac
@@ -2338,6 +2356,12 @@ esac
 
 if ! progress_phase_done PERMS; then
     phase_header "Fix Permissions"
+
+    if [[ "$tgt_run_user" != "www-data" ]]; then
+        iso_apply_perms "$CL_TARGET_DOMAIN" "$tgt_proj_base" "$src_type" "${CL_TGT_MOODLEDATA:-}"
+        sre_success "Permissions applied (isolated: $tgt_run_user)"
+        progress_mark_phase PERMS
+    else
 
     require_acl
 
@@ -2377,6 +2401,7 @@ if ! progress_phase_done PERMS; then
 
     sre_success "Permissions applied"
     progress_mark_phase PERMS
+    fi
 else
     phase_skipped "Fix Permissions"
 fi

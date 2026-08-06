@@ -9,8 +9,9 @@
 # What it does:
 #   1. Downloads the latest phpMyAdmin (or a pinned --version) from
 #      phpmyadmin.net into /var/www/<domain>/current/.
-#   2. Generates config.inc.php with a fresh blowfish_secret, localhost DB host,
-#      cookie auth, and a server-side TempDir.
+#   2. Generates config.inc.php with a fresh blowfish_secret, the configured DB
+#      host (local socket or the remote SQL server from step 5), cookie auth,
+#      and a server-side TempDir.
 #   3. Optionally creates the pma__ control DB + user (multi-user features).
 #   4. Creates the vhost via step 8 (--type phpmyadmin).
 #   5. Offers SSL via step 11 (recommended; on-by-default).
@@ -291,7 +292,8 @@ declare(strict_types=1);
 
 \$i++;
 \$cfg['Servers'][\$i]['auth_type']        = 'cookie';
-\$cfg['Servers'][\$i]['host']             = 'localhost';
+\$cfg['Servers'][\$i]['host']             = '$(db_client_host_legacy)';
+\$cfg['Servers'][\$i]['port']             = '$(db_client_port)';
 \$cfg['Servers'][\$i]['compress']         = false;
 \$cfg['Servers'][\$i]['AllowNoPassword']  = false;
 \$cfg['Servers'][\$i]['extension']        = 'mysqli';
@@ -331,10 +333,15 @@ fi
 if [[ "$PMA_CREATE_CONTROL_DB" == "yes" ]]; then
     sre_header "Creating phpMyAdmin Control DB"
 
-    db_root_pass=""
-    [[ -f /root/.db_root_password ]] && db_root_pass=$(cat /root/.db_root_password)
-    mysql_cmd="mysql"
-    [[ -n "$db_root_pass" ]] && mysql_cmd="mysql -u root -p${db_root_pass}"
+    mysql_cmd="$(db_admin_cmd)"
+    pma_grant_host="$(db_grant_host)"
+    sre_info "Target: $(db_describe)"
+
+    db_check_connection quiet || {
+        db_check_connection
+        sre_error "Cannot create the phpMyAdmin control database."
+        exit 1
+    }
 
     pma_ctrl_user="pma"
     pma_ctrl_pass=$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)
@@ -342,9 +349,9 @@ if [[ "$PMA_CREATE_CONTROL_DB" == "yes" ]]; then
 
     $mysql_cmd -e "CREATE DATABASE IF NOT EXISTS \`${pma_ctrl_db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
         || { sre_error "Could not create control DB"; exit 1; }
-    $mysql_cmd -e "CREATE USER IF NOT EXISTS '${pma_ctrl_user}'@'localhost' IDENTIFIED BY '${pma_ctrl_pass}';" 2>/dev/null
-    $mysql_cmd -e "ALTER  USER '${pma_ctrl_user}'@'localhost' IDENTIFIED BY '${pma_ctrl_pass}';" 2>/dev/null
-    $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${pma_ctrl_db}\`.* TO '${pma_ctrl_user}'@'localhost';" 2>/dev/null
+    $mysql_cmd -e "CREATE USER IF NOT EXISTS '${pma_ctrl_user}'@'${pma_grant_host}' IDENTIFIED BY '${pma_ctrl_pass}';" 2>/dev/null
+    $mysql_cmd -e "ALTER  USER '${pma_ctrl_user}'@'${pma_grant_host}' IDENTIFIED BY '${pma_ctrl_pass}';" 2>/dev/null
+    $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${pma_ctrl_db}\`.* TO '${pma_ctrl_user}'@'${pma_grant_host}';" 2>/dev/null
     $mysql_cmd -e "FLUSH PRIVILEGES;" 2>/dev/null
 
     # Load schema shipped with phpMyAdmin

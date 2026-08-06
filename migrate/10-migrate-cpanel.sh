@@ -400,10 +400,7 @@ if [[ "$MIG_MODE" == "post-only" ]] && [[ "$do_post" == "true" ]] \
     fi
     case "$db_engine" in
         mariadb|mysql)
-            db_root_pass=""
-            [[ -f /root/.db_root_password ]] && db_root_pass=$(cat /root/.db_root_password)
-            mysql_cmd="mysql"
-            [[ -n "$db_root_pass" ]] && mysql_cmd="mysql -u root -p${db_root_pass}"
+            mysql_cmd="$(db_admin_cmd)"
             ;;
     esac
 fi
@@ -598,32 +595,55 @@ fi
 ################################################################################
 
 if [[ "$needs_db" == "true" ]]; then
-    sre_header "Creating Local Database"
+    if db_is_remote; then
+        sre_header "Creating Database on Remote Server"
+    else
+        sre_header "Creating Local Database"
+    fi
 
     if [[ "$SRE_DRY_RUN" != "true" ]]; then
         case "$db_engine" in
             mariadb|mysql)
-                db_root_pass=""
-                [[ -f /root/.db_root_password ]] && db_root_pass=$(cat /root/.db_root_password)
+                mysql_cmd="$(db_admin_cmd)"
+                mig_grant_host="$(db_grant_host)"
+                sre_info "Target: $(db_describe)"
 
-                mysql_cmd="mysql"
-                [[ -n "$db_root_pass" ]] && mysql_cmd="mysql -u root -p${db_root_pass}"
+                db_check_connection quiet || {
+                    db_check_connection
+                    sre_error "Cannot create the database for this migration."
+                    exit 1
+                }
 
-                $mysql_cmd -e "CREATE DATABASE IF NOT EXISTS \`${MIG_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
+                mig_err=$(mktemp)
+                if ! $mysql_cmd -e "CREATE DATABASE IF NOT EXISTS \`${MIG_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>"$mig_err"; then
+                    sre_error "Failed to create database: $MIG_DB_NAME"
+                    [[ -s "$mig_err" ]] && sed 's/^/    /' "$mig_err" >&2
+                    rm -f "$mig_err"
+                    exit 1
+                fi
                 sre_success "Database created: $MIG_DB_NAME"
 
                 # Idempotent user creation: CREATE USER IF NOT EXISTS does NOT
                 # update the password if the user already exists. ALTER USER
                 # afterwards forces the configured password to take effect on
                 # every run, so .env and DB stay in sync after re-runs.
-                $mysql_cmd -e "CREATE USER IF NOT EXISTS '${MIG_DB_USER}'@'localhost' IDENTIFIED BY '${MIG_DB_PASS}';" 2>/dev/null
-                $mysql_cmd -e "ALTER USER '${MIG_DB_USER}'@'localhost' IDENTIFIED BY '${MIG_DB_PASS}';" 2>/dev/null
-                $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${MIG_DB_NAME}\`.* TO '${MIG_DB_USER}'@'localhost';" 2>/dev/null
+                $mysql_cmd -e "CREATE USER IF NOT EXISTS '${MIG_DB_USER}'@'${mig_grant_host}' IDENTIFIED BY '${MIG_DB_PASS}';" 2>/dev/null
+                $mysql_cmd -e "ALTER USER '${MIG_DB_USER}'@'${mig_grant_host}' IDENTIFIED BY '${MIG_DB_PASS}';" 2>/dev/null
+                if ! $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${MIG_DB_NAME}\`.* TO '${MIG_DB_USER}'@'${mig_grant_host}';" 2>"$mig_err"; then
+                    sre_error "Failed granting privileges to '${MIG_DB_USER}'@'${mig_grant_host}'"
+                    [[ -s "$mig_err" ]] && sed 's/^/    /' "$mig_err" >&2
+                    rm -f "$mig_err"
+                    exit 1
+                fi
                 $mysql_cmd -e "FLUSH PRIVILEGES;" 2>/dev/null
-                sre_success "Database user created/updated: $MIG_DB_USER"
+                rm -f "$mig_err"
+                sre_success "Database user created/updated: ${MIG_DB_USER}@${mig_grant_host}"
                 ;;
 
             postgresql)
+                # PostgreSQL admin here is local peer auth only.
+                db_require_local_pg || exit 1
+
                 # Always reconcile password (ALTER ROLE) so re-runs keep
                 # .env and DB in sync.
                 sudo -u postgres psql -c "DO \$\$ BEGIN
@@ -827,8 +847,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                     sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${MIG_DB_NAME}|" "${local_root}/.env"
                     sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${MIG_DB_USER}|" "${local_root}/.env"
                     sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${MIG_DB_PASS}|" "${local_root}/.env"
-                    sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" "${local_root}/.env"
-                    sre_success "Updated .env with local database credentials"
+                    sed -i "s|^DB_HOST=.*|DB_HOST=$(db_client_host)|" "${local_root}/.env"
+                    sed -i "s|^DB_PORT=.*|DB_PORT=$(db_client_port)|" "${local_root}/.env"
+                    sre_success "Updated .env with database credentials (host: $(db_client_host):$(db_client_port))"
                 fi
 
                 sed -i "s|^APP_URL=.*|APP_URL=http://${MIG_DOMAIN}|" "${local_root}/.env"
@@ -935,11 +956,17 @@ global \$CFG;
 
 \$CFG->dbtype    = '${moodle_dbtype}';
 \$CFG->dblibrary = 'native';
-\$CFG->dbhost    = 'localhost';
+\$CFG->dbhost    = '$(db_client_host_legacy)';
 \$CFG->dbname    = '${MIG_DB_NAME}';
 \$CFG->dbuser    = '${MIG_DB_USER}';
 \$CFG->dbpass    = '${MIG_DB_PASS}';
 \$CFG->prefix    = '${moodle_prefix}';
+\$CFG->dboptions = array(
+    'dbpersist' => false,
+    'dbport'    => '$(db_client_port)',
+    'dbsocket'  => '',
+    'dbcollation' => 'utf8mb4_unicode_ci',
+);
 
 \$CFG->wwwroot   = 'http://${MIG_DOMAIN}';
 \$CFG->dataroot  = '${moodledata_dir}';
@@ -1039,13 +1066,16 @@ MOODLE_CONFIG
 
                 cp "$wp_config" "${wp_config}.bak"
 
-                # Update DB credentials to local — keep prefix and salts as-is
+                # Point DB credentials at our server — keep prefix and salts as-is
                 sed -i "s|define( *['\"]DB_NAME['\"] *,.*|define('DB_NAME', '${MIG_DB_NAME}');|" "$wp_config"
                 sed -i "s|define( *['\"]DB_USER['\"] *,.*|define('DB_USER', '${MIG_DB_USER}');|" "$wp_config"
                 sed -i "s|define( *['\"]DB_PASSWORD['\"] *,.*|define('DB_PASSWORD', '${MIG_DB_PASS}');|" "$wp_config"
-                sed -i "s|define( *['\"]DB_HOST['\"] *,.*|define('DB_HOST', 'localhost');|" "$wp_config"
+                # WordPress takes host:port in a single DB_HOST constant.
+                _mig_wp_host="$(db_client_host_legacy)"
+                db_is_remote && _mig_wp_host="${_mig_wp_host}:$(db_client_port)"
+                sed -i "s|define( *['\"]DB_HOST['\"] *,.*|define('DB_HOST', '${_mig_wp_host}');|" "$wp_config"
 
-                sre_success "wp-config.php updated with local DB credentials (backup: ${wp_config}.bak)"
+                sre_success "wp-config.php updated with DB credentials (host: ${_mig_wp_host}, backup: ${wp_config}.bak)"
 
                 # Update siteurl/home in DB to new domain
                 if prompt_yesno "Update WordPress siteurl/home to http://${MIG_DOMAIN} in DB?" "yes"; then

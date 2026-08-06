@@ -26,6 +26,7 @@ Step 12: Quick Fixes & Common Problems
     - Database charset
     - Locale & encoding
     - Supervisor (Laravel queue workers / Horizon / scheduler)
+    - Harden state files & opcache permission validation
 
 Options:
   --dry-run   Print planned actions without executing
@@ -1295,6 +1296,12 @@ fix_db_charset() {
         return 0
     fi
 
+    # Connect via the shared library so this fix works against a remote server
+    # too. Previously these were bare `mysql` calls relying on root socket auth.
+    local mysql_cmd
+    mysql_cmd="$(db_admin_cmd)"
+    sre_info "Target: $(db_describe)"
+
     local issue
     issue=$(prompt_choice "What's the issue?" \
         "set-server-default-utf8mb4" \
@@ -1304,6 +1311,18 @@ fix_db_charset() {
 
     case "$issue" in
         set-server-default-utf8mb4)
+            # Writes a config file for a LOCAL server. In remote mode the
+            # server's my.cnf lives on the other host and is not ours to edit.
+            if db_is_remote; then
+                sre_error "The SQL server is remote ($(db_admin_host)) — its charset"
+                sre_error "configuration must be changed on that host, not here."
+                sre_error "On the DB server, set in my.cnf under [mysqld]:"
+                sre_error "  character-set-server = utf8mb4"
+                sre_error "  collation-server = utf8mb4_unicode_ci"
+                sre_error "then restart it. Per-database conversion still works from"
+                sre_error "here — use 'convert-database' or 'convert-table'."
+                return 1
+            fi
             if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 local cnf_dir="/etc/mysql/conf.d"
                 [[ "$SRE_OS_FAMILY" == "rhel" ]] && cnf_dir="/etc/my.cnf.d"
@@ -1340,7 +1359,7 @@ EOCNF
             sre_warning "This will convert database '$db_name' to utf8mb4 / $collation"
             if prompt_yesno "Proceed? (make sure you have a backup)" "no"; then
                 if [[ "$SRE_DRY_RUN" != "true" ]]; then
-                    mysql -e "ALTER DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE ${collation};" 2>&1
+                    $mysql_cmd -e "ALTER DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE ${collation};" 2>&1
                     sre_success "Database '$db_name' converted to utf8mb4"
                     sre_warning "Individual tables may still need conversion — use 'convert-table' option"
                 fi
@@ -1361,16 +1380,16 @@ EOCNF
                 if [[ "$SRE_DRY_RUN" != "true" ]]; then
                     if [[ "$table_name" == "all" ]]; then
                         local tables
-                        tables=$(mysql -N -e "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='${db_name}';")
+                        tables=$($mysql_cmd -N -e "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='${db_name}';")
                         local count=0
                         while IFS= read -r tbl; do
                             [[ -z "$tbl" ]] && continue
-                            mysql -e "ALTER TABLE \`${db_name}\`.\`${tbl}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE ${collation};" 2>&1 || true
+                            $mysql_cmd -e "ALTER TABLE \`${db_name}\`.\`${tbl}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE ${collation};" 2>&1 || true
                             ((count++))
                         done <<< "$tables"
                         sre_success "Converted $count tables in '$db_name' to utf8mb4"
                     else
-                        mysql -e "ALTER TABLE \`${db_name}\`.\`${table_name}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE ${collation};" 2>&1
+                        $mysql_cmd -e "ALTER TABLE \`${db_name}\`.\`${table_name}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE ${collation};" 2>&1
                         sre_success "Table '${db_name}.${table_name}' converted to utf8mb4"
                     fi
                 fi
@@ -1379,20 +1398,20 @@ EOCNF
 
         check-current-charset)
             sre_info "Server-level charset:"
-            mysql -e "SHOW VARIABLES LIKE 'character_set%';" 2>/dev/null || sre_error "Cannot connect to MySQL"
+            $mysql_cmd -e "SHOW VARIABLES LIKE 'character_set%';" 2>/dev/null || sre_error "Cannot connect to MySQL"
             echo ""
             sre_info "Server-level collation:"
-            mysql -e "SHOW VARIABLES LIKE 'collation%';" 2>/dev/null || true
+            $mysql_cmd -e "SHOW VARIABLES LIKE 'collation%';" 2>/dev/null || true
 
             if prompt_yesno "Check a specific database?" "no"; then
                 local db_name
                 db_name=$(prompt_input "Database name" "")
                 if [[ -n "$db_name" ]]; then
                     sre_info "Database '$db_name' charset:"
-                    mysql -e "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${db_name}';" 2>/dev/null
+                    $mysql_cmd -e "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${db_name}';" 2>/dev/null
                     echo ""
                     sre_info "Tables with non-utf8mb4 charset:"
-                    mysql -e "SELECT TABLE_NAME, TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA='${db_name}' AND TABLE_COLLATION NOT LIKE 'utf8mb4%';" 2>/dev/null
+                    $mysql_cmd -e "SELECT TABLE_NAME, TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA='${db_name}' AND TABLE_COLLATION NOT LIKE 'utf8mb4%';" 2>/dev/null
                 fi
             fi
             ;;
@@ -1741,6 +1760,154 @@ HORIZONEOF
 # Main Menu
 ################################################################################
 
+################################################################################
+# Fix: Harden state files & opcache permission validation
+################################################################################
+
+fix_harden_state() {
+    sre_header "Fix: Harden state files & opcache"
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would chmod 700 /etc/sre-helpers{,/deployments}, 600 state files"
+        sre_info "[DRY-RUN] Would chmod 600 /root/.db_root_password"
+        sre_info "[DRY-RUN] Would set opcache.validate_permission/validate_root = 1 in FPM php.ini"
+        return 0
+    fi
+
+    # 1. State files hold plaintext DB credentials — make the tree root-only
+    if [[ -d /etc/sre-helpers ]]; then
+        chmod 700 /etc/sre-helpers
+        if [[ -d /etc/sre-helpers/deployments ]]; then
+            chmod 700 /etc/sre-helpers/deployments
+            local sf
+            for sf in /etc/sre-helpers/deployments/*.conf; do
+                [[ -f "$sf" ]] && chmod 600 "$sf"
+            done
+        fi
+        sre_success "/etc/sre-helpers locked down (700 dirs, 600 state files)"
+    else
+        sre_info "/etc/sre-helpers not present — nothing to harden there"
+    fi
+
+    # 2. Root DB password file
+    if [[ -f /root/.db_root_password ]]; then
+        chmod 600 /root/.db_root_password
+        sre_success "/root/.db_root_password is 600"
+    fi
+
+    # 3. Opcache must respect filesystem permissions on cache hits — all FPM
+    #    pools share one opcache SHM, so without this a per-project pool could
+    #    read another project's cached scripts
+    local ini _oc changed=false
+    for ini in /etc/php/*/fpm/php.ini /etc/php.ini; do
+        [[ -f "$ini" ]] || continue
+        for _oc in opcache.validate_permission opcache.validate_root; do
+            grep -qE "^${_oc}[[:space:]]*=[[:space:]]*1" "$ini" && continue
+            if grep -qE "^[;[:space:]]*${_oc}[[:space:]]*=" "$ini"; then
+                sed -i "s/^[;[:space:]]*${_oc}[[:space:]]*=.*/${_oc} = 1/" "$ini"
+            else
+                echo "${_oc} = 1" >> "$ini"
+            fi
+            changed=true
+        done
+        sre_success "Opcache permission validation enabled in $ini"
+    done
+    if [[ "$changed" == "true" ]]; then
+        sre_warning "Reload PHP-FPM to apply: systemctl reload 'php*-fpm' (or php-fpm on RHEL)"
+    fi
+}
+
+################################################################################
+# Fix: Redis authentication (requirepass) for existing hosts
+################################################################################
+
+fix_redis_auth() {
+    sre_header "Fix: Redis authentication (requirepass)"
+
+    local redis_conf=""
+    [[ -f /etc/redis/redis.conf ]] && redis_conf="/etc/redis/redis.conf"
+    [[ -f /etc/redis.conf ]] && redis_conf="/etc/redis.conf"
+    if [[ -z "$redis_conf" ]]; then
+        sre_error "No redis.conf found — is Redis installed?"
+        return 1
+    fi
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would set requirepass, update each project .env REDIS_PASSWORD,"
+        sre_info "[DRY-RUN] clear Laravel config caches, and restart supervisor workers"
+        return 0
+    fi
+
+    sre_warning "Between CONFIG SET and the .env updates, apps may see brief NOAUTH errors."
+    sre_warning "Run this in a low-traffic window. Rollback: redis-cli CONFIG SET requirepass \"\""
+    if ! prompt_yesno "Proceed with Redis auth hardening?" "yes"; then
+        sre_skipped "Redis auth"
+        return 0
+    fi
+
+    local redis_pass
+    if [[ -s /etc/sre-helpers/redis.pass ]]; then
+        redis_pass=$(cat /etc/sre-helpers/redis.pass)
+        sre_info "Reusing existing password from /etc/sre-helpers/redis.pass"
+    else
+        redis_pass=$(openssl rand -base64 32 | tr -d '/+=' | cut -c1-40)
+        touch /etc/sre-helpers/redis.pass
+        chmod 600 /etc/sre-helpers/redis.pass
+        printf '%s\n' "$redis_pass" > /etc/sre-helpers/redis.pass
+        sre_success "Password stored at /etc/sre-helpers/redis.pass (600)"
+    fi
+
+    backup_config "$redis_conf"
+    if grep -qE "^requirepass " "$redis_conf"; then
+        sed -i "s|^requirepass .*|requirepass ${redis_pass}|" "$redis_conf"
+    else
+        echo "requirepass ${redis_pass}" >> "$redis_conf"
+    fi
+    # Apply live so no restart (and no persistence flush) is needed
+    redis-cli CONFIG SET requirepass "$redis_pass" &>/dev/null         || redis-cli -a "$redis_pass" --no-auth-warning CONFIG SET requirepass "$redis_pass" &>/dev/null || true
+
+    if redis-cli -a "$redis_pass" --no-auth-warning ping 2>/dev/null | grep -q PONG; then
+        sre_success "Redis now requires authentication"
+    else
+        sre_error "Redis did not accept the new password — check manually"
+        return 1
+    fi
+
+    # Update every deployed project that has a Redis-using .env
+    local sf dom project_dir envf run_user
+    shopt -s nullglob
+    for sf in /etc/sre-helpers/deployments/*.conf; do
+        dom=$(basename "$sf" .conf)
+        project_dir="/var/www/${dom}"
+        for envf in "${project_dir}/current/.env" "${project_dir}/shared/.env" "${project_dir}/.env"; do
+            [[ -f "$envf" ]] || continue
+            if grep -qE "^REDIS_PASSWORD=" "$envf"; then
+                sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${redis_pass}|" "$envf"
+            else
+                printf 'REDIS_PASSWORD=%s\n' "$redis_pass" >> "$envf"
+            fi
+            sre_success "$envf updated"
+            # Clear Laravel config cache as the file owner
+            run_user=$(stat -c '%U' "$envf" 2>/dev/null || echo www-data)
+            if [[ -f "$(dirname "$envf")/artisan" ]]; then
+                ( cd "$(dirname "$envf")" && sudo -u "$run_user" php artisan config:clear &>/dev/null ) || true
+            fi
+            break
+        done
+    done
+    shopt -u nullglob
+
+    # Workers reconnect with the new password after restart
+    if command -v supervisorctl &>/dev/null; then
+        supervisorctl restart all &>/dev/null || true
+        sre_success "Supervisor workers restarted"
+    fi
+
+    sre_warning "Projects NOT deployed via sre-helpers must get REDIS_PASSWORD manually."
+    sre_info "Note: all projects still share one Redis password — per-project Redis ACL"
+    sre_info "users (with key prefixes) are a follow-up that requires a queue drain."
+}
+
 _run_fix_menu() {
     while true; do
         sre_header "Quick Fixes Menu"
@@ -1758,6 +1925,8 @@ _run_fix_menu() {
             "database-charset" \
             "locale-encoding" \
             "supervisor-queue-workers" \
+            "harden-state-opcache" \
+            "redis-auth" \
             "exit")
 
         case "$fix_choice" in
@@ -1772,6 +1941,8 @@ _run_fix_menu() {
             database-charset)          fix_db_charset ;;
             locale-encoding)           fix_locale ;;
             supervisor-queue-workers)  fix_supervisor ;;
+            harden-state-opcache)      fix_harden_state ;;
+            redis-auth)                fix_redis_auth ;;
             exit)
                 sre_info "Exiting fixes menu."
                 break

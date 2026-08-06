@@ -64,9 +64,13 @@ _deploy_state_file() {
 }
 
 deploy_save_state() {
-    mkdir -p "$DEPLOY_STATE_DIR"
+    # State files hold plaintext DB credentials — keep the whole tree root-only
+    install -d -m 700 /etc/sre-helpers
+    install -d -m 700 "$DEPLOY_STATE_DIR"
     local sf
     sf=$(_deploy_state_file "$DEPLOY_DOMAIN")
+    touch "$sf"
+    chmod 600 "$sf"
     cat > "$sf" <<STATE
 # Deployment state for ${DEPLOY_DOMAIN}
 # Saved on $(date '+%Y-%m-%d %H:%M:%S')
@@ -78,6 +82,7 @@ DEPLOY_MOODLEDATA_DIR="${DEPLOY_MOODLEDATA_DIR}"
 DEPLOY_DB_NAME="${DEPLOY_DB_NAME}"
 DEPLOY_DB_USER="${DEPLOY_DB_USER}"
 DEPLOY_DB_PASS="${DEPLOY_DB_PASS}"
+DEPLOY_OS_USER="${DEPLOY_OS_USER:-}"
 STATE
     sre_info "Deployment state saved to: $sf"
 }
@@ -240,6 +245,21 @@ sre_info "Branch: $DEPLOY_BRANCH"
 ################################################################################
 
 project_dir="/var/www/${DEPLOY_DOMAIN}"
+DEPLOY_OS_USER=$(iso_user_for "$DEPLOY_DOMAIN")
+
+# Run git as the project user with its per-project deploy key
+deploy_git() {
+    sudo -u "$DEPLOY_OS_USER" -H \
+        env GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
+        git "$@"
+}
+
+# Run a build command (composer/npm/artisan) as the project user in a directory
+deploy_as_user() {
+    local dir="$1"
+    shift
+    sudo -u "$DEPLOY_OS_USER" -H bash -c "cd \"$dir\" && $*"
+}
 
 case "$DEPLOY_TYPE" in
     laravel)
@@ -391,6 +411,30 @@ if ! prompt_yesno "Proceed with deployment?" "yes"; then
 fi
 
 ################################################################################
+# PROJECT ISOLATION — dedicated system user + per-project deploy key
+################################################################################
+
+sre_header "Project Isolation"
+
+if [[ "$SRE_DRY_RUN" != "true" ]]; then
+    iso_ensure_user "$DEPLOY_DOMAIN" "$project_dir"
+    sre_info "Project user: $DEPLOY_OS_USER"
+
+    if [[ "$DEPLOY_REPO_URL" == git@* || "$DEPLOY_REPO_URL" == ssh://* ]]; then
+        deploy_pubkey=$(iso_deploy_pubkey "$DEPLOY_DOMAIN" "$project_dir")
+        sre_info "Register this as a READ-ONLY deploy key on the repository:"
+        echo ""
+        echo "    ${deploy_pubkey}"
+        echo ""
+        if ! prompt_yesno "Deploy key registered on the repository?" "yes"; then
+            sre_warning "Continuing — git clone will fail until the key is registered"
+        fi
+    fi
+else
+    sre_info "[DRY-RUN] Would create project user $DEPLOY_OS_USER + deploy key"
+fi
+
+################################################################################
 # CREATE DIRECTORY STRUCTURE
 ################################################################################
 
@@ -416,8 +460,8 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             ;;
     esac
 
-    chown -R www-data:www-data "$project_dir"
-    sre_success "Directory structure ready: $project_dir"
+    chown -R "$DEPLOY_OS_USER:$DEPLOY_OS_USER" "$project_dir"
+    sre_success "Directory structure ready: $project_dir (owner $DEPLOY_OS_USER)"
 else
     sre_info "[DRY-RUN] Would create directory structure at $project_dir"
 fi
@@ -435,10 +479,10 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             # Clone into a timestamped release directory
             release_ts=$(date +%Y%m%d%H%M%S)
             release_dir="${project_dir}/releases/${release_ts}"
-            mkdir -p "$release_dir"
+            install -d -o "$DEPLOY_OS_USER" -g "$DEPLOY_OS_USER" "$release_dir"
 
             sre_info "Cloning into release: $release_dir"
-            git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
+            deploy_git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
             git_rc=${PIPESTATUS[0]:-$?}
 
             if [[ $git_rc -ne 0 ]]; then
@@ -471,15 +515,15 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             if [[ -d "${clone_target}/.git" ]]; then
                 if prompt_yesno "Git repo already exists at $clone_target. Pull latest instead of clone?" "yes"; then
                     cd "$clone_target"
-                    git fetch origin "$DEPLOY_BRANCH"
-                    git checkout "$DEPLOY_BRANCH"
-                    git pull origin "$DEPLOY_BRANCH" 2>&1 | tail -5
+                    deploy_git -C "$clone_target" fetch origin "$DEPLOY_BRANCH"
+                    deploy_git -C "$clone_target" checkout "$DEPLOY_BRANCH"
+                    deploy_git -C "$clone_target" pull origin "$DEPLOY_BRANCH" 2>&1 | tail -5
                     sre_success "Pulled latest from $DEPLOY_BRANCH"
                 else
                     sre_info "Removing existing repo and re-cloning..."
                     rm -rf "$clone_target"
                     mkdir -p "$clone_target"
-                    git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$clone_target" 2>&1 | tail -5
+                    deploy_git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$clone_target" 2>&1 | tail -5
                 fi
             else
                 # Clean clone
@@ -491,7 +535,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                     fi
                     rm -rf "${clone_target:?}"/*
                 fi
-                git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$clone_target" 2>&1 | tail -5
+                deploy_git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$clone_target" 2>&1 | tail -5
             fi
 
             git_rc=${PIPESTATUS[0]:-$?}
@@ -509,7 +553,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             mkdir -p "${project_dir}/releases"
 
             sre_info "Cloning into release: $release_dir"
-            git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
+            deploy_git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
             git_rc=${PIPESTATUS[0]:-$?}
 
             if [[ $git_rc -ne 0 ]]; then
@@ -530,7 +574,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             mkdir -p "${project_dir}/releases"
 
             sre_info "Cloning into release: $release_dir"
-            git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
+            deploy_git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
             git_rc=${PIPESTATUS[0]:-$?}
 
             if [[ $git_rc -ne 0 ]]; then
@@ -551,7 +595,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             mkdir -p "${project_dir}/releases"
 
             sre_info "Cloning into release: $release_dir"
-            git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
+            deploy_git clone --branch "$DEPLOY_BRANCH" --single-branch --depth 1 "$DEPLOY_REPO_URL" "$release_dir" 2>&1 | tail -5
             git_rc=${PIPESTATUS[0]:-$?}
 
             if [[ $git_rc -ne 0 ]]; then
@@ -567,7 +611,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             ;;
     esac
 
-    chown -R www-data:www-data "$project_dir"
+    chown -R "$DEPLOY_OS_USER:$DEPLOY_OS_USER" "$project_dir"
     sre_success "Git clone complete"
 else
     sre_info "[DRY-RUN] Would clone $DEPLOY_REPO_URL ($DEPLOY_BRANCH) into $clone_target"
@@ -583,22 +627,77 @@ if [[ "$needs_db" == "true" ]]; then
     if [[ "$SRE_DRY_RUN" != "true" ]]; then
         case "$db_engine" in
             mariadb|mysql)
-                db_root_pass=""
-                [[ -f /root/.db_root_password ]] && db_root_pass=$(cat /root/.db_root_password)
+                # Connection target (local socket vs remote server) comes from
+                # the dbconn library — see common/dbconn.sh and step 5.
+                mysql_cmd="$(db_admin_cmd)"
+                grant_host="$(db_grant_host)"
+                sre_info "Target: $(db_describe)"
 
-                mysql_cmd="mysql"
-                [[ -n "$db_root_pass" ]] && mysql_cmd="mysql -u root -p${db_root_pass}"
+                # Fail fast with real diagnostics. These statements used to be
+                # 2>/dev/null, which reported success even when nothing was
+                # created — unacceptable once the server can be unreachable.
+                db_check_connection quiet || {
+                    db_check_connection
+                    sre_error "Cannot create the database for $DEPLOY_DOMAIN."
+                    exit 1
+                }
 
-                $mysql_cmd -e "CREATE DATABASE IF NOT EXISTS \`${DEPLOY_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
+                db_err=$(mktemp)
+                if ! $mysql_cmd -e "CREATE DATABASE IF NOT EXISTS \`${DEPLOY_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>"$db_err"; then
+                    sre_error "Failed to create database: $DEPLOY_DB_NAME"
+                    [[ -s "$db_err" ]] && sed 's/^/    /' "$db_err" >&2
+                    rm -f "$db_err"
+                    exit 1
+                fi
                 sre_success "Database created: $DEPLOY_DB_NAME"
 
-                $mysql_cmd -e "CREATE USER IF NOT EXISTS '${DEPLOY_DB_USER}'@'localhost' IDENTIFIED BY '${DEPLOY_DB_PASS}';" 2>/dev/null
-                $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${DEPLOY_DB_NAME}\`.* TO '${DEPLOY_DB_USER}'@'localhost';" 2>/dev/null
-                $mysql_cmd -e "FLUSH PRIVILEGES;" 2>/dev/null
-                sre_success "Database user created: $DEPLOY_DB_USER"
+                if ! $mysql_cmd -e "CREATE USER IF NOT EXISTS '${DEPLOY_DB_USER}'@'${grant_host}' IDENTIFIED BY '${DEPLOY_DB_PASS}';" 2>"$db_err"; then
+                    sre_error "Failed to create database user: ${DEPLOY_DB_USER}@${grant_host}"
+                    [[ -s "$db_err" ]] && sed 's/^/    /' "$db_err" >&2
+                    rm -f "$db_err"
+                    exit 1
+                fi
+                # IF NOT EXISTS leaves a pre-existing user's password alone;
+                # ALTER guarantees the password matches what we write to .env.
+                $mysql_cmd -e "ALTER USER '${DEPLOY_DB_USER}'@'${grant_host}' IDENTIFIED BY '${DEPLOY_DB_PASS}';" 2>/dev/null || true
+
+                if ! $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`${DEPLOY_DB_NAME}\`.* TO '${DEPLOY_DB_USER}'@'${grant_host}';" 2>"$db_err"; then
+                    sre_error "Failed to grant privileges to ${DEPLOY_DB_USER}@${grant_host}"
+                    [[ -s "$db_err" ]] && sed 's/^/    /' "$db_err" >&2
+                    rm -f "$db_err"
+                    exit 1
+                fi
+                $mysql_cmd -e "FLUSH PRIVILEGES;" 2>/dev/null || true
+                rm -f "$db_err"
+                sre_success "Database user created: ${DEPLOY_DB_USER}@${grant_host}"
+
+                # Prove the app's own credentials work from here, rather than
+                # discovering it after the site 500s.
+                _app_cnf=$(mktemp); chmod 600 "$_app_cnf"
+                {
+                    printf '[client]\n'
+                    printf 'user=%s\n' "$DEPLOY_DB_USER"
+                    printf 'password=%s\n' "$DEPLOY_DB_PASS"
+                    printf 'host=%s\n' "$(db_client_host)"
+                    printf 'port=%s\n' "$(db_client_port)"
+                } > "$_app_cnf"
+                if mysql --defaults-extra-file="$_app_cnf" -e "USE \`${DEPLOY_DB_NAME}\`; SELECT 1;" >/dev/null 2>&1; then
+                    sre_success "Verified app login: ${DEPLOY_DB_USER}@$(db_client_host) → $DEPLOY_DB_NAME"
+                else
+                    sre_warning "Could not verify the app's DB login from this host."
+                    sre_warning "The database and user exist, but ${DEPLOY_DB_USER} could not"
+                    sre_warning "connect to $(db_client_host):$(db_client_port)."
+                    if db_is_remote; then
+                        sre_warning "Most likely the GRANT host '${grant_host}' does not cover this server."
+                    fi
+                fi
+                rm -f "$_app_cnf"
                 ;;
 
             postgresql)
+                # PostgreSQL admin here is local peer auth only.
+                db_require_local_pg || exit 1
+
                 sudo -u postgres psql -c "DO \$\$ BEGIN
                     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DEPLOY_DB_USER}') THEN
                         CREATE ROLE ${DEPLOY_DB_USER} WITH LOGIN PASSWORD '${DEPLOY_DB_PASS}';
@@ -646,14 +745,17 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                     sed -i "s|^DB_DATABASE=.*|DB_DATABASE=${DEPLOY_DB_NAME}|" "${local_root}/.env"
                     sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${DEPLOY_DB_USER}|" "${local_root}/.env"
                     sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DEPLOY_DB_PASS}|" "${local_root}/.env"
-                    sed -i "s|^DB_HOST=.*|DB_HOST=127.0.0.1|" "${local_root}/.env"
-                    sre_success "Updated .env with database credentials"
+                    sed -i "s|^DB_HOST=.*|DB_HOST=$(db_client_host)|" "${local_root}/.env"
+                    sed -i "s|^DB_PORT=.*|DB_PORT=$(db_client_port)|" "${local_root}/.env"
+                    sre_success "Updated .env with database credentials (host: $(db_client_host):$(db_client_port))"
                 fi
 
                 sed -i "s|^APP_URL=.*|APP_URL=http://${DEPLOY_DOMAIN}|" "${local_root}/.env"
                 sed -i "s|^APP_ENV=.*|APP_ENV=production|" "${local_root}/.env"
                 sed -i "s|^APP_DEBUG=.*|APP_DEBUG=false|" "${local_root}/.env"
-                sre_success ".env configured"
+                chown "$DEPLOY_OS_USER:$DEPLOY_OS_USER" "${local_root}/.env"
+                chmod 600 "${local_root}/.env"
+                sre_success ".env configured (600, owner $DEPLOY_OS_USER)"
             else
                 sre_skipped ".env setup"
             fi
@@ -667,6 +769,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 fi
                 mkdir -p "${storage_dir}"/{app/public,framework/{cache,sessions,views},logs}
                 mkdir -p "${local_root}/bootstrap/cache"
+                chown -R "$DEPLOY_OS_USER:$DEPLOY_OS_USER" "$storage_dir" "${local_root}/bootstrap/cache"
                 sre_success "Storage directories created"
             fi
 
@@ -674,7 +777,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             if command -v composer &>/dev/null; then
                 if prompt_yesno "Run composer install?" "yes"; then
                     sre_info "Running: composer install --no-dev --optimize-autoloader..."
-                    cd "$local_root" && composer install --no-dev --optimize-autoloader --no-interaction 2>&1 | tail -5
+                    deploy_as_user "$local_root" "composer install --no-dev --optimize-autoloader --no-interaction" 2>&1 | tail -5
                     sre_success "Composer dependencies installed"
                 else
                     sre_skipped "composer install"
@@ -686,7 +789,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             # APP_KEY
             if ! grep -q "^APP_KEY=base64:" "${local_root}/.env" 2>/dev/null; then
                 if prompt_yesno "Generate application key? (APP_KEY is missing)" "yes"; then
-                    cd "$local_root" && php artisan key:generate --no-interaction
+                    deploy_as_user "$local_root" "php artisan key:generate --no-interaction"
                     sre_success "Application key generated"
                 fi
             fi
@@ -695,7 +798,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             if [[ "$needs_db" == "true" ]]; then
                 if prompt_yesno "Run php artisan migrate?" "no"; then
                     sre_info "Running: php artisan migrate..."
-                    cd "$local_root" && php artisan migrate --force --no-interaction 2>&1 | tail -5
+                    deploy_as_user "$local_root" "php artisan migrate --force --no-interaction" 2>&1 | tail -5
                     sre_success "Database migrations complete"
                 else
                     sre_skipped "artisan migrate"
@@ -706,9 +809,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             if [[ -f "${local_root}/package.json" ]]; then
                 if prompt_yesno "Run npm install && npm run build?" "yes"; then
                     sre_info "Running: npm install..."
-                    cd "$local_root" && npm install 2>&1 | tail -3
+                    deploy_as_user "$local_root" "npm install" 2>&1 | tail -3
                     sre_info "Running: npm run build..."
-                    npm run build 2>&1 | tail -5
+                    deploy_as_user "$local_root" "npm run build" 2>&1 | tail -5
                     sre_success "Frontend assets built"
                 else
                     sre_skipped "npm install/build"
@@ -717,10 +820,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
 
             # Cache
             if prompt_yesno "Rebuild Laravel caches? (config, route, view)" "yes"; then
-                cd "$local_root"
-                php artisan config:cache --no-interaction 2>/dev/null || true
-                php artisan route:cache --no-interaction 2>/dev/null || true
-                php artisan view:cache --no-interaction 2>/dev/null || true
+                deploy_as_user "$local_root" "php artisan config:cache --no-interaction" 2>/dev/null || true
+                deploy_as_user "$local_root" "php artisan route:cache --no-interaction" 2>/dev/null || true
+                deploy_as_user "$local_root" "php artisan view:cache --no-interaction" 2>/dev/null || true
                 sre_success "Laravel caches rebuilt"
             else
                 sre_skipped "Cache rebuild"
@@ -728,7 +830,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
 
             # Storage link
             if prompt_yesno "Run php artisan storage:link?" "yes"; then
-                cd "$local_root" && php artisan storage:link --no-interaction 2>/dev/null || true
+                deploy_as_user "$local_root" "php artisan storage:link --no-interaction" 2>/dev/null || true
                 sre_success "Storage symlink created"
             else
                 sre_skipped "storage:link"
@@ -760,11 +862,17 @@ global \$CFG;
 
 \$CFG->dbtype    = '${moodle_dbtype}';
 \$CFG->dblibrary = 'native';
-\$CFG->dbhost    = 'localhost';
+\$CFG->dbhost    = '$(db_client_host_legacy)';
 \$CFG->dbname    = '${DEPLOY_DB_NAME}';
 \$CFG->dbuser    = '${DEPLOY_DB_USER}';
 \$CFG->dbpass    = '${DEPLOY_DB_PASS}';
 \$CFG->prefix    = '${moodle_prefix}';
+\$CFG->dboptions = array(
+    'dbpersist' => false,
+    'dbport'    => '$(db_client_port)',
+    'dbsocket'  => '',
+    'dbcollation' => 'utf8mb4_unicode_ci',
+);
 
 \$CFG->wwwroot   = 'http://${DEPLOY_DOMAIN}';
 \$CFG->dataroot  = '${DEPLOY_MOODLEDATA_DIR}';
@@ -786,18 +894,16 @@ MOODLE_CONFIG
             sre_info "Configuring Nuxt..."
             if [[ -f "${local_root}/package.json" ]]; then
                 if prompt_yesno "Run npm install?" "yes"; then
-                    cd "$local_root"
                     sre_info "Running: npm install..."
-                    npm install 2>&1 | tail -3
+                    deploy_as_user "$local_root" "npm install" 2>&1 | tail -3
                     sre_success "Node dependencies installed"
                 else
                     sre_skipped "npm install"
                 fi
 
                 if prompt_yesno "Run npm run build?" "yes"; then
-                    cd "$local_root"
                     sre_info "Running: npm run build..."
-                    npm run build 2>&1 | tail -5
+                    deploy_as_user "$local_root" "npm run build" 2>&1 | tail -5
                     sre_success "Nuxt built"
                 else
                     sre_skipped "npm run build"
@@ -805,23 +911,26 @@ MOODLE_CONFIG
 
                 if command -v pm2 &>/dev/null; then
                     if prompt_yesno "Start PM2 process?" "yes"; then
-                        pm2 delete "${DEPLOY_DOMAIN}" 2>/dev/null || true
+                        # PM2 runs a per-project daemon as the project user
+                        pm2_run() { sudo -u "$DEPLOY_OS_USER" -H pm2 "$@"; }
+                        pm2_run delete "${DEPLOY_DOMAIN}" 2>/dev/null || true
 
                         # Nuxt 3 builds to .output/server/index.mjs
                         if [[ -f "${local_root}/.output/server/index.mjs" ]]; then
-                            pm2 start "${local_root}/.output/server/index.mjs" \
+                            pm2_run start "${local_root}/.output/server/index.mjs" \
                                 --name "${DEPLOY_DOMAIN}" \
                                 --cwd "${local_root}"
                         elif [[ -f "${local_root}/.output/server/index.js" ]]; then
-                            pm2 start "${local_root}/.output/server/index.js" \
+                            pm2_run start "${local_root}/.output/server/index.js" \
                                 --name "${DEPLOY_DOMAIN}" \
                                 --cwd "${local_root}"
                         else
                             # Nuxt 2 / custom start script fallback
-                            pm2 start npm --name "${DEPLOY_DOMAIN}" --cwd "${local_root}" -- start
+                            pm2_run start npm --name "${DEPLOY_DOMAIN}" --cwd "${local_root}" -- start
                         fi
-                        pm2 save
-                        sre_success "PM2 process started: ${DEPLOY_DOMAIN}"
+                        pm2_run save
+                        pm2 startup systemd -u "$DEPLOY_OS_USER" --hp "$project_dir" 2>/dev/null | grep -v "^\[PM2\]" || true
+                        sre_success "PM2 process started: ${DEPLOY_DOMAIN} (user $DEPLOY_OS_USER)"
                     else
                         sre_skipped "PM2 start"
                     fi
@@ -833,11 +942,10 @@ MOODLE_CONFIG
             sre_info "Configuring Vue..."
             if [[ -f "${local_root}/package.json" ]]; then
                 if prompt_yesno "Run npm install && npm run build?" "yes"; then
-                    cd "$local_root"
                     sre_info "Running: npm install..."
-                    npm install 2>&1 | tail -3
+                    deploy_as_user "$local_root" "npm install" 2>&1 | tail -3
                     sre_info "Running: npm run build..."
-                    npm run build 2>&1 | tail -5
+                    deploy_as_user "$local_root" "npm run build" 2>&1 | tail -5
                     sre_success "Vue built to dist/"
                 else
                     sre_skipped "npm install/build"
@@ -895,7 +1003,12 @@ WP_HEADER
                 sed -i "s|define( *['\"]DB_NAME['\"] *,.*|define('DB_NAME', '${DEPLOY_DB_NAME}');|" "$wp_config"
                 sed -i "s|define( *['\"]DB_USER['\"] *,.*|define('DB_USER', '${DEPLOY_DB_USER}');|" "$wp_config"
                 sed -i "s|define( *['\"]DB_PASSWORD['\"] *,.*|define('DB_PASSWORD', '${DEPLOY_DB_PASS}');|" "$wp_config"
-                sed -i "s|define( *['\"]DB_HOST['\"] *,.*|define('DB_HOST', 'localhost');|" "$wp_config"
+                # WordPress takes host:port in a single DB_HOST constant.
+                _wp_db_host="$(db_client_host_legacy)"
+                if db_is_remote; then
+                    _wp_db_host="${_wp_db_host}:$(db_client_port)"
+                fi
+                sed -i "s|define( *['\"]DB_HOST['\"] *,.*|define('DB_HOST', '${_wp_db_host}');|" "$wp_config"
                 sed -i "s|define( *['\"]DB_CHARSET['\"] *,.*|define('DB_CHARSET', 'utf8mb4');|" "$wp_config"
 
                 # Table prefix
@@ -928,9 +1041,8 @@ WP_HEADER
             # If repo has a build script, optionally run it
             if [[ -f "${local_root}/package.json" ]]; then
                 if prompt_yesno "Found package.json — run npm install && npm run build?" "no"; then
-                    cd "$local_root"
-                    npm install 2>&1 | tail -3
-                    npm run build 2>&1 | tail -5
+                    deploy_as_user "$local_root" "npm install" 2>&1 | tail -3
+                    deploy_as_user "$local_root" "npm run build" 2>&1 | tail -5
                     sre_success "Static site built"
                 fi
             fi
@@ -962,115 +1074,15 @@ fi
 sre_header "Fix Permissions"
 
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
-
-    require_acl
-
-    # ── Base ownership ────────────────────────────────────────────────────────
-    sre_info "Setting ownership: www-data:www-data on $project_dir"
-    chown -R www-data:www-data "$project_dir"
-    sre_success "Ownership: www-data:www-data on $project_dir"
-
-    # Fix moodledata ownership (may be outside project_dir)
-    if [[ "$DEPLOY_TYPE" == "moodle" ]] && [[ -n "${DEPLOY_MOODLEDATA_DIR:-}" ]] \
-            && [[ -d "$DEPLOY_MOODLEDATA_DIR" ]] \
-            && [[ "$DEPLOY_MOODLEDATA_DIR" != "$project_dir"* ]]; then
-        sre_info "Fixing ownership on external moodledata: $DEPLOY_MOODLEDATA_DIR"
-        chown -R www-data:www-data "$DEPLOY_MOODLEDATA_DIR"
-        sre_success "Ownership: www-data:www-data on $DEPLOY_MOODLEDATA_DIR"
+    # Isolated scheme: owner p-<key>, dirs 750 / files 640, secrets 600,
+    # legacy www-data/root ACLs stripped. Web server reads via the project group.
+    if [[ "$DEPLOY_TYPE" == "moodle" ]]; then
+        iso_apply_perms "$DEPLOY_DOMAIN" "$project_dir" "$DEPLOY_TYPE" "${DEPLOY_MOODLEDATA_DIR:-}"
+    else
+        iso_apply_perms "$DEPLOY_DOMAIN" "$project_dir" "$DEPLOY_TYPE"
     fi
-
-    # ── Base permissions ──────────────────────────────────────────────────────
-    find "$project_dir" -type d -exec chmod 755 {} \;
-    find "$project_dir" -type f -exec chmod 644 {} \;
-    sre_success "Base: dirs=755, files=644"
-
-    # ── Default ACLs for inheritance ──────────────────────────────────────────
-    setfacl -R -m d:u:www-data:rwX "$project_dir"
-    setfacl -R -m u:www-data:rwX "$project_dir"
-    setfacl -R -m d:u:root:rwX "$project_dir"
-    setfacl -R -m u:root:rwX "$project_dir"
-    sre_success "Default ACL: www-data + root have rwX"
-
-    # ── Executable scripts / binaries ─────────────────────────────────────────
-    for pattern in "*.sh" "artisan"; do
-        find "$project_dir" -name "$pattern" -type f -exec chmod 755 {} \; 2>/dev/null || true
-    done
-    for bin_dir in "${local_root}/vendor/bin" "${local_root}/node_modules/.bin"; do
-        if [[ -d "$bin_dir" ]]; then
-            find "$bin_dir" -type f -exec chmod 755 {} \;
-        fi
-    done
-
-    # ── Project-type-specific ─────────────────────────────────────────────────
-    case "$DEPLOY_TYPE" in
-        laravel)
-            for wd in "${local_root}/storage" "${local_root}/bootstrap/cache"; do
-                if [[ -d "$wd" ]]; then
-                    chmod -R 775 "$wd"
-                    setfacl -R -m u:www-data:rwX "$wd"
-                    setfacl -R -m d:u:www-data:rwX "$wd"
-                    setfacl -R -m g:www-data:rwX "$wd"
-                    setfacl -R -m d:g:www-data:rwX "$wd"
-                fi
-            done
-            sre_success "Laravel: storage + bootstrap/cache → 775, ACL rwX"
-
-            if [[ -f "${local_root}/.env" ]]; then
-                chmod 640 "${local_root}/.env"
-                setfacl -m u:www-data:r-- "${local_root}/.env"
-                sre_success ".env: 640, www-data read-only"
-            fi
-
-            [[ -f "${local_root}/artisan" ]] && chmod 755 "${local_root}/artisan"
-            ;;
-
-        moodle)
-            if [[ -n "${DEPLOY_MOODLEDATA_DIR:-}" ]] && [[ -d "$DEPLOY_MOODLEDATA_DIR" ]]; then
-                chown -R www-data:www-data "$DEPLOY_MOODLEDATA_DIR"
-                chmod -R 775 "$DEPLOY_MOODLEDATA_DIR"
-                setfacl -R -m u:www-data:rwX "$DEPLOY_MOODLEDATA_DIR"
-                setfacl -R -m d:u:www-data:rwX "$DEPLOY_MOODLEDATA_DIR"
-                setfacl -R -m g:www-data:rwX "$DEPLOY_MOODLEDATA_DIR"
-                setfacl -R -m d:g:www-data:rwX "$DEPLOY_MOODLEDATA_DIR"
-
-                mount_point=$(df "$DEPLOY_MOODLEDATA_DIR" --output=target 2>/dev/null | tail -1)
-                if [[ -n "$mount_point" && "$mount_point" != "/" ]]; then
-                    if ! mount | grep "$mount_point" | grep -q "acl"; then
-                        sre_warning "Block storage at $mount_point may need 'acl' mount option in /etc/fstab"
-                    fi
-                fi
-
-                sre_success "Moodledata ($DEPLOY_MOODLEDATA_DIR): 775, ACL rwX"
-            fi
-
-            if [[ -f "${local_root}/config.php" ]]; then
-                chmod 640 "${local_root}/config.php"
-                setfacl -m u:www-data:r-- "${local_root}/config.php"
-                sre_success "config.php: 640, www-data read-only"
-            fi
-            ;;
-
-        wordpress)
-            # wp-content (uploads, plugins, themes) needs to be writable
-            if [[ -d "${local_root}/wp-content" ]]; then
-                chmod -R 775 "${local_root}/wp-content"
-                setfacl -R -m u:www-data:rwX "${local_root}/wp-content"
-                setfacl -R -m d:u:www-data:rwX "${local_root}/wp-content"
-                setfacl -R -m g:www-data:rwX "${local_root}/wp-content"
-                setfacl -R -m d:g:www-data:rwX "${local_root}/wp-content"
-                sre_success "WordPress: wp-content → 775, ACL rwX"
-            fi
-
-            # wp-config.php holds DB credentials — restrict
-            if [[ -f "${local_root}/wp-config.php" ]]; then
-                chmod 640 "${local_root}/wp-config.php"
-                setfacl -m u:www-data:r-- "${local_root}/wp-config.php"
-                sre_success "wp-config.php: 640, www-data read-only"
-            fi
-            ;;
-    esac
 else
-    sre_info "[DRY-RUN] Would fix permissions on $project_dir"
+    sre_info "[DRY-RUN] Would apply isolated permissions on $project_dir (owner $DEPLOY_OS_USER)"
 fi
 
 ################################################################################
@@ -1103,7 +1115,7 @@ process_name=%(program_name)s
 command=php ${project_dir}/current/artisan horizon
 autostart=true
 autorestart=true
-user=www-data
+user=${DEPLOY_OS_USER}
 redirect_stderr=true
 stdout_logfile=${project_dir}/current/storage/logs/horizon.log
 stopwaitsecs=3600
@@ -1116,7 +1128,7 @@ process_name=%(program_name)s_%(process_num)02d
 command=php ${project_dir}/current/artisan queue:work --sleep=3 --tries=${worker_tries} --timeout=${worker_timeout} --queue=${worker_queue}
 autostart=true
 autorestart=true
-user=www-data
+user=${DEPLOY_OS_USER}
 numprocs=${worker_processes}
 redirect_stderr=true
 stdout_logfile=${project_dir}/current/storage/logs/worker.log
@@ -1127,7 +1139,7 @@ WORKEREOF
 
             # Scheduler cron
             if prompt_yesno "Also setup Laravel scheduler cron?" "yes"; then
-                cron_line="* * * * * www-data cd ${project_dir}/current && php artisan schedule:run >> /dev/null 2>&1"
+                cron_line="* * * * * ${DEPLOY_OS_USER} cd ${project_dir}/current && php artisan schedule:run >> /dev/null 2>&1"
                 cron_file="/etc/cron.d/${DEPLOY_DOMAIN//\./-}-scheduler"
                 echo "$cron_line" > "$cron_file"
                 chmod 644 "$cron_file"
