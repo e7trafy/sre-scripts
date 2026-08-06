@@ -43,17 +43,25 @@ SRE_DB_ADMIN_PASS_FILE="${SRE_DB_ADMIN_PASS_FILE:-/etc/sre-helpers/db-admin.pass
 
 # Directory holding this run's credentials file.
 #
-# The path MUST be deterministic rather than mktemp-random: db_admin_cmd() is
-# almost always called inside a command substitution — `cmd="$(db_admin_cmd)"`
-# — which runs in a SUBSHELL. Any variable it sets is lost to the parent, so a
-# random path would be regenerated on every call, leaking a tmpdir each time
-# and (worse) returning a path the subshell's own EXIT trap had already
-# deleted. Keying on the top-level PID makes the path stable across subshells
-# and lets repeat calls reuse the same file.
+# Two constraints have to hold at once:
 #
-# $$ is the parent shell's PID even when evaluated inside a subshell, which is
-# exactly the property needed here.
-_SRE_DB_CNF_DIR="${TMPDIR:-/tmp}/.sre-dbconn-$$"
+#  1. The path must be STABLE across subshells. db_admin_cmd() is almost
+#     always called as `cmd="$(db_admin_cmd)"`, which runs in a subshell whose
+#     variable writes are discarded. If the path were computed per call, every
+#     call would leak a new directory and hand back a file the subshell had
+#     already cleaned up.
+#
+#  2. The path must be UNPREDICTABLE. A predictable name under a world-
+#     writable /tmp (mode 1777) lets a local user pre-plant it as a symlink;
+#     `mkdir -p` succeeds on an existing path and the subsequent write follows
+#     the link, handing them the remote DB admin password — and these scripts
+#     run as root. Keying on $$ is NOT sufficient: PIDs are guessable.
+#
+# Creating the directory once here, at source time, satisfies both: this runs
+# in the top-level shell (so the variable persists for every later subshell),
+# and mktemp -d gives an unguessable name created atomically with mode 700.
+_SRE_DB_CNF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/.sre-dbconn-XXXXXXXX")"
+chmod 700 "$_SRE_DB_CNF_DIR" 2>/dev/null || true
 _SRE_DB_CNF="${_SRE_DB_CNF_DIR}/client.cnf"
 
 ################################################################################
@@ -168,9 +176,22 @@ db_admin_pass_write() {
 # Command builders
 ################################################################################
 
+# Shred the credentials file and remove its directory. Registered as the EXIT
+# trap by lib.sh. Safe to call more than once.
+#
+# Pass "reusable" to re-establish a fresh unguessable directory afterwards, so
+# later db_admin_cmd() calls still work. Callers must never recreate the
+# directory themselves at a predictable path — see _SRE_DB_CNF_DIR above.
 db_cnf_cleanup() {
     [[ -f "$_SRE_DB_CNF" ]] && rm -f "$_SRE_DB_CNF"
-    [[ -d "$_SRE_DB_CNF_DIR" ]] && rmdir "$_SRE_DB_CNF_DIR" 2>/dev/null
+    if [[ -d "$_SRE_DB_CNF_DIR" && ! -L "$_SRE_DB_CNF_DIR" ]]; then
+        rmdir "$_SRE_DB_CNF_DIR" 2>/dev/null || true
+    fi
+    if [[ "${1:-}" == "reusable" && ! -d "$_SRE_DB_CNF_DIR" ]]; then
+        _SRE_DB_CNF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/.sre-dbconn-XXXXXXXX")" || return 0
+        chmod 700 "$_SRE_DB_CNF_DIR" 2>/dev/null || true
+        _SRE_DB_CNF="${_SRE_DB_CNF_DIR}/client.cnf"
+    fi
     return 0
 }
 
@@ -197,12 +218,18 @@ _db_ensure_cnf() {
         return 0
     fi
 
-    # Create the dir 0700 and the file 0600 BEFORE any secret is written, so
-    # the credentials are never briefly world-readable.
-    if [[ ! -d "$_SRE_DB_CNF_DIR" ]]; then
-        mkdir -p "$_SRE_DB_CNF_DIR" || return 1
+    # The directory was created (mode 700, unguessable name) at source time.
+    # Deliberately do NOT mkdir -p here: re-creating a missing directory would
+    # reintroduce the symlink race that the mktemp -d above exists to prevent.
+    if [[ ! -d "$_SRE_DB_CNF_DIR" || -L "$_SRE_DB_CNF_DIR" ]]; then
+        sre_error "Credentials directory is missing or not a real directory:"
+        sre_error "  $_SRE_DB_CNF_DIR"
+        sre_error "Refusing to write database credentials."
+        return 1
     fi
-    chmod 700 "$_SRE_DB_CNF_DIR"
+
+    # Create the file 0600 BEFORE any secret is written, so the credentials are
+    # never briefly world-readable.
     touch "$_SRE_DB_CNF"
     chmod 600 "$_SRE_DB_CNF"
     {
