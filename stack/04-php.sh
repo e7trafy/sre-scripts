@@ -350,13 +350,12 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         done
 
         if [[ -n "$_cfg_h" ]]; then
-            for _dep in raqm harfbuzz fribidi; do
-                _up=$(printf '%s' "$_dep" | tr '[:lower:]' '[:upper:]')
-                # An enabled delegate is "#define MAGICKCORE_RAQM_DELEGATE 1";
-                # a disabled one is left commented out by autoheader.
-                grep -qE "^[[:space:]]*#define[[:space:]]+MAGICKCORE_${_up}_DELEGATE[[:space:]]+1" \
-                    "$_cfg_h" 2>/dev/null || _im7_missing+=("$_dep")
-            done
+            # Only RAQM matters here. ImageMagick defines a delegate macro for
+            # raqm, but harfbuzz and fribidi are raqm's own dependencies — it
+            # does not define MAGICKCORE_HARFBUZZ_DELEGATE at all, so requiring
+            # them flags every good build as broken.
+            grep -qE "^[[:space:]]*#define[[:space:]]+MAGICKCORE_RAQM_DELEGATE[[:space:]]+1" \
+                "$_cfg_h" 2>/dev/null || _im7_missing+=("raqm")
         else
             sre_warning "  Could not locate config.h to verify delegates."
             sre_warning "  Skipping the pre-build check; the installed binary is"

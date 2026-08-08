@@ -938,19 +938,41 @@ sre_check_imagick_arabic() {
     features=$("$magick_bin" -version 2>/dev/null | grep -i '^Delegates' || true)
     [[ -z "$features" ]] && return 1
 
-    local missing=()
-    grep -qi 'raqm'     <<<"$features" || missing+=("raqm")
-    grep -qi 'harfbuzz' <<<"$features" || missing+=("harfbuzz")
-    grep -qi 'fribidi'  <<<"$features" || missing+=("fribidi")
-
-    if (( ${#missing[@]} > 0 )); then
-        sre_warning "ImageMagick is missing Arabic shaping delegates: ${missing[*]}"
+    # raqm is THE signal. ImageMagick lists it in Delegates; harfbuzz and
+    # fribidi are raqm's own hard dependencies, linked in transitively and
+    # deliberately NOT listed there. Requiring all three by name reports a
+    # perfectly good Arabic-capable build as broken — libraqm literally
+    # cannot be built without harfbuzz and fribidi.
+    if ! grep -qi 'raqm' <<<"$features"; then
+        sre_warning "ImageMagick has no 'raqm' delegate — Arabic text will render"
+        sre_warning "unshaped and in reverse order."
         sre_warning "  $features"
-        sre_warning "Arabic text will render unshaped/reversed. Recompile IM7 with:"
+        sre_warning "Recompile ImageMagick 7 with:"
         sre_warning "  --with-raqm=yes --with-harfbuzz=yes --with-fribidi=yes"
         return 1
     fi
-    sre_success "ImageMagick has Arabic shaping delegates (raqm, harfbuzz, fribidi)"
+
+    # Confirm harfbuzz/fribidi really are linked in, rather than trusting that
+    # raqm implies them. Checked against the binary, not the Delegates string.
+    local libs="" lib_warn=""
+    if command -v ldd &>/dev/null; then
+        local raqm_lib
+        raqm_lib=$(ldd "$(command -v "$magick_bin")" 2>/dev/null | awk '/libraqm/{print $3; exit}')
+        [[ -n "$raqm_lib" && -e "$raqm_lib" ]] && libs=$(ldd "$raqm_lib" 2>/dev/null || true)
+        if [[ -n "$libs" ]]; then
+            grep -qi 'libharfbuzz' <<<"$libs" || lib_warn+=" harfbuzz"
+            grep -qi 'libfribidi'  <<<"$libs" || lib_warn+=" fribidi"
+        fi
+    fi
+
+    if [[ -n "$lib_warn" ]]; then
+        sre_warning "raqm is present but not linked against:${lib_warn}"
+        sre_warning "Arabic shaping may still be incomplete."
+        return 1
+    fi
+
+    sre_success "ImageMagick has Arabic text shaping (raqm delegate present)"
+    [[ -n "$libs" ]] && sre_info "  raqm links harfbuzz and fribidi as expected"
     return 0
 }
 
