@@ -336,25 +336,50 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         # it just quietly builds without them, and Arabic text then renders
         # unshaped and reversed. Catch that here, before spending minutes on
         # make, rather than discovering it in a browser later.
-        # Read the FINAL column of configure's summary table, e.g.
-        #   RAQM            --with-raqm=yes         yes
-        # Matching "yes" anywhere on the line is wrong: it also matches the
-        # --with-raqm=yes flag name on a line whose result column says "no".
+        # Determine what configure actually enabled.
+        #
+        # Do NOT parse config.log: that is autoconf's raw trace, where every
+        # line starts with "configure:<lineno>:". The "RAQM ... yes" summary
+        # table is printed to stdout, not stored there. config.h is the
+        # authoritative record — configure writes MAGICKCORE_<DEP>_DELEGATE
+        # for each delegate it enabled.
         _im7_missing=()
-        for _dep in raqm harfbuzz fribidi; do
-            _val=$(awk -v d="$_dep" \
-                'toupper($1)==toupper(d) { print tolower($NF) }' config.log 2>/dev/null | tail -1)
-            [[ "$_val" == "yes" ]] || _im7_missing+=("$_dep")
+        _cfg_h=""
+        for _c in config.h magick/magick-baseconfig.h MagickCore/magick-baseconfig.h; do
+            [[ -f "$_c" ]] && { _cfg_h="$_c"; break; }
         done
+
+        if [[ -n "$_cfg_h" ]]; then
+            for _dep in raqm harfbuzz fribidi; do
+                _up=$(printf '%s' "$_dep" | tr '[:lower:]' '[:upper:]')
+                # An enabled delegate is "#define MAGICKCORE_RAQM_DELEGATE 1";
+                # a disabled one is left commented out by autoheader.
+                grep -qE "^[[:space:]]*#define[[:space:]]+MAGICKCORE_${_up}_DELEGATE[[:space:]]+1" \
+                    "$_cfg_h" 2>/dev/null || _im7_missing+=("$_dep")
+            done
+        else
+            sre_warning "  Could not locate config.h to verify delegates."
+            sre_warning "  Skipping the pre-build check; the installed binary is"
+            sre_warning "  verified after 'make install' regardless."
+        fi
         if (( ${#_im7_missing[@]} > 0 )); then
-            sre_warning "configure could not enable: ${_im7_missing[*]}"
+            sre_warning "configure did not enable: ${_im7_missing[*]}"
             sre_warning "Arabic text shaping needs all of raqm, harfbuzz and fribidi."
-            sre_warning "Install the -dev/-devel packages and re-run step 4."
-            if ! prompt_yesno "Continue building anyway (Arabic shaping may not work)?" "no"; then
+            sre_warning "Checked: ${_cfg_h}"
+            sre_warning ""
+            sre_warning "The delegates are verified again on the built binary after"
+            sre_warning "'make install', which is the definitive check — so continuing"
+            sre_warning "is reasonable; you will get a clear result either way."
+            # Default to continuing: this is a pre-build heuristic, and the
+            # post-install delegate check is authoritative. Defaulting to abort
+            # would throw away a good build on a false negative.
+            if ! prompt_yesno "Continue building?" "yes"; then
                 sre_error "Aborting ImageMagick 7 build at user request."
                 cd /; rm -rf "$im7_build_dir"
                 exit 1
             fi
+        else
+            sre_success "configure enabled raqm, harfbuzz and fribidi"
         fi
 
         make -j"$(nproc)"
