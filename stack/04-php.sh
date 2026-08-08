@@ -269,6 +269,10 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
     # Rebuild PHP imagick extension against ImageMagick 7 (all installed versions)
     sre_info "Rebuilding PHP imagick extension for ImageMagick 7..."
 
+    # Track per-version failures so the summary reflects reality. Declared
+    # before the loop because set -u would abort on an unset array below.
+    _imagick_failed=()
+
     for _php_ver in "${all_php_versions[@]}"; do
         sre_info "  Building imagick for PHP ${_php_ver}..."
 
@@ -278,30 +282,55 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             rhel)   dnf remove -y php-imagick 2>/dev/null || true ;;
         esac
 
-        # Install dev package and build from PECL
+        # Install build deps. The ImageMagick headers are required, not just
+        # php-dev — without them the build fails on "Cannot find MagickWand.h".
+        # Here IM7 was just compiled to /usr/local, so its headers are present.
         case "$SRE_OS_FAMILY" in
             debian)
-                pkg_install "php${_php_ver}-dev" 2>/dev/null || true
-                # Use version-specific pecl/phpize
-                printf "\n" | "/usr/bin/pecl${_php_ver}" install imagick 2>/dev/null \
-                    || printf "\n" | pecl install imagick 2>/dev/null || true
+                pkg_install "php${_php_ver}-dev" || pkg_install php-dev || true
+                pkg_install pkg-config make gcc || true
+                ;;
+            rhel)
+                pkg_install php-devel || true
+                pkg_install pkgconfig make gcc || true
+                ;;
+        esac
 
+        if ! sre_pecl_install_imagick "$_php_ver"; then
+            sre_error "  imagick build FAILED for PHP ${_php_ver}"
+            sre_error "  Not writing imagick.ini — a stale extension= line makes"
+            sre_error "  every PHP request emit a startup warning."
+            _imagick_failed+=("$_php_ver")
+            continue
+        fi
+
+        case "$SRE_OS_FAMILY" in
+            debian)
                 im_ini_dir="/etc/php/${_php_ver}/mods-available"
                 mkdir -p "$im_ini_dir"
                 echo "extension=imagick.so" > "${im_ini_dir}/imagick.ini"
                 phpenmod -v "$_php_ver" imagick 2>/dev/null || true
                 ;;
             rhel)
-                pkg_install php-devel 2>/dev/null || true
-                printf "\n" | pecl install imagick 2>/dev/null || true
                 echo "extension=imagick.so" > "/etc/php.d/imagick.ini"
                 ;;
         esac
 
-        sre_success "  imagick built for PHP ${_php_ver}"
+        if sre_verify_imagick "$_php_ver"; then
+            sre_success "  imagick built and loaded for PHP ${_php_ver}"
+        else
+            sre_warning "  imagick built for PHP ${_php_ver} but does not load in CLI yet"
+            sre_warning "  (usually fine if PHP-FPM has not been restarted; verify after)"
+        fi
     done
 
-    sre_success "PHP imagick extension rebuilt for ImageMagick 7"
+    if (( ${#_imagick_failed[@]} > 0 )); then
+        sre_error "PHP imagick could NOT be built for: ${_imagick_failed[*]}"
+        sre_error "Arabic text rendering will not work for those versions."
+        sre_error "Retry later with: sudo bash fixes/12-fixes.sh  → imagick-arabic"
+    else
+        sre_success "PHP imagick extension rebuilt for ImageMagick 7"
+    fi
 
     # Configure ImageMagick policy for Arabic text rendering
     im_policy_path=""
@@ -400,6 +429,18 @@ _apply_php_ini_settings() {
     # Disable dangerous functions — keep exec/proc_open/popen for Laravel, Composer, Horizon
     sed -i 's/^[;]*\s*disable_functions\s*=.*/disable_functions = passthru,shell_exec,system/' "$ini_file"
 
+    # Opcache must respect filesystem permissions on cache hits — all FPM pools
+    # share one opcache SHM, so without this a per-project pool could read
+    # another project's cached scripts (required for the isolation model)
+    local _oc
+    for _oc in opcache.validate_permission opcache.validate_root; do
+        if grep -qE "^[;[:space:]]*${_oc}[[:space:]]*=" "$ini_file"; then
+            sed -i "s/^[;[:space:]]*${_oc}[[:space:]]*=.*/${_oc} = 1/" "$ini_file"
+        else
+            echo "${_oc} = 1" >> "$ini_file"
+        fi
+    done
+
     # Upload and memory limits
     sed -i 's/^[;]*\s*upload_max_filesize\s*=.*/upload_max_filesize = 256M/' "$ini_file"
     sed -i 's/^[;]*\s*post_max_size\s*=.*/post_max_size = 256M/' "$ini_file"
@@ -420,6 +461,8 @@ else
     sre_info "[DRY-RUN] Would configure php.ini files: ${php_ini_files[*]}"
     sre_info "  expose_php = Off"
     sre_info "  disable_functions = passthru,shell_exec,system"
+    sre_info "  opcache.validate_permission = 1"
+    sre_info "  opcache.validate_root = 1"
     sre_info "  upload_max_filesize = 256M"
     sre_info "  post_max_size = 256M"
     sre_info "  memory_limit = 1024M"

@@ -756,6 +756,90 @@ require_acl() {
     return 0
 }
 
+################################################################################
+# PECL imagick installation
+#
+# `pecl install imagick` alone is unreliable: the maintainers have not marked a
+# release "stable" on pecl.php.net for years, and PECL refuses to install an
+# unstable release implicitly. On such a host the command fails with:
+#
+#   No releases available for package "pecl.php.net/imagick"
+#
+# even though the package exists. The fix is to name a version explicitly (or
+# request the beta channel), so we try progressively more specific forms.
+#
+# Prints the built extension path on success. Returns non-zero on failure, with
+# the real PECL output shown — callers must NOT assume success.
+################################################################################
+
+sre_pecl_install_imagick() {
+    local php_ver="$1"
+    local pecl_bin="pecl"
+    # Debian's php<ver>-dev ships a version-specific pecl; prefer it so the
+    # extension is built against the intended PHP, not just the default one.
+    [[ -x "/usr/bin/pecl${php_ver}" ]] && pecl_bin="/usr/bin/pecl${php_ver}"
+
+    local out rc
+    # Order matters: a plain `imagick` succeeds on hosts that do have a stable
+    # release, and avoids pinning those to an older version unnecessarily.
+    local -a candidates=("imagick" "imagick-beta" "imagick-3.7.0" "imagick-3.8.0")
+
+    local spec
+    for spec in "${candidates[@]}"; do
+        sre_info "  Trying: ${pecl_bin} install ${spec}"
+        # `printf "\n"` accepts the "use default" answer for imagick's single
+        # configure prompt. 2>&1 so failures are diagnosable, not hidden.
+        out=$(printf "\n" | "$pecl_bin" install "$spec" 2>&1)
+        rc=$?
+
+        if [[ $rc -eq 0 ]]; then
+            sre_success "  imagick built via '${spec}'"
+            return 0
+        fi
+
+        # Already installed is a success for our purposes; PECL exits non-zero.
+        if grep -qi "already installed" <<<"$out"; then
+            sre_info "  imagick already installed; forcing a rebuild"
+            out=$(printf "\n" | "$pecl_bin" install --force "$spec" 2>&1)
+            rc=$?
+            if [[ $rc -eq 0 ]]; then
+                sre_success "  imagick rebuilt via '${spec}'"
+                return 0
+            fi
+        fi
+
+        # Only keep trying if this looks like the "no stable release" problem.
+        # Any other failure (missing headers, compile error) will not be fixed
+        # by naming a different version, so stop and report it.
+        if ! grep -qiE "No releases available|requires PEAR|is not valid" <<<"$out"; then
+            sre_error "  PECL build failed for '${spec}':"
+            sed 's/^/    /' <<<"$out" | tail -25 >&2
+            return 1
+        fi
+    done
+
+    sre_error "  Could not install imagick via PECL. Last output:"
+    sed 's/^/    /' <<<"$out" | tail -25 >&2
+    return 1
+}
+
+# Verify the imagick extension actually loads for a given PHP version, and
+# report which ImageMagick it linked against. Returns non-zero if not loaded.
+sre_verify_imagick() {
+    local php_ver="$1"
+    local php_bin="php"
+    [[ -x "/usr/bin/php${php_ver}" ]] && php_bin="/usr/bin/php${php_ver}"
+
+    if ! "$php_bin" -m 2>/dev/null | grep -qi '^imagick$'; then
+        return 1
+    fi
+
+    local im_ver
+    im_ver=$("$php_bin" -r 'if (class_exists("Imagick")) { $v = Imagick::getVersion(); echo $v["versionString"] ?? ""; }' 2>/dev/null)
+    [[ -n "$im_ver" ]] && sre_info "  Linked against: $im_ver"
+    return 0
+}
+
 # Helper: check if a port is in use
 port_in_use() {
     local port="$1"

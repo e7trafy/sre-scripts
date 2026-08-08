@@ -489,8 +489,39 @@ fix_imagick() {
 
                 if prompt_yesno "Install/rebuild imagick extension via PECL?" "yes"; then
                     if [[ "$SRE_DRY_RUN" != "true" ]]; then
-                        pkg_install "php${php_ver}-dev" 2>/dev/null || pkg_install php-devel
-                        printf "\n" | pecl install imagick 2>/dev/null || true
+                        # Build deps. imagick needs the ImageMagick headers, not
+                        # just php-dev — without them the build fails with a
+                        # confusing "Cannot find MagickWand.h".
+                        case "$SRE_OS_FAMILY" in
+                            debian)
+                                pkg_install "php${php_ver}-dev" || pkg_install php-dev || true
+                                pkg_install libmagickwand-dev || true
+                                pkg_install pkg-config make gcc || true
+                                ;;
+                            rhel)
+                                pkg_install php-devel || true
+                                pkg_install ImageMagick-devel || true
+                                pkg_install pkgconfig make gcc || true
+                                ;;
+                        esac
+
+                        if ! sre_pecl_install_imagick "$php_ver"; then
+                            sre_error "imagick installation FAILED — extension not installed."
+                            sre_error ""
+                            sre_error "Deliberately not writing imagick.ini: pointing PHP at an"
+                            sre_error "extension that was never built makes every request log a"
+                            sre_error "startup warning."
+                            sre_error ""
+                            sre_error "Most common cause: no release is marked 'stable' on PECL,"
+                            sre_error "so a bare 'pecl install imagick' finds nothing. Try:"
+                            sre_error "  sudo pecl install imagick-3.7.0"
+                            sre_error "Or use the distro package instead (links to ImageMagick 6):"
+                            case "$SRE_OS_FAMILY" in
+                                debian) sre_error "  sudo apt-get install php${php_ver}-imagick" ;;
+                                rhel)   sre_error "  sudo dnf install php-imagick" ;;
+                            esac
+                            return 1
+                        fi
 
                         local ini_dir=""
                         case "$SRE_OS_FAMILY" in
@@ -507,7 +538,17 @@ fix_imagick() {
                         fi
 
                         svc_restart "$(get_phpfpm_svc "$php_ver")"
-                        sre_success "imagick extension installed and PHP-FPM restarted"
+
+                        # Confirm it actually loads — the whole point of this fix.
+                        if sre_verify_imagick "$php_ver"; then
+                            sre_success "imagick extension installed, loaded, and PHP-FPM restarted"
+                        else
+                            sre_error "imagick was built but does NOT load in PHP ${php_ver}."
+                            sre_error "Check for an ABI mismatch (built against a different PHP):"
+                            sre_error "  php${php_ver} -m | grep -i imagick"
+                            sre_error "  php${php_ver} -i | grep -i 'extension_dir'"
+                            return 1
+                        fi
                     fi
                 fi
             fi
