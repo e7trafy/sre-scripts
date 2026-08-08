@@ -772,9 +772,42 @@ require_acl() {
 # the real PECL output shown — callers must NOT assume success.
 ################################################################################
 
+# Locate a source-built ImageMagick 7 (step 4 installs it to /usr/local).
+# Prints its prefix and returns 0 when found; returns 1 otherwise.
+sre_im7_prefix() {
+    local p
+    for p in /usr/local /opt/imagemagick7; do
+        # A source install is identified by its MagickWand pkg-config file
+        # reporting major version 7.
+        if [[ -f "${p}/lib/pkgconfig/MagickWand.pc" ]]; then
+            if grep -qE '^Version:[[:space:]]*7\.' "${p}/lib/pkgconfig/MagickWand.pc"; then
+                printf '%s' "$p"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
 sre_pecl_install_imagick() {
     local php_ver="$1"
     local pecl_bin="pecl"
+
+    # Pin the build to a source-installed ImageMagick 7 when one exists.
+    #
+    # Without this, pkg-config searches its default path first and a distro
+    # IM6 (/usr/lib/.../MagickWand.pc, pulled in by libmagickwand-dev) wins
+    # over the IM7 in /usr/local. The extension then compiles and loads fine
+    # but is linked against ImageMagick 6 — silently losing the
+    # raqm/harfbuzz/fribidi text shaping that Arabic rendering depends on.
+    local im7
+    if im7="$(sre_im7_prefix)"; then
+        export PKG_CONFIG_PATH="${im7}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+        export LD_LIBRARY_PATH="${im7}/lib:${LD_LIBRARY_PATH:-}"
+        # Make the IM7 binaries (magick, MagickWand-config) win on PATH too.
+        export PATH="${im7}/bin:${PATH}"
+        sre_info "  Pinning build to ImageMagick 7 at ${im7}"
+    fi
     # Debian's php<ver>-dev ships a version-specific pecl; prefer it so the
     # extension is built against the intended PHP, not just the default one.
     [[ -x "/usr/bin/pecl${php_ver}" ]] && pecl_bin="/usr/bin/pecl${php_ver}"
@@ -823,8 +856,12 @@ sre_pecl_install_imagick() {
     return 1
 }
 
-# Verify the imagick extension actually loads for a given PHP version, and
-# report which ImageMagick it linked against. Returns non-zero if not loaded.
+# Verify the imagick extension loads for a given PHP version and report which
+# ImageMagick it linked against. Returns non-zero if not loaded.
+#
+# Also warns when the extension loaded but linked against ImageMagick 6 while a
+# source-built IM7 is present — that combination means Arabic text shaping is
+# broken even though everything "works", which is otherwise very hard to spot.
 sre_verify_imagick() {
     local php_ver="$1"
     local php_bin="php"
@@ -836,7 +873,44 @@ sre_verify_imagick() {
 
     local im_ver
     im_ver=$("$php_bin" -r 'if (class_exists("Imagick")) { $v = Imagick::getVersion(); echo $v["versionString"] ?? ""; }' 2>/dev/null)
-    [[ -n "$im_ver" ]] && sre_info "  Linked against: $im_ver"
+    if [[ -n "$im_ver" ]]; then
+        sre_info "  Linked against: $im_ver"
+        if [[ "$im_ver" == *"ImageMagick 6"* ]] && sre_im7_prefix >/dev/null; then
+            sre_warning "  imagick is linked against ImageMagick 6, but ImageMagick 7"
+            sre_warning "  is installed at $(sre_im7_prefix). Arabic text shaping"
+            sre_warning "  (raqm/harfbuzz/fribidi) will NOT work through PHP."
+            sre_warning "  Rebuild with the IM7 headers first on PKG_CONFIG_PATH."
+        fi
+    fi
+    return 0
+}
+
+# Report whether ImageMagick 7 was built with the Arabic text-shaping stack.
+# Informational: prints a warning when the delegates are missing.
+sre_check_imagick_arabic() {
+    local magick_bin="magick"
+    local im7
+    im7="$(sre_im7_prefix 2>/dev/null || true)"
+    [[ -n "$im7" && -x "${im7}/bin/magick" ]] && magick_bin="${im7}/bin/magick"
+    command -v "$magick_bin" &>/dev/null || return 1
+
+    local features
+    features=$("$magick_bin" -version 2>/dev/null | grep -i '^Delegates' || true)
+    [[ -z "$features" ]] && return 1
+
+    local missing=()
+    grep -qi 'raqm'     <<<"$features" || missing+=("raqm")
+    grep -qi 'harfbuzz' <<<"$features" || missing+=("harfbuzz")
+    grep -qi 'fribidi'  <<<"$features" || missing+=("fribidi")
+
+    if (( ${#missing[@]} > 0 )); then
+        sre_warning "ImageMagick is missing Arabic shaping delegates: ${missing[*]}"
+        sre_warning "  $features"
+        sre_warning "Arabic text will render unshaped/reversed. Recompile IM7 with:"
+        sre_warning "  --with-raqm=yes --with-harfbuzz=yes --with-fribidi=yes"
+        return 1
+    fi
+    sre_success "ImageMagick has Arabic shaping delegates (raqm, harfbuzz, fribidi)"
     return 0
 }
 

@@ -251,13 +251,43 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             --with-xml=yes \
             --with-lcms=yes
 
+        # configure SUCCEEDS even when raqm/harfbuzz/fribidi are unavailable —
+        # it just quietly builds without them, and Arabic text then renders
+        # unshaped and reversed. Catch that here, before spending minutes on
+        # make, rather than discovering it in a browser later.
+        # Read the FINAL column of configure's summary table, e.g.
+        #   RAQM            --with-raqm=yes         yes
+        # Matching "yes" anywhere on the line is wrong: it also matches the
+        # --with-raqm=yes flag name on a line whose result column says "no".
+        _im7_missing=()
+        for _dep in raqm harfbuzz fribidi; do
+            _val=$(awk -v d="$_dep" \
+                'toupper($1)==toupper(d) { print tolower($NF) }' config.log 2>/dev/null | tail -1)
+            [[ "$_val" == "yes" ]] || _im7_missing+=("$_dep")
+        done
+        if (( ${#_im7_missing[@]} > 0 )); then
+            sre_warning "configure could not enable: ${_im7_missing[*]}"
+            sre_warning "Arabic text shaping needs all of raqm, harfbuzz and fribidi."
+            sre_warning "Install the -dev/-devel packages and re-run step 4."
+            if ! prompt_yesno "Continue building anyway (Arabic shaping may not work)?" "no"; then
+                sre_error "Aborting ImageMagick 7 build at user request."
+                cd /; rm -rf "$im7_build_dir"
+                exit 1
+            fi
+        fi
+
         make -j"$(nproc)"
         make install
         ldconfig
 
-        # Verify installation
-        if magick --version 2>/dev/null | grep -q "ImageMagick 7"; then
+        # Verify installation. Use the freshly installed binary explicitly:
+        # a stale IM6 `convert` may still be first on PATH in this shell.
+        _im7_magick="/usr/local/bin/magick"
+        [[ -x "$_im7_magick" ]] || _im7_magick="magick"
+        if "$_im7_magick" --version 2>/dev/null | grep -q "ImageMagick 7"; then
             sre_success "ImageMagick 7 compiled and installed"
+            # Confirm the Arabic delegates actually made it into the binary.
+            sre_check_imagick_arabic || true
         else
             sre_error "ImageMagick 7 installation may have failed — check manually"
         fi

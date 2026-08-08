@@ -489,21 +489,40 @@ fix_imagick() {
 
                 if prompt_yesno "Install/rebuild imagick extension via PECL?" "yes"; then
                     if [[ "$SRE_DRY_RUN" != "true" ]]; then
-                        # Build deps. imagick needs the ImageMagick headers, not
-                        # just php-dev — without them the build fails with a
-                        # confusing "Cannot find MagickWand.h".
+                        # Build deps. imagick needs ImageMagick headers, not just
+                        # php-dev — without them the build fails on
+                        # "Cannot find MagickWand.h".
+                        #
+                        # Deliberately do NOT install libmagickwand-dev /
+                        # ImageMagick-devel here: those are the ImageMagick *6*
+                        # headers. If step 4 compiled ImageMagick 7 from source
+                        # for Arabic text shaping, pulling in IM6 headers makes
+                        # pkg-config resolve to 6.x and the extension silently
+                        # links against IM6 — losing raqm/harfbuzz/fribidi while
+                        # still reporting success. Only fall back to the distro
+                        # headers when no source-built IM7 is present.
                         case "$SRE_OS_FAMILY" in
                             debian)
                                 pkg_install "php${php_ver}-dev" || pkg_install php-dev || true
-                                pkg_install libmagickwand-dev || true
                                 pkg_install pkg-config make gcc || true
                                 ;;
                             rhel)
                                 pkg_install php-devel || true
-                                pkg_install ImageMagick-devel || true
                                 pkg_install pkgconfig make gcc || true
                                 ;;
                         esac
+
+                        if sre_im7_prefix >/dev/null; then
+                            sre_info "Building against source-installed ImageMagick 7 ($(sre_im7_prefix))"
+                        else
+                            sre_warning "No source-built ImageMagick 7 found — installing distro headers."
+                            sre_warning "Arabic text shaping needs IM7 with raqm/harfbuzz/fribidi;"
+                            sre_warning "run step 4 (PHP) to compile it if Arabic rendering matters."
+                            case "$SRE_OS_FAMILY" in
+                                debian) pkg_install libmagickwand-dev || true ;;
+                                rhel)   pkg_install ImageMagick-devel || true ;;
+                            esac
+                        fi
 
                         if ! sre_pecl_install_imagick "$php_ver"; then
                             sre_error "imagick installation FAILED — extension not installed."
