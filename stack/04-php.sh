@@ -462,7 +462,18 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 im_ini_dir="/etc/php/${_php_ver}/mods-available"
                 mkdir -p "$im_ini_dir"
                 echo "extension=imagick.so" > "${im_ini_dir}/imagick.ini"
-                phpenmod -v "$_php_ver" imagick 2>/dev/null || true
+                # phpenmod symlinks mods-available/imagick.ini into the cli/
+                # and fpm/ conf.d dirs. If it is missing or fails, the .ini
+                # exists but is never read — the extension silently stays
+                # unloaded. Fall back to creating the symlinks directly.
+                if ! phpenmod -v "$_php_ver" imagick 2>/dev/null; then
+                    sre_warning "  phpenmod failed — linking conf.d entries manually"
+                    for _sapi in cli fpm apache2; do
+                        _cd="/etc/php/${_php_ver}/${_sapi}/conf.d"
+                        [[ -d "$_cd" ]] || continue
+                        ln -sf "../../mods-available/imagick.ini" "${_cd}/20-imagick.ini"
+                    done
+                fi
                 ;;
             rhel)
                 echo "extension=imagick.so" > "/etc/php.d/imagick.ini"
@@ -476,10 +487,21 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             sre_success "  imagick built and loaded for PHP ${_php_ver}"
         else
             sre_error "  imagick does NOT load for PHP ${_php_ver} despite building."
-            sre_error "  Usual cause: built against a different PHP, so the .so"
-            sre_error "  landed in another extension_dir. Compare:"
-            sre_error "    php${_php_ver} -i | grep '^extension_dir'"
-            sre_error "    ls -l \$(php${_php_ver} -r 'echo ini_get(\"extension_dir\");')/imagick.so"
+            # Distinguish the two causes instead of leaving it to guesswork:
+            # the .so in the wrong place, versus the .ini never being read.
+            _ed=$(/usr/bin/php-config${_php_ver} --extension-dir 2>/dev/null \
+                  || php-config --extension-dir 2>/dev/null || true)
+            if [[ -n "$_ed" && -f "${_ed}/imagick.so" ]]; then
+                sre_error "  imagick.so IS present at ${_ed}/imagick.so"
+                sre_error "  so the .ini is not being read. Check:"
+                sre_error "    php${_php_ver} --ini | head -3"
+                sre_error "    ls -l /etc/php/${_php_ver}/cli/conf.d/ | grep imagick"
+            else
+                sre_error "  imagick.so was NOT found in ${_ed:-<unknown extension_dir>}"
+                sre_error "  The build did not produce a usable extension. Find it with:"
+                sre_error "    find / -name imagick.so 2>/dev/null"
+                sre_error "  If it exists elsewhere, it was built for a different PHP."
+            fi
             _imagick_failed+=("$_php_ver")
         fi
     done
