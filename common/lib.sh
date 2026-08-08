@@ -789,9 +789,49 @@ sre_im7_prefix() {
     return 1
 }
 
+# Remove an imagick.ini that points at a .so which does not exist.
+#
+# This matters because `pecl` is itself a PHP script: a dangling
+# "extension=imagick.so" makes EVERY pecl invocation start with
+#   PHP Warning: Unable to load dynamic library 'imagick.so'
+# which pollutes the output and, on some setups, is enough to break the
+# install. Earlier versions of these scripts wrote imagick.ini
+# unconditionally even when the build had failed, so such leftovers exist
+# in the wild.
+sre_clear_broken_imagick_ini() {
+    local php_ver="$1"
+    local ext_dir so_path removed=0
+
+    local php_bin="php"
+    [[ -x "/usr/bin/php${php_ver}" ]] && php_bin="/usr/bin/php${php_ver}"
+    ext_dir=$("$php_bin" -r 'echo ini_get("extension_dir");' 2>/dev/null)
+    so_path="${ext_dir%/}/imagick.so"
+
+    # If the .so genuinely exists there is nothing to clean up.
+    [[ -n "$ext_dir" && -f "$so_path" ]] && return 0
+
+    local f
+    for f in "/etc/php/${php_ver}/mods-available/imagick.ini" \
+             "/etc/php/${php_ver}/cli/conf.d/"*imagick.ini \
+             "/etc/php/${php_ver}/fpm/conf.d/"*imagick.ini \
+             /etc/php.d/*imagick.ini; do
+        [[ -e "$f" ]] || continue
+        rm -f "$f" && removed=1
+    done
+
+    if (( removed )); then
+        sre_warning "  Removed a stale imagick.ini (pointed at a missing imagick.so)."
+        sre_warning "  It was making every PHP/pecl invocation emit a startup warning."
+    fi
+    return 0
+}
+
 sre_pecl_install_imagick() {
     local php_ver="$1"
     local pecl_bin="pecl"
+
+    # Do this first: a dangling extension=imagick.so breaks pecl's own startup.
+    sre_clear_broken_imagick_ini "$php_ver"
 
     # Pin the build to a source-installed ImageMagick 7 when one exists.
     #

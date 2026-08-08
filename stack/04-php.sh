@@ -22,6 +22,9 @@ Step 4: PHP Installation
 Prerequisites: Step 1 (base-setup) and Step 3 (web-server) must be complete.
 
 Options:
+  --force-imagick   Recompile ImageMagick 7 and rebuild the PHP imagick
+                    extension even if they already look installed. Use when
+                    Arabic text renders unshaped/reversed.
   --dry-run   Print planned actions without executing
   --yes       Accept defaults without prompting
   --config    Override config file path
@@ -31,8 +34,21 @@ Options:
 Example:
   sudo bash $0
   sudo bash $0 --yes --dry-run
+  sudo bash $0 --force-imagick        # rebuild IM7 with Arabic shaping
 EOF
 }
+
+# Consumed before the common parser, which would treat it as an unknown arg.
+SRE_FORCE_IMAGICK="false"
+_argv=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force-imagick) SRE_FORCE_IMAGICK="true" ;;
+        *)               _argv+=("$1") ;;
+    esac
+    shift
+done
+set -- "${_argv[@]+"${_argv[@]}"}"
 
 sre_parse_args "04-php.sh" "$@"
 require_root
@@ -185,20 +201,35 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         current_im_ver=$(convert --version 2>/dev/null | head -1 | grep -oP 'ImageMagick \K[0-9]+')
     fi
 
+    # Skipping requires BOTH conditions: version 7 AND the Arabic shaping
+    # delegates. An IM7 built without harfbuzz/fribidi cannot shape Arabic, so
+    # treating "version is 7" as done leaves the machine permanently broken for
+    # Arabic — the skip guarantees it is never rebuilt.
+    _im_arabic_ok=false
     if [[ "$current_im_ver" == "7" ]]; then
-        sre_skipped "ImageMagick 7 already installed"
-        # Being version 7 is not the same as being built FOR ARABIC. An IM7
-        # compiled without raqm/harfbuzz/fribidi renders Arabic unshaped and
-        # reversed, and because this branch never rebuilds, that would go
-        # unnoticed forever. Check the delegates explicitly.
-        if ! sre_check_imagick_arabic; then
-            sre_warning "The installed ImageMagick 7 lacks Arabic text shaping."
-            sre_warning "To rebuild it with the required delegates:"
-            sre_warning "  sudo apt-get install -y libraqm-dev libharfbuzz-dev libfribidi-dev"
-            sre_warning "  sudo rm -f /usr/local/bin/magick   # force this step to recompile"
-            sre_warning "  sudo bash stack/04-php.sh"
-        fi
+        sre_check_imagick_arabic >/dev/null 2>&1 && _im_arabic_ok=true
+    fi
+
+    if [[ "$current_im_ver" == "7" && "$_im_arabic_ok" == "true" && "$SRE_FORCE_IMAGICK" != "true" ]]; then
+        sre_skipped "ImageMagick 7 with Arabic shaping already installed"
+        sre_check_imagick_arabic || true
     else
+        if [[ "$current_im_ver" == "7" && "$_im_arabic_ok" != "true" ]]; then
+            sre_warning "ImageMagick 7 is installed but WITHOUT Arabic text shaping."
+            sre_check_imagick_arabic || true
+            sre_warning "Recompiling it with --with-harfbuzz --with-fribidi --with-raqm."
+            sre_warning "The existing build will be replaced."
+            if ! prompt_yesno "Recompile ImageMagick 7 now? (takes several minutes)" "yes"; then
+                sre_skipped "Keeping the current ImageMagick 7 (Arabic shaping stays broken)"
+                _im_skip_build=true
+            fi
+        elif [[ "$SRE_FORCE_IMAGICK" == "true" ]]; then
+            sre_info "--force-imagick given: rebuilding ImageMagick 7 from source"
+        fi
+    fi
+
+    if [[ "${_im_skip_build:-false}" != "true" ]] \
+       && { [[ "$current_im_ver" != "7" ]] || [[ "$_im_arabic_ok" != "true" ]] || [[ "$SRE_FORCE_IMAGICK" == "true" ]]; }; then
         sre_info "Installing ImageMagick 7 from source..."
 
         # Remove old ImageMagick 6 if present
@@ -224,6 +255,45 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                     lcms2-devel libheif-devel LibRaw-devel openjpeg2-devel
                 ;;
         esac
+
+        # The Arabic shaping trio is installed as part of a large batch above.
+        # apt-get/dnf fail the ENTIRE batch if any one package name is
+        # unavailable, which is how an IM7 ends up built without harfbuzz and
+        # fribidi. Install them individually and confirm the headers exist
+        # before configure, so this fails here with a clear message rather than
+        # silently producing a build that cannot shape Arabic.
+        sre_info "Verifying Arabic shaping build dependencies..."
+        case "$SRE_OS_FAMILY" in
+            debian)
+                for _p in libharfbuzz-dev libfribidi-dev libraqm-dev; do
+                    pkg_install "$_p" || sre_warning "  could not install $_p"
+                done
+                ;;
+            rhel)
+                for _p in harfbuzz-devel fribidi-devel libraqm-devel; do
+                    pkg_install "$_p" || sre_warning "  could not install $_p"
+                done
+                ;;
+        esac
+
+        _missing_dev=()
+        for _m in harfbuzz fribidi raqm; do
+            pkg-config --exists "$_m" 2>/dev/null || _missing_dev+=("$_m")
+        done
+        if (( ${#_missing_dev[@]} > 0 )); then
+            sre_error "Missing development libraries: ${_missing_dev[*]}"
+            sre_error "ImageMagick would build WITHOUT Arabic text shaping."
+            case "$SRE_OS_FAMILY" in
+                debian) sre_error "  sudo apt-get install -y libharfbuzz-dev libfribidi-dev libraqm-dev" ;;
+                rhel)   sre_error "  sudo dnf install -y harfbuzz-devel fribidi-devel libraqm-devel" ;;
+            esac
+            if ! prompt_yesno "Continue anyway (Arabic shaping will NOT work)?" "no"; then
+                sre_error "Aborting so the dependencies can be installed first."
+                exit 1
+            fi
+        else
+            sre_success "harfbuzz, fribidi and raqm development libraries present"
+        fi
 
         # Download and compile ImageMagick 7
         im7_build_dir="/tmp/imagemagick7-build"
