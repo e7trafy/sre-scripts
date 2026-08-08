@@ -853,9 +853,14 @@ sre_pecl_install_imagick() {
     [[ -x "/usr/bin/pecl${php_ver}" ]] && pecl_bin="/usr/bin/pecl${php_ver}"
 
     local out rc
-    # Order matters: a plain `imagick` succeeds on hosts that do have a stable
-    # release, and avoids pinning those to an older version unnecessarily.
-    local -a candidates=("imagick" "imagick-beta" "imagick-3.7.0" "imagick-3.8.0")
+    # Order matters:
+    #  - plain `imagick` first: succeeds on hosts that do have a stable release
+    #    and avoids pinning them to a specific version unnecessarily.
+    #  - then 3.8.0, which is the release with proper ImageMagick 7 support.
+    #  - 3.7.0 last, as a desperation fallback: it predates full IM7 support and
+    #    often fails to compile against IM7 headers, so trying it before 3.8.0
+    #    just wastes a compile and produces a confusing error.
+    local -a candidates=("imagick" "imagick-beta" "imagick-3.8.0" "imagick-3.7.0")
 
     local spec
     for spec in "${candidates[@]}"; do
@@ -891,8 +896,84 @@ sre_pecl_install_imagick() {
         fi
     done
 
-    sre_error "  Could not install imagick via PECL. Last output:"
-    sed 's/^/    /' <<<"$out" | tail -25 >&2
+    sre_warning "  PECL could not resolve a release. Last output:"
+    sed 's/^/    /' <<<"$out" | tail -15 >&2
+
+    # Last resort: build from the upstream source tarball, bypassing PECL's
+    # release registry entirely. This is the reliable path when pecl.php.net
+    # reports "No releases available" — the code is fine, only the registry
+    # metadata is the problem.
+    sre_info "  Falling back to building imagick from source..."
+    sre_build_imagick_from_source "$php_ver"
+}
+
+# Build the imagick extension from the upstream GitHub tarball.
+# Used when PECL's registry cannot resolve a release.
+sre_build_imagick_from_source() {
+    local php_ver="$1"
+    local version="${2:-3.8.0}"
+    local build_dir ext_dir phpize_bin php_config_bin rc
+
+    phpize_bin="phpize"
+    php_config_bin="php-config"
+    [[ -x "/usr/bin/phpize${php_ver}"     ]] && phpize_bin="/usr/bin/phpize${php_ver}"
+    [[ -x "/usr/bin/php-config${php_ver}" ]] && php_config_bin="/usr/bin/php-config${php_ver}"
+
+    if ! command -v "$phpize_bin" &>/dev/null; then
+        sre_error "  phpize not found — install php${php_ver}-dev (or php-devel)."
+        return 1
+    fi
+
+    build_dir=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand build_dir now, not at trap time
+    trap "rm -rf '$build_dir'" RETURN
+
+    local url="https://github.com/Imagick/imagick/archive/refs/tags/${version}.tar.gz"
+    sre_info "  Downloading imagick ${version} source..."
+    if ! curl -fsSL "$url" -o "${build_dir}/imagick.tar.gz" 2>/dev/null; then
+        sre_error "  Could not download ${url}"
+        return 1
+    fi
+
+    tar xzf "${build_dir}/imagick.tar.gz" -C "$build_dir" || {
+        sre_error "  Could not extract the imagick source tarball."
+        return 1
+    }
+
+    local src
+    src=$(find "$build_dir" -maxdepth 1 -type d -name 'imagick-*' | head -1)
+    if [[ -z "$src" ]]; then
+        sre_error "  imagick source directory not found after extraction."
+        return 1
+    fi
+
+    sre_info "  Compiling imagick ${version} for PHP ${php_ver}..."
+    (
+        cd "$src" || exit 1
+        "$phpize_bin" >/dev/null 2>&1 || exit 1
+        # PKG_CONFIG_PATH was already pinned to the source IM7 by the caller.
+        ./configure --with-php-config="$php_config_bin" >/dev/null 2>&1 || exit 1
+        make -j"$(nproc 2>/dev/null || echo 2)" >/dev/null 2>&1 || exit 1
+        make install >/dev/null 2>&1 || exit 1
+    )
+    rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        sre_error "  Source build failed. Re-run manually to see the full output:"
+        sre_error "    curl -fsSL ${url} -o /tmp/imagick.tar.gz"
+        sre_error "    cd /tmp && tar xzf imagick.tar.gz && cd imagick-${version}"
+        sre_error "    ${phpize_bin} && ./configure --with-php-config=${php_config_bin}"
+        sre_error "    make && sudo make install"
+        return 1
+    fi
+
+    ext_dir=$("$php_config_bin" --extension-dir 2>/dev/null)
+    if [[ -n "$ext_dir" && -f "${ext_dir}/imagick.so" ]]; then
+        sre_success "  imagick ${version} built from source → ${ext_dir}/imagick.so"
+        return 0
+    fi
+
+    sre_error "  Build reported success but imagick.so is not in ${ext_dir:-<unknown>}"
     return 1
 }
 
