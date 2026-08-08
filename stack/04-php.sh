@@ -187,6 +187,17 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
 
     if [[ "$current_im_ver" == "7" ]]; then
         sre_skipped "ImageMagick 7 already installed"
+        # Being version 7 is not the same as being built FOR ARABIC. An IM7
+        # compiled without raqm/harfbuzz/fribidi renders Arabic unshaped and
+        # reversed, and because this branch never rebuilds, that would go
+        # unnoticed forever. Check the delegates explicitly.
+        if ! sre_check_imagick_arabic; then
+            sre_warning "The installed ImageMagick 7 lacks Arabic text shaping."
+            sre_warning "To rebuild it with the required delegates:"
+            sre_warning "  sudo apt-get install -y libraqm-dev libharfbuzz-dev libfribidi-dev"
+            sre_warning "  sudo rm -f /usr/local/bin/magick   # force this step to recompile"
+            sre_warning "  sudo bash stack/04-php.sh"
+        fi
     else
         sre_info "Installing ImageMagick 7 from source..."
 
@@ -312,9 +323,8 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             rhel)   dnf remove -y php-imagick 2>/dev/null || true ;;
         esac
 
-        # Install build deps. The ImageMagick headers are required, not just
+        # Install build deps. ImageMagick headers are required, not just
         # php-dev — without them the build fails on "Cannot find MagickWand.h".
-        # Here IM7 was just compiled to /usr/local, so its headers are present.
         case "$SRE_OS_FAMILY" in
             debian)
                 pkg_install "php${_php_ver}-dev" || pkg_install php-dev || true
@@ -325,6 +335,25 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 pkg_install pkgconfig make gcc || true
                 ;;
         esac
+
+        # Where the headers come from depends on how we got here. If this run
+        # compiled IM7, they are under /usr/local. But if IM7 was SKIPPED as
+        # already-installed and came from a package rather than source, there
+        # are no /usr/local headers and PECL fails on a missing MagickWand.h.
+        # Only fall back to the distro -dev package when no source IM7 exists,
+        # since that package carries the IM6 headers we must not link against.
+        if _im7_pfx="$(sre_im7_prefix)"; then
+            sre_info "  Using ImageMagick 7 headers from ${_im7_pfx}"
+        elif pkg-config --exists MagickWand 2>/dev/null; then
+            sre_info "  Using ImageMagick headers already on the system ($(pkg-config --modversion MagickWand 2>/dev/null))"
+        else
+            sre_warning "  No ImageMagick development headers found — installing distro package."
+            sre_warning "  These are ImageMagick 6 headers; Arabic shaping needs a source IM7."
+            case "$SRE_OS_FAMILY" in
+                debian) pkg_install libmagickwand-dev || true ;;
+                rhel)   pkg_install ImageMagick-devel || true ;;
+            esac
+        fi
 
         if ! sre_pecl_install_imagick "$_php_ver"; then
             sre_error "  imagick build FAILED for PHP ${_php_ver}"
@@ -346,11 +375,18 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 ;;
         esac
 
+        # phpenmod/the .ini has already been written, so the CLI should see the
+        # extension immediately. If it does not, the build produced nothing
+        # usable — treat that as a failure rather than a "check it later".
         if sre_verify_imagick "$_php_ver"; then
             sre_success "  imagick built and loaded for PHP ${_php_ver}"
         else
-            sre_warning "  imagick built for PHP ${_php_ver} but does not load in CLI yet"
-            sre_warning "  (usually fine if PHP-FPM has not been restarted; verify after)"
+            sre_error "  imagick does NOT load for PHP ${_php_ver} despite building."
+            sre_error "  Usual cause: built against a different PHP, so the .so"
+            sre_error "  landed in another extension_dir. Compare:"
+            sre_error "    php${_php_ver} -i | grep '^extension_dir'"
+            sre_error "    ls -l \$(php${_php_ver} -r 'echo ini_get(\"extension_dir\");')/imagick.so"
+            _imagick_failed+=("$_php_ver")
         fi
     done
 
