@@ -914,11 +914,7 @@ MOODLE_CONFIG
                         # Read the proxy port the vhost is configured for. The vhost
                         # is the source of truth (11-ssl.sh reads it the same way);
                         # PM2 must bind that exact port or nginx will proxy blindly.
-                        nuxt_port=""
-                        if [[ -f "$vhost_conf_path" ]]; then
-                            nuxt_port=$(grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' \
-                                        "$vhost_conf_path" | grep -oE '[0-9]+$' | head -1 || true)
-                        fi
+                        nuxt_port=$(nuxt_port_from_conf "$vhost_conf_path")
                         [[ -z "$nuxt_port" ]] && nuxt_port="3000"
                         sre_info "PM2 will bind PORT=${nuxt_port} (HOST=127.0.0.1)"
 

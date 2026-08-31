@@ -22,6 +22,7 @@ Step 12: Quick Fixes & Common Problems
     - Log file issues
     - ImageMagick / Arabic rendering
     - PHP limits & extensions
+    - Nuxt proxy port collision (new site shows first site's page)
     - Nginx / web server issues
     - Database charset
     - Locale & encoding
@@ -787,6 +788,186 @@ fix_php_version() {
     else
         sre_info "[DRY-RUN] Would switch $domain from PHP ${current_ver:-unknown} to PHP $new_ver"
     fi
+}
+
+################################################################################
+# Fix: Nuxt Proxy Port Collision
+################################################################################
+# Symptom: a new Nuxt site loads the *first* Nuxt project's page.
+# Cause: every Nuxt vhost created before the 08-vhost auto-allocator patch
+# hardcoded proxy_pass 127.0.0.1:3000, and PM2 was started without a PORT
+# env, so the second site's node never bound (3000 was taken) and nginx
+# proxied the new domain to the first site's still-running server.
+# Fix: pick a free port, rewrite every proxy_pass line in the vhost, and
+# restart PM2 with that port. Leaves other sites (including the one on
+# 3000) alone.
+
+fix_nuxt_port() {
+    sre_header "Fix: Nuxt Proxy Port Collision"
+
+    local domain
+    domain=$(prompt_input "Nuxt domain to fix" "")
+    [[ -z "$domain" ]] && { sre_error "Domain is required."; return 1; }
+
+    local web_server
+    web_server=$(config_get "SRE_WEB_SERVER" "nginx")
+    if [[ "$web_server" != "nginx" ]]; then
+        sre_error "This fix only applies to nginx (found: $web_server)"
+        return 1
+    fi
+
+    local vhost_file
+    vhost_file="$(get_vhost_dir "$web_server")/${domain}.conf"
+    if [[ ! -f "$vhost_file" ]]; then
+        sre_error "Vhost config not found: $vhost_file"
+        return 1
+    fi
+
+    local current_port
+    current_port=$(nuxt_port_from_conf "$vhost_file")
+    if [[ -z "$current_port" ]]; then
+        sre_error "No proxy_pass 127.0.0.1:PORT found in $vhost_file"
+        sre_error "Is this really a Nuxt vhost?"
+        return 1
+    fi
+    sre_info "Vhost currently proxies to :$current_port"
+
+    # If the current port is already unique across other vhosts and nothing
+    # else on the box is on it (except this project's own node, which is
+    # fine), there's nothing to do. Ask nuxt_alloc_port what it *would* pick
+    # if starting from scratch — if that's the same as current, we're good.
+    local suggested
+    suggested=$(nuxt_alloc_port "$domain" "$web_server") \
+        || { sre_error "No free port in 3000-3999 range"; return 1; }
+
+    # Verify the collision hypothesis before touching anything: does any
+    # OTHER vhost proxy to $current_port?
+    local collide_conf=""
+    local scan_dir
+    scan_dir=$(get_vhost_dir "$web_server")
+    for conf in "$scan_dir"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        [[ "$conf" == "$vhost_file" ]] && continue
+        if grep -qE "proxy_pass[[:space:]]+http://127\.0\.0\.1:${current_port}(;|/|[[:space:]])" "$conf"; then
+            collide_conf="$conf"
+            break
+        fi
+    done
+
+    if [[ -z "$collide_conf" ]]; then
+        sre_success "No other vhost claims :$current_port — no collision detected."
+        sre_info "If the site is still broken, PM2 is likely not running:"
+        sre_info "  ss -ltnp | grep ':$current_port'"
+        sre_info "  sudo -u $(iso_user_for "$domain") -H pm2 list"
+        return 0
+    fi
+
+    sre_warning "Collision detected: also proxied from $collide_conf"
+    sre_info "Will move $domain from :$current_port to :$suggested"
+
+    if ! prompt_yesno "Rewrite vhost and restart PM2 for $domain?" "yes"; then
+        sre_skipped "Cancelled."
+        return 0
+    fi
+
+    # --- Rewrite the vhost -------------------------------------------------
+    # Global sed: step 11 (SSL) adds a second server block with its own
+    # proxy_pass line, so replacing only the first would leave HTTPS broken.
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        backup_config "$vhost_file"
+
+        sed -i "s|proxy_pass[[:space:]]\+http://127\.0\.0\.1:${current_port}\b|proxy_pass http://127.0.0.1:${suggested}|g" \
+            "$vhost_file"
+
+        local rewritten
+        rewritten=$(grep -cE "proxy_pass[[:space:]]+http://127\.0\.0\.1:${suggested}\b" "$vhost_file" || true)
+        sre_info "Rewrote $rewritten proxy_pass line(s) → :$suggested"
+
+        if ! nginx -t 2>&1; then
+            sre_error "Nginx config test failed after rewrite — restoring backup."
+            # backup_config saved <file>.bak.<timestamp>; pick the newest.
+            local backup
+            backup=$(ls -1t "${vhost_file}.bak."* 2>/dev/null | head -1)
+            [[ -n "$backup" ]] && cp "$backup" "$vhost_file"
+            return 1
+        fi
+        svc_reload nginx
+        sre_success "Nginx reloaded on :$suggested"
+    else
+        sre_info "[DRY-RUN] Would rewrite proxy_pass in $vhost_file: $current_port → $suggested"
+        sre_info "[DRY-RUN] Would nginx -t + reload"
+    fi
+
+    # --- Determine the PM2 user -------------------------------------------
+    # Isolation naming: /var/www/<domain> is owned by p-<sanitized-domain>.
+    # Pre-isolation sites may still run under www-data — ask if the derived
+    # user doesn't exist.
+    local pm2_user
+    pm2_user=$(iso_user_for "$domain")
+    if ! id -u "$pm2_user" >/dev/null 2>&1; then
+        sre_warning "Isolation user '$pm2_user' does not exist."
+        pm2_user=$(prompt_input "System user running PM2 for this site" "www-data")
+        if ! id -u "$pm2_user" >/dev/null 2>&1; then
+            sre_error "User '$pm2_user' does not exist either. Aborting."
+            return 1
+        fi
+    fi
+    sre_info "PM2 user: $pm2_user"
+
+    # --- Restart PM2 with the new port ------------------------------------
+    local project_root="/var/www/${domain}/current"
+    if [[ ! -d "$project_root" ]]; then
+        sre_error "Project root not found: $project_root"
+        return 1
+    fi
+
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        if ! command -v pm2 &>/dev/null; then
+            sre_error "pm2 is not installed on this host."
+            return 1
+        fi
+
+        # sudo strips env — MUST wrap with `env` for PORT/HOST to reach node.
+        # Without the `env`, PM2 launches node with a fresh environment that
+        # picks up nothing from the caller and Nuxt falls back to :3000.
+        pm2_run() {
+            sudo -u "$pm2_user" -H env "PORT=${suggested}" "HOST=127.0.0.1" pm2 "$@"
+        }
+
+        pm2_run delete "${domain}" 2>/dev/null || true
+
+        if [[ -f "${project_root}/.output/server/index.mjs" ]]; then
+            pm2_run start "${project_root}/.output/server/index.mjs" \
+                --name "${domain}" --cwd "${project_root}"
+        elif [[ -f "${project_root}/.output/server/index.js" ]]; then
+            pm2_run start "${project_root}/.output/server/index.js" \
+                --name "${domain}" --cwd "${project_root}"
+        elif [[ -f "${project_root}/package.json" ]]; then
+            pm2_run start npm --name "${domain}" --cwd "${project_root}" -- start
+        else
+            sre_error "No Nuxt build output (.output/server/index.mjs/js) or package.json in $project_root"
+            sre_error "Run: cd $project_root && sudo -u $pm2_user npm install && sudo -u $pm2_user npm run build"
+            return 1
+        fi
+
+        pm2_run save
+
+        # ss is the honest check — pm2 list reports "online" for a process
+        # that exited on bind failure. Give node a moment to bind.
+        sleep 2
+        if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${suggested}$"; then
+            sre_success "PM2 process bound to :${suggested} — collision resolved"
+        else
+            sre_error "PM2 restarted but nothing is listening on :${suggested}"
+            sre_error "Check: sudo -u $pm2_user -H pm2 logs $domain --lines 30"
+            return 1
+        fi
+    else
+        sre_info "[DRY-RUN] Would restart PM2 as $pm2_user with PORT=$suggested"
+    fi
+
+    sre_info "Verify from the outside:"
+    sre_info "  curl -sI -H 'Host: $domain' http://127.0.0.1/ | head -3"
 }
 
 ################################################################################
@@ -1977,6 +2158,7 @@ _run_fix_menu() {
             "permissions-ownership" \
             "filesystem-acl" \
             "change-php-version" \
+            "nuxt-proxy-port" \
             "moodle-temp-dirs" \
             "log-files" \
             "imagick-arabic" \
@@ -1993,6 +2175,7 @@ _run_fix_menu() {
             permissions-ownership)     fix_permissions ;;
             filesystem-acl)            fix_acl ;;
             change-php-version)        fix_php_version ;;
+            nuxt-proxy-port)           fix_nuxt_port ;;
             moodle-temp-dirs)          fix_moodle_temp ;;
             log-files)                 fix_logs ;;
             imagick-arabic)            fix_imagick ;;

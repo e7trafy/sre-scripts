@@ -129,52 +129,17 @@ fi
 
 # --- Auto-allocate Nuxt proxy port to avoid collisions ---
 # Every Nuxt vhost proxies to 127.0.0.1:PORT. Hardcoding 3000 makes the second
-# Nuxt site silently steal the first site's running node process. Scan existing
-# vhosts (and live listeners) and pick the first free port from 3000 up.
-# Explicit --port always wins. Own domain's existing port is preserved on re-run.
+# Nuxt site silently steal the first site's running node process.
+# Explicit --port always wins; own domain's existing port is preserved on re-run.
 if [[ "$VHOST_TYPE" == "nuxt" && "$VHOST_PORT_EXPLICIT" != "true" ]]; then
-    _vhost_scan_dir=$(get_vhost_dir "$web_server")
-    _own_conf="${_vhost_scan_dir}/${VHOST_DOMAIN}.conf"
-
-    # Preserve this domain's existing port if the vhost is being re-run
-    _own_port=""
-    if [[ -f "$_own_conf" ]]; then
-        _own_port=$(grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' "$_own_conf" \
-                    | grep -oE '[0-9]+$' | head -1 || true)
-    fi
-
+    _own_conf="$(get_vhost_dir "$web_server")/${VHOST_DOMAIN}.conf"
+    _own_port=$(nuxt_port_from_conf "$_own_conf")
     if [[ -n "$_own_port" ]]; then
         VHOST_PORT="$_own_port"
         sre_info "Reusing existing Nuxt port from $_own_conf: $VHOST_PORT"
     else
-        # Collect ports already claimed by other vhosts (exclude this domain's conf)
-        declare -A _taken_ports=()
-        if [[ -d "$_vhost_scan_dir" ]]; then
-            for _conf in "$_vhost_scan_dir"/*.conf; do
-                [[ -f "$_conf" ]] || continue
-                [[ "$_conf" == "$_own_conf" ]] && continue
-                while read -r _p; do
-                    [[ -n "$_p" ]] && _taken_ports[$_p]=1
-                done < <(grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' "$_conf" \
-                         | grep -oE '[0-9]+$' || true)
-            done
-        fi
-
-        # Also treat any currently-listening TCP port as taken
-        if command -v ss &>/dev/null; then
-            while read -r _p; do
-                [[ -n "$_p" ]] && _taken_ports[$_p]=1
-            done < <(ss -ltn 2>/dev/null | awk 'NR>1 {print $4}' \
-                     | grep -oE ':[0-9]+$' | tr -d ':' || true)
-        fi
-
-        # Pick the first free port from 3000 up
-        _candidate=3000
-        while [[ -n "${_taken_ports[$_candidate]:-}" ]]; do
-            _candidate=$((_candidate + 1))
-            [[ $_candidate -gt 3999 ]] && { sre_error "No free Nuxt port in 3000-3999 range"; exit 1; }
-        done
-        VHOST_PORT="$_candidate"
+        VHOST_PORT=$(nuxt_alloc_port "$VHOST_DOMAIN" "$web_server") \
+            || { sre_error "No free Nuxt port in 3000-3999 range"; exit 1; }
         sre_info "Auto-allocated Nuxt port: $VHOST_PORT"
     fi
 fi

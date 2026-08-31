@@ -379,6 +379,60 @@ get_vhost_enabled_dir() {
     esac
 }
 
+# --- Nuxt proxy port helpers -----------------------------------------------
+# One canonical implementation shared by 08-vhost (allocate on create),
+# 13-new-project (read back to hand to PM2), 11-ssl (read back to preserve
+# through SSL rewrite), and 12-fixes (retrofit an existing collision).
+# Every duplicate copy of this logic is another chance for drift.
+
+# Extract the first proxy_pass port from an nginx conf. Empty if none.
+nuxt_port_from_conf() {
+    local conf="$1"
+    [[ -f "$conf" ]] || return 0
+    grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' "$conf" \
+        | grep -oE '[0-9]+$' | head -1
+}
+
+# Pick the first free port from 3000 up for a Nuxt vhost.
+#   $1 = target domain (its own conf is excluded from the "taken" set so
+#        re-runs are stable and don't shuffle the site's own port)
+#   $2 = web server (nginx / apache) — allocator is only meaningful for nginx
+# Prints the port. On no-port-in-range prints nothing and returns 1.
+nuxt_alloc_port() {
+    local domain="$1" server="${2:-nginx}"
+    local scan_dir own_conf conf p candidate=3000
+    scan_dir=$(get_vhost_dir "$server")
+    own_conf="${scan_dir}/${domain}.conf"
+
+    declare -A _taken=()
+
+    if [[ -d "$scan_dir" ]]; then
+        for conf in "$scan_dir"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            [[ "$conf" == "$own_conf" ]] && continue
+            while read -r p; do
+                [[ -n "$p" ]] && _taken[$p]=1
+            done < <(grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' "$conf" \
+                     | grep -oE '[0-9]+$' || true)
+        done
+    fi
+
+    # Live TCP listeners: a port bound by something else (a static tool,
+    # a stray dev server) must also be considered taken.
+    if command -v ss &>/dev/null; then
+        while read -r p; do
+            [[ -n "$p" ]] && _taken[$p]=1
+        done < <(ss -ltn 2>/dev/null | awk 'NR>1 {print $4}' \
+                 | grep -oE ':[0-9]+$' | tr -d ':' || true)
+    fi
+
+    while [[ -n "${_taken[$candidate]:-}" ]]; do
+        candidate=$((candidate + 1))
+        [[ $candidate -gt 3999 ]] && return 1
+    done
+    printf '%s' "$candidate"
+}
+
 # Get main web server config file
 get_webserver_conf() {
     local server="$1"
