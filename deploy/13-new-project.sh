@@ -911,26 +911,8 @@ MOODLE_CONFIG
 
                 if command -v pm2 &>/dev/null; then
                     if prompt_yesno "Start PM2 process?" "yes"; then
-                        # Read the proxy port the vhost is configured for. The vhost
-                        # is the source of truth (11-ssl.sh reads it the same way);
-                        # PM2 must bind that exact port or nginx will proxy blindly.
-                        nuxt_port=""
-                        if [[ -f "$vhost_conf_path" ]]; then
-                            nuxt_port=$(grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' \
-                                        "$vhost_conf_path" | grep -oE '[0-9]+$' | head -1 || true)
-                        fi
-                        [[ -z "$nuxt_port" ]] && nuxt_port="3000"
-                        sre_info "PM2 will bind PORT=${nuxt_port} (HOST=127.0.0.1)"
-
-                        # PM2 runs a per-project daemon as the project user.
-                        # `sudo -u` strips the environment — wrap with `env` so PORT/HOST
-                        # actually reach the node process. Without this, Nuxt falls back
-                        # to :3000 regardless of what we prefix.
-                        pm2_run() {
-                            sudo -u "$DEPLOY_OS_USER" -H env \
-                                "PORT=${nuxt_port}" "HOST=127.0.0.1" \
-                                pm2 "$@"
-                        }
+                        # PM2 runs a per-project daemon as the project user
+                        pm2_run() { sudo -u "$DEPLOY_OS_USER" -H pm2 "$@"; }
                         pm2_run delete "${DEPLOY_DOMAIN}" 2>/dev/null || true
 
                         # Nuxt 3 builds to .output/server/index.mjs
@@ -948,7 +930,7 @@ MOODLE_CONFIG
                         fi
                         pm2_run save
                         pm2 startup systemd -u "$DEPLOY_OS_USER" --hp "$project_dir" 2>/dev/null | grep -v "^\[PM2\]" || true
-                        sre_success "PM2 process started: ${DEPLOY_DOMAIN} on :${nuxt_port} (user $DEPLOY_OS_USER)"
+                        sre_success "PM2 process started: ${DEPLOY_DOMAIN} (user $DEPLOY_OS_USER)"
                     else
                         sre_skipped "PM2 start"
                     fi

@@ -15,7 +15,6 @@ VHOST_DOMAIN=""
 VHOST_TYPE=""
 VHOST_ROOT=""
 VHOST_PORT="3000"
-VHOST_PORT_EXPLICIT="false"
 
 sre_show_help() {
     cat <<EOF
@@ -58,7 +57,7 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --domain) _i=$((_i + 1)); VHOST_DOMAIN="${_raw_args[$_i]:-}" ;;
         --type)   _i=$((_i + 1)); VHOST_TYPE="${_raw_args[$_i]:-}" ;;
         --root)   _i=$((_i + 1)); VHOST_ROOT="${_raw_args[$_i]:-}" ;;
-        --port)   _i=$((_i + 1)); VHOST_PORT="${_raw_args[$_i]:-3000}"; VHOST_PORT_EXPLICIT="true" ;;
+        --port)   _i=$((_i + 1)); VHOST_PORT="${_raw_args[$_i]:-3000}" ;;
     esac
     _i=$((_i + 1))
 done
@@ -127,58 +126,6 @@ if [[ "$VHOST_TYPE" == "laravel" || "$VHOST_TYPE" == "moodle" || "$VHOST_TYPE" =
     sre_info "PHP version: $php_version"
 fi
 
-# --- Auto-allocate Nuxt proxy port to avoid collisions ---
-# Every Nuxt vhost proxies to 127.0.0.1:PORT. Hardcoding 3000 makes the second
-# Nuxt site silently steal the first site's running node process. Scan existing
-# vhosts (and live listeners) and pick the first free port from 3000 up.
-# Explicit --port always wins. Own domain's existing port is preserved on re-run.
-if [[ "$VHOST_TYPE" == "nuxt" && "$VHOST_PORT_EXPLICIT" != "true" ]]; then
-    _vhost_scan_dir=$(get_vhost_dir "$web_server")
-    _own_conf="${_vhost_scan_dir}/${VHOST_DOMAIN}.conf"
-
-    # Preserve this domain's existing port if the vhost is being re-run
-    _own_port=""
-    if [[ -f "$_own_conf" ]]; then
-        _own_port=$(grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' "$_own_conf" \
-                    | grep -oE '[0-9]+$' | head -1 || true)
-    fi
-
-    if [[ -n "$_own_port" ]]; then
-        VHOST_PORT="$_own_port"
-        sre_info "Reusing existing Nuxt port from $_own_conf: $VHOST_PORT"
-    else
-        # Collect ports already claimed by other vhosts (exclude this domain's conf)
-        declare -A _taken_ports=()
-        if [[ -d "$_vhost_scan_dir" ]]; then
-            for _conf in "$_vhost_scan_dir"/*.conf; do
-                [[ -f "$_conf" ]] || continue
-                [[ "$_conf" == "$_own_conf" ]] && continue
-                while read -r _p; do
-                    [[ -n "$_p" ]] && _taken_ports[$_p]=1
-                done < <(grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' "$_conf" \
-                         | grep -oE '[0-9]+$' || true)
-            done
-        fi
-
-        # Also treat any currently-listening TCP port as taken
-        if command -v ss &>/dev/null; then
-            while read -r _p; do
-                [[ -n "$_p" ]] && _taken_ports[$_p]=1
-            done < <(ss -ltn 2>/dev/null | awk 'NR>1 {print $4}' \
-                     | grep -oE ':[0-9]+$' | tr -d ':' || true)
-        fi
-
-        # Pick the first free port from 3000 up
-        _candidate=3000
-        while [[ -n "${_taken_ports[$_candidate]:-}" ]]; do
-            _candidate=$((_candidate + 1))
-            [[ $_candidate -gt 3999 ]] && { sre_error "No free Nuxt port in 3000-3999 range"; exit 1; }
-        done
-        VHOST_PORT="$_candidate"
-        sre_info "Auto-allocated Nuxt port: $VHOST_PORT"
-    fi
-fi
-
 sre_info "Domain: $VHOST_DOMAIN"
 sre_info "Type: $VHOST_TYPE"
 sre_info "Root: $VHOST_ROOT"
@@ -198,39 +145,12 @@ fi
 
 sre_info "Using template: $template_file"
 
-# --- Per-project isolation: dedicated user + FPM pool (PHP types only) ---
-project_base="/var/www/${VHOST_DOMAIN}"
-proj_user=$(iso_user_for "$VHOST_DOMAIN")
-moodledata=""
-if [[ "$VHOST_TYPE" == "moodle" ]]; then
-    default_moodledata="/var/www/${VHOST_DOMAIN}/moodledata"
-    moodledata=$(prompt_input "Moodledata path (may be on block storage)" "$default_moodledata")
-fi
-
-case "$VHOST_TYPE" in
-    laravel|moodle|wordpress|phpmyadmin)
-        if [[ "$SRE_DRY_RUN" != "true" ]]; then
-            iso_ensure_user "$VHOST_DOMAIN" "$project_base"
-            if [[ -n "$moodledata" ]]; then
-                iso_write_pool "$VHOST_DOMAIN" "$php_version" "$project_base" "$moodledata" || exit 1
-            else
-                iso_write_pool "$VHOST_DOMAIN" "$php_version" "$project_base" || exit 1
-            fi
-        else
-            sre_info "[DRY-RUN] Would create user $proj_user + dedicated FPM pool"
-        fi
-        ;;
-esac
-
 # Read and substitute placeholders
-# FPM socket: per-project when the site has a dedicated pool, shared otherwise
-fpm_socket=$(iso_socket_or_shared "$VHOST_DOMAIN" "$php_version")
 vhost_content=$(cat "$template_file")
 vhost_content="${vhost_content//\{DOMAIN\}/$VHOST_DOMAIN}"
 vhost_content="${vhost_content//\{DOCUMENT_ROOT\}/$VHOST_ROOT}"
 vhost_content="${vhost_content//\{PHP_VERSION\}/$php_version}"
 vhost_content="${vhost_content//\{PORT\}/$VHOST_PORT}"
-vhost_content="${vhost_content//\{FPM_SOCKET\}/$fpm_socket}"
 
 # --- Determine destination path ---
 case "$web_server" in
@@ -276,13 +196,62 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
     # Create document root if it doesn't exist
     mkdir -p "$VHOST_ROOT" 2>/dev/null || true
 
-    # --- Isolated ownership: project user owns; web server reads via group ---
-    if [[ "$VHOST_TYPE" == "moodle" && -n "$moodledata" ]]; then
+    # --- Set FACL permissions on project and data directories ---
+    sre_info "Setting filesystem ACLs for www-data access..."
+
+    require_acl
+
+    project_base="/var/www/${VHOST_DOMAIN}"
+
+    # Set ownership
+    chown -R www-data:www-data "$project_base"
+
+    # Default ACL: www-data gets rwx on all new files/dirs automatically
+    setfacl -R -m u:www-data:rwX "$project_base"
+    setfacl -R -d -m u:www-data:rwX "$project_base"
+
+    # For Moodle: set ACL on moodledata (may be on external block storage)
+    if [[ "$VHOST_TYPE" == "moodle" ]]; then
+        default_moodledata="/var/www/${VHOST_DOMAIN}/moodledata"
+        moodledata=$(prompt_input "Moodledata path (may be on block storage)" "$default_moodledata")
+
         mkdir -p "$moodledata"
-        iso_apply_perms "$VHOST_DOMAIN" "$project_base" "$VHOST_TYPE" "$moodledata"
-    else
-        iso_apply_perms "$VHOST_DOMAIN" "$project_base" "$VHOST_TYPE"
+        chown -R www-data:www-data "$moodledata"
+        setfacl -R -m u:www-data:rwX "$moodledata"
+        setfacl -R -d -m u:www-data:rwX "$moodledata"
+        chmod 2770 "$moodledata"
+
+        # Ensure the filesystem supports ACLs (block storage may need acl mount option)
+        mount_point=$(df "$moodledata" --output=target 2>/dev/null | tail -1)
+        if [[ -n "$mount_point" && "$mount_point" != "/" ]]; then
+            if ! mount | grep "$mount_point" | grep -q "acl"; then
+                sre_warning "Block storage at $mount_point may need 'acl' mount option"
+                sre_warning "Add 'acl' to mount options in /etc/fstab if ACLs don't persist after reboot"
+            fi
+        fi
+
+        sre_success "FACL set on moodledata: $moodledata"
     fi
+
+    # For Laravel: ensure storage and cache dirs have proper ACLs
+    if [[ "$VHOST_TYPE" == "laravel" ]]; then
+        for subdir in storage bootstrap/cache; do
+            target="${project_base}/current/${subdir}"
+            if [[ -d "$target" ]]; then
+                setfacl -R -m u:www-data:rwX "$target"
+                setfacl -R -d -m u:www-data:rwX "$target"
+            fi
+        done
+        # Also set on shared storage (symlinked)
+        # shared_storage="${project_base}/shared/storage"
+        shared_storage="${project_base}/current/storage"
+        if [[ -d "$shared_storage" ]]; then
+            setfacl -R -m u:www-data:rwX "$shared_storage"
+            setfacl -R -d -m u:www-data:rwX "$shared_storage"
+        fi
+    fi
+
+    sre_success "FACL permissions configured on $project_base"
 
     # Create subpath snippets directory (referenced by `include` in nginx templates).
     # An empty directory makes the include a no-op; nginx errors if the dir is missing.
@@ -333,8 +302,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             ;;
     esac
 else
-    sre_info "[DRY-RUN] Would apply isolated ownership on /var/www/${VHOST_DOMAIN} (owner $proj_user)"
-    [[ "$VHOST_TYPE" == "moodle" ]] && sre_info "[DRY-RUN] Would apply isolated ownership on moodledata (prompted path, may be external block storage)"
+    sre_info "[DRY-RUN] Would set FACL on /var/www/${VHOST_DOMAIN} (www-data:rwX + default ACL)"
+    [[ "$VHOST_TYPE" == "moodle" ]] && sre_info "[DRY-RUN] Would set FACL on moodledata (prompted path, may be external block storage)"
+    [[ "$VHOST_TYPE" == "laravel" ]] && sre_info "[DRY-RUN] Would set FACL on storage + bootstrap/cache"
     sre_info "[DRY-RUN] Would write vhost config to: $vhost_dest"
     sre_info "[DRY-RUN] Template content preview:"
     echo "$vhost_content" | head -5
@@ -372,7 +342,7 @@ process_name=%(program_name)s
 command=php ${project_base}/current/artisan horizon
 autostart=true
 autorestart=true
-user=${proj_user}
+user=www-data
 redirect_stderr=true
 stdout_logfile=${project_base}/current/storage/logs/horizon.log
 stopwaitsecs=3600
@@ -385,7 +355,7 @@ process_name=%(program_name)s_%(process_num)02d
 command=php ${project_base}/current/artisan queue:work --sleep=3 --tries=${worker_tries} --timeout=${worker_timeout} --queue=${worker_queue}
 autostart=true
 autorestart=true
-user=${proj_user}
+user=www-data
 numprocs=${worker_processes}
 redirect_stderr=true
 stdout_logfile=${project_base}/current/storage/logs/worker.log
@@ -396,7 +366,7 @@ WORKEREOF
 
             # Setup scheduler cron
             if prompt_yesno "Also setup Laravel scheduler cron?" "yes"; then
-                cron_line="* * * * * ${proj_user} cd ${project_base}/current && php artisan schedule:run >> /dev/null 2>&1"
+                cron_line="* * * * * www-data cd ${project_base}/current && php artisan schedule:run >> /dev/null 2>&1"
                 cron_file="/etc/cron.d/${VHOST_DOMAIN//\./-}-scheduler"
                 echo "$cron_line" > "$cron_file"
                 chmod 644 "$cron_file"
