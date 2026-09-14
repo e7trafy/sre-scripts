@@ -182,6 +182,20 @@ if grep -q 'proxy_pass' "$vhost_conf" 2>/dev/null; then
     sre_info "Nuxt proxy port: $nuxt_port"
 fi
 
+# --- Extract PHP-FPM socket from existing vhost ---
+# The templates carry a {FPM_SOCKET} placeholder that step 8 fills in with
+# either the per-project isolated socket or the shared one. Read it back from
+# the live config so we re-render with the socket the site is actually using.
+fpm_socket=""
+case "$web_server" in
+    nginx)  fpm_socket=$(grep -oP 'fastcgi_pass\s+unix:\K[^;]+' "$vhost_conf" 2>/dev/null | head -1) ;;
+    apache) fpm_socket=$(grep -oP 'proxy:unix:\K[^|]+' "$vhost_conf" 2>/dev/null | head -1) ;;
+esac
+if [[ -z "$fpm_socket" ]]; then
+    fpm_socket=$(iso_socket_or_shared "$SSL_DOMAIN" "$php_version")
+fi
+sre_info "PHP-FPM socket: $fpm_socket"
+
 # --- Check for existing certificate ---
 cert_dir="/etc/letsencrypt/live/${SSL_DOMAIN}"
 
@@ -484,9 +498,37 @@ else
     cert_key="${cert_dir}/privkey.pem"
 fi
 
+pre_ssl_backup=""
 if [[ "$SRE_DRY_RUN" != "true" ]]; then
+    # Durable archive under /etc/sre-helpers/backups
     backup_config "$vhost_conf"
+    # Own copy at a path we control, for the rollback below. Do NOT try to
+    # locate backup_config's file by glob — its naming is its own business.
+    pre_ssl_backup=$(mktemp "/tmp/vhost-pre-ssl-${SSL_DOMAIN}.XXXXXX")
+    cp "$vhost_conf" "$pre_ssl_backup"
+    sre_info "Rollback copy: $pre_ssl_backup"
 fi
+
+# Restore the pre-SSL vhost and reload only if it tests clean.
+# Used by both the nginx and apache branches when the new config fails.
+_restore_pre_ssl_vhost() {
+    local test_cmd="$1" reload_svc="$2"
+    if [[ -z "$pre_ssl_backup" || ! -f "$pre_ssl_backup" ]]; then
+        sre_error "No rollback copy available — $vhost_conf left as written."
+        sre_error "Restore manually from /etc/sre-helpers/backups/"
+        return 1
+    fi
+    cp "$pre_ssl_backup" "$vhost_conf"
+    sre_info "Restored pre-SSL config from $pre_ssl_backup"
+    if $test_cmd >/dev/null 2>&1; then
+        svc_reload "$reload_svc"
+        sre_success "Reverted to working config and reloaded $reload_svc"
+        return 0
+    fi
+    sre_error "Restored config ALSO fails its config test — not reloading."
+    sre_error "$reload_svc is still running its last-good config; fix before reloading."
+    return 1
+}
 
 case "$web_server" in
     nginx)
@@ -525,10 +567,22 @@ case "$web_server" in
             | sed '1d;$d' \
             | grep -v 'listen 80\|listen \[::\]:80' \
             | sed '/well-known/,/}/d' \
+            | grep -v 'add_header X-Frame-Options\|add_header X-Content-Type-Options\|add_header X-XSS-Protection\|add_header Referrer-Policy' \
             | sed "s|{DOMAIN}|${SSL_DOMAIN}|g" \
             | sed "s|{DOCUMENT_ROOT}|${doc_root}|g" \
             | sed "s|{PHP_VERSION}|${php_version}|g" \
+            | sed "s|{FPM_SOCKET}|${fpm_socket}|g" \
             | sed "s|{PORT}|${nuxt_port:-3000}|g")
+
+        # Fail loudly rather than writing a config with unfilled placeholders
+        if grep -q '{[A-Z_]\+}' <<<"$existing_inner"; then
+            sre_error "Unsubstituted placeholder(s) in rendered config:"
+            grep -o '{[A-Z_]\+}' <<<"$existing_inner" | sort -u | while read -r ph; do
+                sre_error "  $ph"
+            done
+            sre_error "Refusing to write a broken vhost. Original config left untouched."
+            exit 1
+        fi
 
         if [[ "$SRE_DRY_RUN" != "true" ]]; then
             cat > "$vhost_conf" <<NGINX_CONF
@@ -583,10 +637,9 @@ NGINX_CONF
                 svc_reload nginx
                 sre_success "Nginx reloaded"
             else
-                sre_error "Nginx config test failed — restoring backup"
-                backup_file=$(ls -t "${vhost_conf}".*.bak 2>/dev/null | head -1)
-                [[ -n "$backup_file" ]] && cp "$backup_file" "$vhost_conf"
-                svc_reload nginx
+                sre_error "Nginx config test failed — restoring pre-SSL config"
+                nginx -t 2>&1 | sed 's/^/    /' >&2
+                _restore_pre_ssl_vhost "nginx -t" nginx
                 exit 1
             fi
         else
@@ -614,7 +667,21 @@ NGINX_CONF
                 | sed '1d;$d' \
                 | sed "s|{DOMAIN}|${SSL_DOMAIN}|g" \
                 | sed "s|{DOCUMENT_ROOT}|${doc_root}|g" \
-                | sed "s|{PHP_VERSION}|${php_version}|g")
+                | sed "s|{PHP_VERSION}|${php_version}|g" \
+                | sed "s|{FPM_SOCKET}|${fpm_socket}|g")
+
+            # Fail loudly rather than writing a config with unfilled placeholders
+            # (note: ${APACHE_LOG_DIR} and %{REQUEST_FILENAME} are Apache's own
+            #  runtime variables, not our placeholders — the pattern skips them)
+            leftover=$(grep -oP '(?<![$%])\{[A-Z_]+\}' <<<"$existing_inner" | sort -u || true)
+            if [[ -n "$leftover" ]]; then
+                sre_error "Unsubstituted placeholder(s) in rendered config:"
+                while read -r ph; do
+                    sre_error "  $ph"
+                done <<<"$leftover"
+                sre_error "Refusing to write a broken vhost. Original config left untouched."
+                exit 1
+            fi
 
             cat > "$vhost_conf" <<APACHE_CONF
 # HTTP → HTTPS redirect
@@ -673,10 +740,9 @@ APACHE_CONF
                 svc_reload "$reload_svc"
                 sre_success "Apache reloaded"
             else
-                sre_error "Apache config test failed — restoring backup"
-                backup_file=$(ls -t "${vhost_conf}".*.bak 2>/dev/null | head -1)
-                [[ -n "$backup_file" ]] && cp "$backup_file" "$vhost_conf"
-                svc_reload "$reload_svc"
+                sre_error "Apache config test failed — restoring pre-SSL config"
+                $test_cmd 2>&1 | sed 's/^/    /' >&2
+                _restore_pre_ssl_vhost "$test_cmd" "$reload_svc"
                 exit 1
             fi
         else
