@@ -16,6 +16,7 @@ VHOST_TYPE=""
 VHOST_ROOT=""
 VHOST_PORT="3000"
 VHOST_PORT_EXPLICIT="false"
+VHOST_FORCE_REPLACE_SSL="false"   # allow overwriting a vhost that already has SSL
 
 sre_show_help() {
     cat <<EOF
@@ -32,6 +33,11 @@ Options:
   --type <type>     Project type: laravel, moodle, wordpress, nuxt, vue, static, phpmyadmin (required, or prompted)
   --root <path>     Document root (default: /var/www/<domain>/current/public)
   --port <port>     Node.js port for Nuxt (default: 3000)
+  --force-replace-ssl
+                    Allow overwriting a vhost that already has SSL configured.
+                    The templates are HTTP-only, so this REMOVES HTTPS — re-run
+                    step 11 afterwards. Without this flag, step 8 refuses to
+                    touch an HTTPS vhost (--yes does not override it).
   --dry-run         Print planned actions without executing
   --yes             Accept defaults without prompting
   --config          Override config file path
@@ -59,6 +65,7 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --type)   _i=$((_i + 1)); VHOST_TYPE="${_raw_args[$_i]:-}" ;;
         --root)   _i=$((_i + 1)); VHOST_ROOT="${_raw_args[$_i]:-}" ;;
         --port)   _i=$((_i + 1)); VHOST_PORT="${_raw_args[$_i]:-3000}"; VHOST_PORT_EXPLICIT="true" ;;
+        --force-replace-ssl) VHOST_FORCE_REPLACE_SSL="true" ;;
     esac
     _i=$((_i + 1))
 done
@@ -228,6 +235,29 @@ esac
 # --- Check for existing vhost ---
 if [[ -f "$vhost_dest" ]]; then
     sre_warning "Vhost config already exists: $vhost_dest"
+
+    # The templates are HTTP-only. If the live vhost already carries a
+    # certificate (step 11 / step 18 ran), overwriting it silently strips
+    # HTTPS off a working site — the site keeps serving, just unencrypted,
+    # so the breakage is easy to miss. Require an explicit opt-in that
+    # --yes cannot satisfy on its own.
+    if grep -qE 'ssl_certificate|SSLCertificateFile' "$vhost_dest" 2>/dev/null; then
+        sre_error "This vhost already has SSL configured."
+        sre_error "Overwriting it with the HTTP-only template would REMOVE HTTPS."
+        echo ""
+        sre_info "If you only need to change SSL, run step 11 instead."
+        sre_info "To rebuild the vhost from the template and then re-add SSL:"
+        sre_info "  1. sudo bash ${SCRIPT_DIR}/vhost/08-vhost.sh --domain ${VHOST_DOMAIN} --force-replace-ssl"
+        sre_info "  2. sudo bash ${SCRIPT_DIR}/ssl/11-ssl.sh --domain ${VHOST_DOMAIN}"
+        echo ""
+        if [[ "$VHOST_FORCE_REPLACE_SSL" != "true" ]]; then
+            sre_error "Refusing to strip SSL. Re-run with --force-replace-ssl if that is what you want."
+            exit 4
+        fi
+        sre_warning "--force-replace-ssl given — proceeding to overwrite the HTTPS vhost."
+        sre_warning "Remember to re-run step 11 afterwards or the site stays HTTP-only."
+    fi
+
     if prompt_yesno "Overwrite? (backup will be created)" "yes"; then
         backup_config "$vhost_dest"
     else

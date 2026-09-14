@@ -1442,12 +1442,42 @@ fix_nginx() {
                     [[ ! -f "$vhost_file" ]] && vhost_file="/etc/nginx/conf.d/${vhost_domain}.conf"
 
                     if [[ -f "$vhost_file" ]]; then
+                        backup_config "$vhost_file"
                         if grep -q "client_max_body_size" "$vhost_file"; then
                             sed -i "s/client_max_body_size.*/client_max_body_size ${new_size};/" "$vhost_file"
                         else
-                            sed -i "/server_name/a\\    client_max_body_size ${new_size};" "$vhost_file"
+                            # After step 11 a vhost has two server blocks (HTTP
+                            # redirect + HTTPS). A bare /server_name/a inserts into
+                            # both — and the redirect block is the wrong place, since
+                            # uploads only ever reach the block that serves content.
+                            # Anchor on the server_name of the block that has a root
+                            # or fastcgi_pass; fall back to the first one otherwise.
+                            anchor_line=$(awk '
+                                /^[[:space:]]*server[[:space:]]*\{/ { sn = 0 }
+                                /server_name/ && !sn { sn = NR }
+                                # A block that serves content (not a bare redirect).
+                                # proxy_pass/fastcgi_pass may be nested in a location,
+                                # so match anywhere in the block, not just at its top.
+                                /root[[:space:]]|fastcgi_pass|proxy_pass/ {
+                                    if (sn) { print sn; exit }
+                                }
+                            ' "$vhost_file")
+                            [[ -z "$anchor_line" ]] && anchor_line=$(grep -n 'server_name' "$vhost_file" | head -1 | cut -d: -f1)
+                            if [[ -n "$anchor_line" ]]; then
+                                sed -i "${anchor_line}a\\    client_max_body_size ${new_size};" "$vhost_file"
+                            else
+                                sre_error "No server_name found in $vhost_file — not editing."
+                                return 1
+                            fi
                         fi
-                        sre_success "Vhost client_max_body_size set to ${new_size}"
+                        if nginx -t >/dev/null 2>&1; then
+                            sre_success "Vhost client_max_body_size set to ${new_size}"
+                        else
+                            sre_error "nginx -t failed after editing $vhost_file"
+                            nginx -t 2>&1 | sed 's/^/    /' >&2
+                            sre_error "Restore from /etc/sre-helpers/backups/ and retry."
+                            return 1
+                        fi
                     else
                         sre_error "Vhost config not found for $vhost_domain"
                         return 1

@@ -2122,7 +2122,7 @@ if ! progress_phase_done CONFIG && [[ "$do_files" == "true" || "$do_db" == "true
                     else
                         sre_warning "wp-cli not installed — post bodies still contain old domain URLs."
                         sre_warning "Install wp-cli and run:"
-                        sre_warning "  cd ${tgt_proj_base}/current && sudo -u "$tgt_run_user" wp search-replace \\"
+                        sre_warning "  cd ${tgt_proj_base}/current && sudo -u ${tgt_run_user} wp search-replace \\"
                         sre_warning "    '${src_scheme}://${CL_SOURCE_DOMAIN}' '${CL_TGT_SCHEME}://${CL_TARGET_DOMAIN}' --all-tables"
                     fi
                 fi
