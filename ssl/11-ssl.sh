@@ -16,6 +16,7 @@ SSL_DOMAIN=""
 SSL_EMAIL=""
 SSL_PREFER_WILDCARD="yes"   # auto-detect existing wildcard cert before LE
 SSL_WILDCARD_DIR=""         # extra search dir for non-LE wildcard certs
+SSL_FPM_SOCKET=""           # override the auto-detected PHP-FPM socket
 SSL_FORCE_LE="false"        # skip wildcard detection entirely
 
 sre_show_help() {
@@ -42,6 +43,9 @@ Options:
   --wildcard-dir <p>   Extra dir to scan for non-LE wildcard certs.
                        Layout: <p>/<base.domain>/{fullchain.pem,privkey.pem}
   --no-wildcard        Skip wildcard detection, force Let's Encrypt
+  --fpm-socket <path>  Override the PHP-FPM socket instead of detecting it
+                       from the vhost / pool files. Use when a previous run
+                       left a broken vhost and detection can't recover it.
   --dry-run            Print planned actions without executing
   --yes                Accept defaults without prompting
   --config             Override config file path
@@ -65,6 +69,7 @@ while [[ $_i -lt ${#_raw_args[@]} ]]; do
         --domain)        _i=$((_i + 1)); SSL_DOMAIN="${_raw_args[$_i]:-}" ;;
         --email)         _i=$((_i + 1)); SSL_EMAIL="${_raw_args[$_i]:-}" ;;
         --wildcard-dir)  _i=$((_i + 1)); SSL_WILDCARD_DIR="${_raw_args[$_i]:-}" ;;
+        --fpm-socket)    _i=$((_i + 1)); SSL_FPM_SOCKET="${_raw_args[$_i]:-}" ;;
         --no-wildcard)   SSL_FORCE_LE="true"; SSL_PREFER_WILDCARD="no" ;;
     esac
     _i=$((_i + 1))
@@ -158,18 +163,41 @@ fi
 sre_info "Vhost config: $vhost_conf"
 
 # --- Extract document root from existing vhost ---
+# The ACME challenge block carries its own `root /var/www/letsencrypt;` and it
+# appears BEFORE the server root in the templates, so a plain first-match grep
+# picks the wrong one and bakes the ACME webroot in as the document root.
+# Skip that block, and skip any placeholder left by an earlier broken render.
 doc_root=""
 case "$web_server" in
     nginx)
-        doc_root=$(grep -m1 '^\s*root ' "$vhost_conf" | awk '{print $2}' | tr -d ';')
+        doc_root=$(grep -oP '^\s*root\s+\K[^;]+' "$vhost_conf" 2>/dev/null \
+            | grep -v '^/var/www/letsencrypt' | head -1)
         ;;
     apache)
-        doc_root=$(grep -im1 'DocumentRoot' "$vhost_conf" | awk '{print $2}')
+        doc_root=$(grep -oiP '^\s*DocumentRoot\s+\K\S+' "$vhost_conf" 2>/dev/null \
+            | tr -d '"' | grep -v '^/var/www/letsencrypt' | head -1)
         ;;
 esac
+doc_root="${doc_root%"${doc_root##*[![:space:]]}"}"   # trim trailing whitespace
+
+if [[ "$doc_root" == *'{'* || "$doc_root" != /* ]]; then
+    [[ -n "$doc_root" ]] && sre_warning "Ignoring unusable document root in vhost: $doc_root"
+    doc_root=""
+fi
+
+# Fall back to the conventional layout for this domain before giving up.
+if [[ -z "$doc_root" ]]; then
+    for _cand in "/var/www/${SSL_DOMAIN}/current/public" \
+                 "/var/www/${SSL_DOMAIN}/current" \
+                 "/var/www/${SSL_DOMAIN}/public_html" \
+                 "/var/www/${SSL_DOMAIN}"; do
+        [[ -d "$_cand" ]] && { doc_root="$_cand"; break; }
+    done
+    [[ -n "$doc_root" ]] && sre_warning "Document root not readable from vhost — using $doc_root"
+fi
 
 if [[ -z "$doc_root" ]]; then
-    sre_warning "Could not auto-detect document root from vhost. Using webroot method with /var/www/html."
+    sre_warning "Could not auto-detect document root from vhost. Using /var/www/html."
     doc_root="/var/www/html"
 fi
 sre_info "Document root: $doc_root"
@@ -186,15 +214,53 @@ fi
 # The templates carry a {FPM_SOCKET} placeholder that step 8 fills in with
 # either the per-project isolated socket or the shared one. Read it back from
 # the live config so we re-render with the socket the site is actually using.
+#
+# A vhost written by the pre-fix version of this script contains the LITERAL
+# string "{FPM_SOCKET}", so anything that still looks like a placeholder (or
+# isn't an absolute path) must be rejected — otherwise we'd carry the broken
+# value straight back into the new config.
 fpm_socket=""
-case "$web_server" in
-    nginx)  fpm_socket=$(grep -oP 'fastcgi_pass\s+unix:\K[^;]+' "$vhost_conf" 2>/dev/null | head -1) ;;
-    apache) fpm_socket=$(grep -oP 'proxy:unix:\K[^|]+' "$vhost_conf" 2>/dev/null | head -1) ;;
-esac
+if [[ -n "$SSL_FPM_SOCKET" ]]; then
+    fpm_socket="$SSL_FPM_SOCKET"
+    sre_info "Using --fpm-socket override"
+else
+    case "$web_server" in
+        nginx)  fpm_socket=$(grep -oP 'fastcgi_pass\s+unix:\K[^;]+' "$vhost_conf" 2>/dev/null | head -1) ;;
+        apache) fpm_socket=$(grep -oP 'proxy:unix:\K[^|]+' "$vhost_conf" 2>/dev/null | head -1) ;;
+    esac
+fi
+if [[ "$fpm_socket" == *'{'* || "$fpm_socket" != /* ]]; then
+    [[ -n "$fpm_socket" ]] && sre_warning "Ignoring unusable socket in vhost: $fpm_socket"
+    fpm_socket=""
+fi
+
+# Fall back to the pool on disk, then to any live socket matching this site.
 if [[ -z "$fpm_socket" ]]; then
     fpm_socket=$(iso_socket_or_shared "$SSL_DOMAIN" "$php_version")
+    # iso_socket_or_shared returns the SHARED socket when no dedicated pool
+    # file exists for this php_version. If that socket isn't actually present,
+    # search the other installed PHP versions before trusting it.
+    if [[ ! -S "$fpm_socket" ]]; then
+        _iso_sock=$(iso_socket_for "$SSL_DOMAIN")
+        if [[ -S "$_iso_sock" ]]; then
+            fpm_socket="$_iso_sock"
+        else
+            for _pool in /etc/php/*/fpm/pool.d/"${SSL_DOMAIN}".conf; do
+                [[ -f "$_pool" ]] || continue
+                _s=$(grep -oP '^\s*listen\s*=\s*\K/.*\.sock' "$_pool" | head -1)
+                [[ -n "$_s" ]] && { fpm_socket="$_s"; break; }
+            done
+        fi
+    fi
+fi
+
+if [[ -z "$fpm_socket" ]]; then
+    sre_error "Could not determine the PHP-FPM socket for $SSL_DOMAIN."
+    sre_error "Check the pool file under /etc/php/*/fpm/pool.d/ and pass it with --fpm-socket."
+    exit 2
 fi
 sre_info "PHP-FPM socket: $fpm_socket"
+[[ -S "$fpm_socket" ]] || sre_warning "Socket $fpm_socket does not exist yet — check PHP-FPM is running."
 
 # --- Check for existing certificate ---
 cert_dir="/etc/letsencrypt/live/${SSL_DOMAIN}"
