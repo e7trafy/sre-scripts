@@ -258,7 +258,10 @@ max_heap_table_size = 64M"
                 ;;
             postgresql)
                 pg_conf=""
-                pg_conf=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
+                # `find` on a missing /etc/postgresql (the RHEL case) exits 1,
+                # and under pipefail that killed the script right here - before
+                # the fallback below, which exists for exactly that case.
+                pg_conf=$( { find /etc/postgresql -name postgresql.conf 2>/dev/null || true; } | head -1)
                 if [[ -z "$pg_conf" ]]; then
                     pg_conf="/var/lib/pgsql/data/postgresql.conf"
                 fi

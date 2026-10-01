@@ -709,25 +709,18 @@ if [[ "$needs_db" == "true" ]]; then
                 dump_err_file="/tmp/mysqldump_err_$$.txt"
 
                 set +e
-                ssh -p "$MIG_SOURCE_PORT" "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
-                    "bash -s" <<REMOTE_DUMP > "$dump_file" 2>"$dump_err_file"
-#!/bin/bash
-# Write a per-process my.cnf into a private tmpdir only readable by this user
-_tmpdir=\$(mktemp -d)
-_cnf="\${_tmpdir}/.my.cnf"
-chmod 700 "\${_tmpdir}"
-cat > "\${_cnf}" <<CNF
-[client]
-user=${MIG_SOURCE_DB_USER}
-password=${MIG_SOURCE_DB_PASS}
-CNF
-chmod 600 "\${_cnf}"
-mysqldump --defaults-extra-file="\${_cnf}" \
-    '${MIG_SOURCE_DB_NAME}' --single-transaction --quick
-rc=\$?
-rm -rf "\${_tmpdir}"
-exit \$rc
-REMOTE_DUMP
+                # Credentials go over STDIN only - never on the ssh command
+                # line. ssh joins its command arguments into one string that
+                # the remote shell re-parses, so a password like 'a$x#1'
+                # arrived as 'a#1', a space split it, and 'p;id' would execute
+                # on the remote host. See db_remote_dump_stream in dbconn.sh.
+                db_remote_dump_stream \
+                    "$MIG_SOURCE_DB_USER" "$MIG_SOURCE_DB_PASS" \
+                    "$MIG_SOURCE_DB_NAME" "" \
+                    --single-transaction --quick \
+                | ssh -p "$MIG_SOURCE_PORT" \
+                      "${MIG_SOURCE_USER}@${MIG_SOURCE_HOST}" \
+                      "bash -s" > "$dump_file" 2>"$dump_err_file"
                 dump_rc=$?
                 set -e
 
@@ -786,6 +779,8 @@ REMOTE_DUMP
                 sre_success "Database dump downloaded: $dump_file ($dump_size)"
 
                 sre_info "Importing into local database..."
+                # shellcheck disable=SC2024  # the redirect is read by THIS
+                # shell from a local dump file; postgres never needs to read it.
                 sudo -u postgres psql "$MIG_DB_NAME" < "$dump_file" >/dev/null
                 sre_success "Database imported: $MIG_DB_NAME"
                 ;;

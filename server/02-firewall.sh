@@ -15,7 +15,8 @@ sre_show_help() {
 Usage: sudo bash $0 [OPTIONS]
 
 Step 2: Firewall Configuration
-  Configures ufw (Debian) or firewalld (RHEL) to allow ports 22, 80, 443.
+  Configures ufw (Debian) or firewalld (RHEL) to allow the detected SSH
+  port plus 80 and 443.
   Optionally opens additional ports.
 
 Prerequisites: Step 1 (base-setup) must be complete.
@@ -53,10 +54,28 @@ case "$(config_get SRE_OS_FAMILY)" in
         sre_info "Configuring ufw..."
         if [[ "$SRE_DRY_RUN" != "true" ]]; then
             pkg_is_installed ufw || pkg_install ufw
-            ufw --force reset >/dev/null 2>&1
+
+            # Do NOT reset on every run: that wipes rules added by other steps
+            # or by hand, which breaks idempotency (constitution IV). ufw allow
+            # is already idempotent, so a reset is only useful on a first run.
+            if ! ufw status 2>/dev/null | grep -q 'Status: active'; then
+                ufw --force reset >/dev/null 2>&1
+            else
+                sre_info "ufw already active — adding rules without resetting"
+            fi
+
             ufw default deny incoming
             ufw default allow outgoing
-            ufw allow 22/tcp comment "SSH"
+
+            # Open the port sshd ACTUALLY listens on. Hardcoding 22 locks you
+            # out of any host running ssh elsewhere. Read it from the effective
+            # sshd config, not from `ss`: on socket-activated Ubuntu 24.04 the
+            # listener shows up as systemd, not sshd.
+            ssh_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
+            [[ -n "$ssh_port" ]] || ssh_port="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+            [[ -n "$ssh_port" ]] || ssh_port="22"
+            ufw allow "${ssh_port}/tcp" comment "SSH"
+            [[ "$ssh_port" != "22" ]] && sre_info "Opened detected SSH port: $ssh_port"
             ufw allow 80/tcp comment "HTTP"
             ufw allow 443/tcp comment "HTTPS"
 
@@ -80,7 +99,14 @@ case "$(config_get SRE_OS_FAMILY)" in
         if [[ "$SRE_DRY_RUN" != "true" ]]; then
             pkg_is_installed firewalld || pkg_install firewalld
             svc_enable_start firewalld
+            # --add-service=ssh only covers port 22; add the real port too.
             firewall-cmd --permanent --add-service=ssh
+            ssh_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
+            [[ -n "$ssh_port" ]] || ssh_port="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+            if [[ -n "$ssh_port" && "$ssh_port" != "22" ]]; then
+                firewall-cmd --permanent --add-port="${ssh_port}/tcp"
+                sre_info "Opened detected SSH port: $ssh_port"
+            fi
             firewall-cmd --permanent --add-service=http
             firewall-cmd --permanent --add-service=https
 

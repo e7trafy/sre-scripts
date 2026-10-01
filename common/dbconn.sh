@@ -233,11 +233,30 @@ _db_ensure_cnf() {
     touch "$_SRE_DB_CNF"
     chmod 600 "$_SRE_DB_CNF"
     {
+        # Quote ONLY when the value needs it. MySQL's option-file parser
+        # treats an unquoted '#' as the start of a comment, so a password like
+        # 'p#1' would silently become 'p'; leading/trailing spaces are also
+        # stripped. Plain values stay unquoted so the on-disk format of an
+        # already-working credentials file does not change.
+        _cnf_val() {
+            local v="$1"
+            # Backslash too: MySQL processes \ escapes inside option values,
+            # so an unquoted \n in a password would become a newline.
+            if [[ "$v" == *'#'* || "$v" == *'"'* || "$v" == *'\'* \
+                  || "$v" != "${v#[[:space:]]}" || "$v" != "${v%[[:space:]]}" ]]; then
+                # Escape backslashes and double quotes, then wrap.
+                v="${v//\\/\\\\}"
+                v="${v//\"/\\\"}"
+                printf '"%s"' "$v"
+            else
+                printf '%s' "$v"
+            fi
+        }
         printf '[client]\n'
-        printf 'user=%s\n' "$user"
-        printf 'password=%s\n' "$pass"
+        printf 'user=%s\n' "$(_cnf_val "$user")"
+        printf 'password=%s\n' "$(_cnf_val "$pass")"
         if db_is_remote; then
-            printf 'host=%s\n' "$(db_admin_host)"
+            printf 'host=%s\n' "$(_cnf_val "$(db_admin_host)")"
             printf 'port=%s\n' "$(db_admin_port)"
         fi
     } > "$_SRE_DB_CNF"
@@ -345,4 +364,67 @@ db_require_local_pg() {
         return 1
     fi
     return 0
+}
+
+################################################################################
+# Remote dump streaming
+#
+# Build the stdin stream for `ssh <host> "bash -s"`: credential assignments
+# first, then a fixed script that reads them as variables.
+#
+# Credentials must NEVER travel on the ssh command line. ssh does not preserve
+# argument boundaries - it joins its command arguments into one string that the
+# REMOTE login shell parses again. So `ssh host "bash -s" -- "$pass"` with a
+# password of 'a$x#1' arrives as 'a#1', a space splits it in two, a quote is a
+# syntax error, and 'p;id' executes id on the remote host. It would also put
+# the password in argv on both machines, which is what dbconn.sh:33 forbids.
+#
+# printf %q produces a quoting that bash parses back to the exact original, and
+# the remote side is bash, so this round-trips any byte safely.
+#
+#   db_remote_dump_stream <user> <pass> <dbname> [host] [extra mysqldump args...]
+#
+# The caller pipes the result into ssh and redirects stdout to the dump file.
+################################################################################
+
+db_remote_dump_stream() {
+    local user="$1" pass="$2" dbname="$3" host="${4:-}"
+    shift 4 2>/dev/null || shift $#
+    local extra=("$@")
+
+    printf '_u=%q\n_p=%q\n_d=%q\n_h=%q\n' "$user" "$pass" "$dbname" "$host"
+    printf '_extra=('
+    local a
+    for a in ${extra[@]+"${extra[@]}"}; do printf '%q ' "$a"; done
+    printf ')\n'
+
+    cat <<'REMOTE_SCRIPT'
+# Runs on the remote host. Credentials arrive as _u/_p/_d/_h above; nothing is
+# on the command line and nothing is re-parsed by a shell.
+_tmpdir=$(mktemp -d) || exit 1
+chmod 700 "$_tmpdir"
+_cnf="${_tmpdir}/.my.cnf"
+
+# MySQL option-file quoting: an unquoted '#' starts a comment and edge spaces
+# are stripped, so quote the value and escape \ and " inside it.
+_cnf_quote() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "$v"
+}
+
+{
+    printf '[client]\n'
+    printf 'user=%s\n' "$(_cnf_quote "$_u")"
+    printf 'password=%s\n' "$(_cnf_quote "$_p")"
+    [ -n "$_h" ] && printf 'host=%s\n' "$(_cnf_quote "$_h")"
+} > "$_cnf"
+chmod 600 "$_cnf"
+
+mysqldump --defaults-extra-file="$_cnf" "$_d" ${_extra[@]+"${_extra[@]}"}
+_rc=$?
+rm -rf "$_tmpdir"
+exit $_rc
+REMOTE_SCRIPT
 }

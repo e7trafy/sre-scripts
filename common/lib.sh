@@ -169,13 +169,32 @@ EOF
     fi
 }
 
+# Load the config into the current shell.
+#
+# Deliberately NOT `source`. The file holds operator-supplied values (DB hosts,
+# passwords, domains); sourcing it EXECUTES any $(...) or backtick inside them,
+# so a password containing $( ) ran as root and a value round-tripped
+# differently through config_get (plain text) than config_load (evaluated).
+# Parsing with printf -v keeps both paths byte-identical.
+#
+# Reads the existing on-disk format unchanged: KEY="value", one per line.
 config_load() {
-    if [[ -f "$SRE_CONFIG_FILE" ]]; then
-        # shellcheck source=/dev/null
-        source "$SRE_CONFIG_FILE"
-        return 0
-    fi
-    return 1
+    [[ -f "$SRE_CONFIG_FILE" ]] || return 1
+
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip blanks and comments.
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # Only KEY=... lines with a shell-safe key.
+        [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        # Strip one layer of surrounding double quotes, as config_set writes.
+        [[ "$value" == \"*\" ]] && value="${value:1:${#value}-2}"
+        printf -v "$key" '%s' "$value"
+    done < "$SRE_CONFIG_FILE"
+
+    return 0
 }
 
 config_get() {
@@ -195,6 +214,14 @@ config_get() {
 config_set() {
     local key="$1"
     local value="$2"
+
+    # A newline would write a second KEY=... line, letting one value inject an
+    # unrelated config key. A CR would survive into the value.
+    if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        sre_error "Refusing to store a value containing a newline: $key"
+        return 1
+    fi
+
     config_init
     # Use a python-safe temp approach: remove key then append, avoids sed delimiter issues with slashes
     if grep -q "^${key}=" "$SRE_CONFIG_FILE" 2>/dev/null; then
@@ -207,19 +234,61 @@ config_set() {
 # T006: Config Backup
 ################################################################################
 
+# Records the path it wrote in SRE_LAST_BACKUP so a caller can roll back.
+# It does NOT echo the path: it also calls sre_info, so a caller capturing
+# stdout would get the log line glued to the filename.
+SRE_LAST_BACKUP=""
+
 backup_config() {
     local file="$1"
+    SRE_LAST_BACKUP=""
     if [[ ! -f "$file" ]]; then
         return 0
     fi
-    local backup_dir="/etc/sre-helpers/backups"
+    local backup_dir="${SRE_BACKUP_DIR:-/etc/sre-helpers/backups}"
     mkdir -p "$backup_dir"
     local basename
     basename=$(basename "$file")
-    local backup_path="${backup_dir}/${basename}.bak.$(date +%Y%m%d-%H%M%S)"
+    # Second-resolution timestamps collide when one script backs up several
+    # files with the same basename in a tight loop (04-php.sh does this for
+    # fpm+cli php.ini across versions), so add a short unique suffix.
+    # mktemp, not $$: the same script in the same second produces the same
+    # PID-based name, so a loop backing up several same-named files collided.
+    local backup_path
+    backup_path="$(mktemp "${backup_dir}/${basename}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX")"
     cp "$file" "$backup_path"
+    SRE_LAST_BACKUP="$backup_path"
     sre_info "Backed up $file -> $backup_path"
 }
+
+# Restore the newest backup of a file written by backup_config.
+#
+# backup_config writes to /etc/sre-helpers/backups/, NOT alongside the original.
+# Rollback paths in 12-fixes.sh globbed "${file}.bak.*" - a pattern that never
+# matches - so they printed "Restoring backup..." and restored nothing while
+# returning as if they had.
+restore_config() {
+    local file="$1" backup="${2:-}"
+
+    # An explicit backup path from THIS run is required. Picking "the newest
+    # matching backup" could restore a stale copy from an earlier run, or a
+    # same-named file from elsewhere - writing a config the caller never saw
+    # and calling it a rollback.
+    if [[ -z "$backup" ]]; then
+        sre_error "restore_config: no backup path given for $file"
+        sre_error "Capture SRE_LAST_BACKUP right after backup_config and pass it."
+        return 1
+    fi
+
+    if [[ ! -f "$backup" ]]; then
+        sre_error "Backup not found: $backup"
+        return 1
+    fi
+
+    cp "$backup" "$file"
+    sre_info "Restored $file <- $backup"
+}
+
 
 ################################################################################
 # T007: Package Manager Abstraction
@@ -386,11 +455,21 @@ get_vhost_enabled_dir() {
 # Every duplicate copy of this logic is another chance for drift.
 
 # Extract the first proxy_pass port from an nginx conf. Empty if none.
+#
+# The `|| true` is load-bearing. Every caller sources lib.sh, so set -euo
+# pipefail is active, and a grep that matches nothing exits 1 - which under
+# pipefail killed the calling script at the assignment, before the
+# `[[ -z "$port" ]] && port=...` fallback written to handle exactly this case
+# could ever run. Guarded here, in one place, rather than at each call site.
+#
+# NOTE for callers: an empty result means "no port recorded", NOT "use 3000".
+# Defaulting to 3000 is what gave every Nuxt vhost the same port (2eb1384).
+# Fall back to nuxt_alloc_port, or fail - never to a constant.
 nuxt_port_from_conf() {
     local conf="$1"
     [[ -f "$conf" ]] || return 0
-    grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' "$conf" \
-        | grep -oE '[0-9]+$' | head -1
+    { grep -oE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:[0-9]+' "$conf" \
+        | grep -oE '[0-9]+$' | head -1; } || true
 }
 
 # Pick the first free port from 3000 up for a Nuxt vhost.
@@ -431,6 +510,179 @@ nuxt_alloc_port() {
         [[ $candidate -gt 3999 ]] && return 1
     done
     printf '%s' "$candidate"
+}
+
+################################################################################
+# Template rendering
+#
+# ONE renderer for every vhost/pool template. Step 8 used bash expansion and
+# step 11 used two separate sed pipelines; the same logic in three places is
+# why dfc4b24, c106e98 and 0934d19 each had to fix only one copy.
+#
+# Values come from RT_<TOKEN> variables, so {FPM_SOCKET} reads RT_FPM_SOCKET.
+# An unset token is a hard error: writing a config with a literal {TOKEN} in it
+# is what dfc4b24 was about.
+#
+# Deliberately NOT sed: a value holding / | & or a newline breaks sed in a way
+# that is painful to escape correctly. Bash expansion with a quoted replacement
+# has no such problem - the quoting matters, because under bash >= 5.2
+# (patsub_replacement, so Ubuntu 24.04) an unquoted & expands to the match.
+#
+# ${APACHE_LOG_DIR} and %{REQUEST_FILENAME} are Apache/nginx runtime syntax,
+# not our placeholders. APACHE_LOG_DIR is resolved per OS because it is defined
+# only in Debian's /etc/apache2/envvars - on RHEL it would reach httpd unset
+# and the vhost would fail to load.
+################################################################################
+
+render_template() {
+    local template="$1"
+
+    if [[ ! -f "$template" ]]; then
+        sre_error "Template not found: $template"
+        return 1
+    fi
+
+    local content
+    content="$(cat "$template")"
+
+    # Resolve Apache's own log-dir variable per OS family before the leak check.
+    local apache_log_dir
+    case "${SRE_OS_FAMILY:-debian}" in
+        rhel) apache_log_dir="/var/log/httpd" ;;
+        *)    apache_log_dir="/var/log/apache2" ;;
+    esac
+    content="${content//'${APACHE_LOG_DIR}'/"$apache_log_dir"}"
+
+    # Substitute every {TOKEN} that has a matching RT_<TOKEN>.
+    local token var value
+    for token in $(grep -oE '\{[A-Z_][A-Z0-9_]*\}' <<<"$content" | sort -u || true); do
+        var="RT_${token:1:${#token}-2}"
+        [[ -n "${!var+x}" ]] || continue
+        value="${!var}"
+        # Both sides quoted: pattern so {} are literal, replacement so & is.
+        content="${content//"$token"/"$value"}"
+    done
+
+    # Nothing that still looks like a placeholder may reach a live config.
+    # A { preceded by $ or % belongs to Apache/nginx, so it is allowed.
+    local leftover
+    leftover="$(grep -oE '(^|[^$%])\{[A-Z_][A-Z0-9_]*\}' <<<"$content" \
+                | grep -oE '\{[A-Z_][A-Z0-9_]*\}' | sort -u || true)"
+    if [[ -n "$leftover" ]]; then
+        sre_error "Unsubstituted placeholder(s) rendering $(basename "$template"):"
+        local t
+        while IFS= read -r t; do
+            [[ -n "$t" ]] && sre_error "  $t  (set RT_${t:1:${#t}-2})"
+        done <<<"$leftover"
+        return 1
+    fi
+
+    printf '%s\n' "$content"
+}
+
+################################################################################
+# Write a web-server config, test it, and roll back if the test fails.
+#
+# Step 8 wrote the vhost, created the sites-enabled symlink, ran `nginx -t`,
+# and on failure merely printed an error and exited - leaving a BROKEN CONFIG
+# ENABLED. Nothing looks wrong at the time, because nginx keeps serving its
+# last-good config from memory; the damage surfaces at the next reload from
+# any other script, or at reboot, when every site on the host fails to start.
+#
+# Generalised from 11-ssl.sh's _restore_pre_ssl_vhost, including its key
+# property: if the RESTORED config also fails, do not reload at all - leave
+# the running process on its last-good config and say so.
+#
+#   $1 dest    - config file to write
+#   $2 content - full file contents
+#   $3 link    - optional sites-enabled symlink to create
+#   $4 server  - nginx | apache (default: nginx)
+#
+# Returns 0 if the config tests clean and was reloaded.
+################################################################################
+
+webserver_apply_or_rollback() {
+    local dest="$1" content="$2" link="${3:-}" server="${4:-nginx}"
+
+    local test_cmd reload_svc
+    case "$server" in
+        nginx)
+            test_cmd="nginx -t"
+            reload_svc="nginx"
+            ;;
+        apache)
+            case "${SRE_OS_FAMILY:-debian}" in
+                rhel) test_cmd="httpd -t";          reload_svc="httpd"   ;;
+                *)    test_cmd="apachectl configtest"; reload_svc="apache2" ;;
+            esac
+            ;;
+        *)
+            sre_error "Unknown web server: $server"
+            return 1
+            ;;
+    esac
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would write $dest, test with '$test_cmd', reload $reload_svc"
+        return 0
+    fi
+
+    # Distinguish "replacing a vhost" from "creating one". Rollback for a new
+    # vhost means DELETING the file and the symlink - there is no prior file to
+    # put back, and leaving an untested one enabled is the bug being fixed.
+    local existed="false" rollback_copy=""
+    if [[ -f "$dest" ]]; then
+        existed="true"
+        backup_config "$dest"
+        rollback_copy="$(mktemp "${TMPDIR:-/tmp}/sre-vhost-rollback.XXXXXX")"
+        cp "$dest" "$rollback_copy"
+    fi
+
+    printf '%s\n' "$content" > "$dest"
+    sre_success "Written config: $dest"
+
+    local link_created="false"
+    if [[ -n "$link" && ! -e "$link" ]]; then
+        ln -sf "$dest" "$link"
+        link_created="true"
+        sre_success "Enabled site: $link"
+    elif [[ -n "$link" ]]; then
+        ln -sf "$dest" "$link"
+    fi
+
+    if $test_cmd >/dev/null 2>&1; then
+        sre_success "${server} config test passed"
+        svc_reload "$reload_svc"
+        sre_success "${server} reloaded"
+        [[ -n "$rollback_copy" ]] && rm -f "$rollback_copy"
+        return 0
+    fi
+
+    # Failed. Show the operator why before touching anything.
+    sre_error "${server} config test FAILED for $dest:"
+    $test_cmd 2>&1 | sed 's/^/    /' || true
+
+    if [[ "$existed" == "true" ]]; then
+        cp "$rollback_copy" "$dest"
+        sre_info "Rolled back $dest to its previous contents"
+        rm -f "$rollback_copy"
+    else
+        rm -f "$dest"
+        sre_info "Removed newly written $dest"
+        if [[ "$link_created" == "true" ]]; then
+            rm -f "$link"
+            sre_info "Removed newly created symlink $link"
+        fi
+    fi
+
+    if $test_cmd >/dev/null 2>&1; then
+        svc_reload "$reload_svc"
+        sre_success "Reverted to a working config and reloaded ${reload_svc}"
+    else
+        sre_error "Config is STILL broken after rollback - not reloading."
+        sre_error "${reload_svc} keeps running its last-good config; fix before any reload."
+    fi
+    return 1
 }
 
 # Get main web server config file
@@ -628,6 +880,7 @@ declare -A STEP_REGISTRY=(
     [17]="stack/17-phpmyadmin.sh"
     [18]="ssl/18-custom-ssl.sh"
     [19]="vhost/19-mount-subpath.sh"
+    [20]="migrate/20-isolate-existing.sh"
     [21]="setup/21-claude-code.sh"
 )
 
@@ -652,6 +905,7 @@ declare -A STEP_NAMES=(
     [17]="phpMyAdmin (Optional)"
     [18]="Install Custom SSL (Wildcard / Single)"
     [19]="Mount Project as Subpath"
+    [20]="Isolate Existing Projects"
     [21]="Claude Code (agents, skills, MCPs)"
 )
 
@@ -663,14 +917,14 @@ _is_step_skipped() {
            [[ "$(config_get "SRE_DB_MODE" "local")" == "remote" ]] && return 1
            local e; e=$(config_get "SRE_DB_ENGINE" "none"); [[ "$e" == "none" || -z "$e" ]] && return 0 ;;
         6) local v; v=$(config_get "SRE_NODE_VERSION" ""); [[ -z "$v" ]] && return 0 ;;
-        0|9|10|13|14|15|16|17|18|19|21) return 0 ;; # all optional / on-demand steps
+        0|9|10|13|14|15|16|17|18|19|20|21) return 0 ;; # all optional / on-demand steps
     esac
     return 1
 }
 
 _is_step_optional() {
     local step="$1"
-    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" || "$step" == "13" || "$step" == "14" || "$step" == "15" || "$step" == "16" || "$step" == "17" || "$step" == "18" || "$step" == "19" || "$step" == "21" ]] && return 0
+    [[ "$step" == "0" || "$step" == "9" || "$step" == "10" || "$step" == "12" || "$step" == "13" || "$step" == "14" || "$step" == "15" || "$step" == "16" || "$step" == "17" || "$step" == "18" || "$step" == "19" || "$step" == "20" || "$step" == "21" ]] && return 0
     return 1
 }
 

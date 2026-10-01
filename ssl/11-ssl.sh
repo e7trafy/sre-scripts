@@ -205,8 +205,17 @@ sre_info "Document root: $doc_root"
 # --- Extract proxy port from existing vhost (Nuxt reverse proxy) ---
 nuxt_port=""
 if grep -q 'proxy_pass' "$vhost_conf" 2>/dev/null; then
-    nuxt_port=$(grep -oP 'proxy_pass\s+http://127\.0\.0\.1:\K[0-9]+' "$vhost_conf" | head -1)
-    [[ -z "$nuxt_port" ]] && nuxt_port="3000"
+    # Read through the shared helper rather than a second hand-rolled grep -oP.
+    # The old fallback to a hardcoded 3000 is exactly how every Nuxt vhost ended
+    # up on the same port (2eb1384): if the read failed for any reason -
+    # whitespace, `localhost` instead of 127.0.0.1 - step 11 silently rewrote
+    # the vhost to 3000 and pointed it at a different site's app. Fail instead.
+    nuxt_port="$(nuxt_port_from_conf "$vhost_conf")"
+    if [[ -z "$nuxt_port" ]]; then
+        sre_error "Vhost $vhost_conf proxies, but no 127.0.0.1:<port> could be read."
+        sre_error "Refusing to guess a port - fix the vhost, or re-run step 8."
+        exit 1
+    fi
     sre_info "Nuxt proxy port: $nuxt_port"
 fi
 
@@ -431,12 +440,74 @@ if [[ "$SSL_FORCE_LE" != "true" ]] && [[ "$SSL_PREFER_WILDCARD" == "yes" ]]; the
     fi
 fi
 
+################################################################################
+# Renewal deploy hook (installed early, and idempotently)
+#
+# This has to run BEFORE the "cert + HTTPS already in place" early exit below:
+# the hosts that need it most are the ones already serving HTTPS from an
+# earlier run, and they would otherwise never receive it.
+################################################################################
+
+if [[ "$SRE_DRY_RUN" != "true" ]]; then
+    # A renewal that nobody reloads is invisible: certbot writes the new cert,
+    # but nginx/apache keep serving the old one from memory until something
+    # reloads them, so the site shows an expired certificate while
+    # /etc/letsencrypt holds a perfectly valid one. Only the cron fallback
+    # below had a hook; the systemd timer - the normal path - had none.
+    #
+    # A deploy hook runs after ANY successful renewal, however it was
+    # triggered, so it covers the timer, cron and manual `certbot renew`.
+    hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    hook_file="${hook_dir}/00-sre-reload-webserver.sh"
+    mkdir -p "$hook_dir"
+    cat > "$hook_file" <<'HOOK'
+#!/bin/bash
+# Installed by sre-helpers step 11. Reload whichever web servers are running
+# so a renewed certificate is actually served. Never fail a renewal: test the
+# config first and skip the reload if it is broken.
+for svc in nginx apache2 httpd; do
+    systemctl is-active --quiet "$svc" 2>/dev/null || continue
+    case "$svc" in
+        nginx)          nginx -t >/dev/null 2>&1 || continue ;;
+        apache2|httpd)  apachectl configtest >/dev/null 2>&1 || httpd -t >/dev/null 2>&1 || continue ;;
+    esac
+    systemctl reload "$svc" >/dev/null 2>&1 || true
+done
+exit 0
+HOOK
+    chmod 755 "$hook_file"
+    sre_success "Renewal deploy hook installed: $hook_file"
+
+fi
+
+# A certificate on disk does NOT mean the vhost is serving HTTPS. Those are
+# separate questions and conflating them left sites permanently HTTP-only:
+# under --yes, prompt_yesno returns 1 for a "no" default, so this exited 0
+# before writing the HTTPS vhost - breaking step 8's own documented recovery
+# ("08-vhost.sh --force-replace-ssl" then "11-ssl.sh") and 18-custom-ssl's
+# bulk loop, while reporting success.
+#
+# Skip only when the cert exists AND the vhost already serves HTTPS. If the
+# vhost is still HTTP, skip re-issuance but go on to write the HTTPS config.
+SSL_SKIP_ISSUANCE="false"
 if [[ "$SSL_USE_WILDCARD" != "true" ]] && [[ -d "$cert_dir" ]]; then
     sre_warning "Certificate already exists for $SSL_DOMAIN"
-    if ! prompt_yesno "Renew/replace the certificate?" "no"; then
-        sre_skipped "SSL setup skipped (certificate already exists)"
-        recommend_next_step "$CURRENT_STEP"
-        exit 0
+
+    vhost_already_https="false"
+    if [[ -f "$vhost_conf" ]] && grep -qE 'listen[[:space:]]+443|SSLEngine[[:space:]]+on' "$vhost_conf" 2>/dev/null; then
+        vhost_already_https="true"
+    fi
+
+    if [[ "$vhost_already_https" == "true" ]]; then
+        if ! prompt_yesno "Renew/replace the certificate?" "no"; then
+            sre_skipped "SSL setup skipped (certificate and HTTPS vhost already in place)"
+            recommend_next_step "$CURRENT_STEP"
+            exit 0
+        fi
+    else
+        sre_info "Vhost is not serving HTTPS yet — reusing the existing certificate"
+        sre_info "and writing the HTTPS config."
+        SSL_SKIP_ISSUANCE="true"
     fi
 fi
 
@@ -452,6 +523,13 @@ if [[ "$SSL_USE_WILDCARD" == "true" ]]; then
     sre_info "Skipping Certbot — wildcard is renewed by whoever issued it."
 
     # Ensure ACME webroot still exists (vhost will reference it)
+    if [[ "$SRE_DRY_RUN" != "true" ]]; then
+        mkdir -p "${acme_webroot}/.well-known/acme-challenge"
+    fi
+elif [[ "$SSL_SKIP_ISSUANCE" == "true" ]]; then
+    # Cert already on disk and still valid; the vhost just isn't using it yet.
+    # Reuse it and fall through to writing the HTTPS config.
+    sre_info "Reusing existing certificate at $cert_dir"
     if [[ "$SRE_DRY_RUN" != "true" ]]; then
         mkdir -p "${acme_webroot}/.well-known/acme-challenge"
     fi
@@ -511,11 +589,29 @@ else
                         esac ;;
             esac
 
+            # certbot records the authenticator in the renewal conf, so a
+            # bare --standalone here makes every FUTURE unattended renewal try
+            # to bind port 80 while the web server holds it - and fail forever.
+            # Persisting pre/post hooks with the issuance makes the standalone
+            # renewal stop and restart the server itself.
+            # Resolve the actual unit now: reload_svc is a local in a helper
+            # defined further down, so it is unset here and a :-nginx default
+            # would stop the wrong service on an Apache host.
+            case "$web_server" in
+                apache) case "$os_family" in
+                            rhel) standalone_svc="httpd" ;;
+                            *)    standalone_svc="apache2" ;;
+                        esac ;;
+                *)      standalone_svc="nginx" ;;
+            esac
+
             certbot certonly \
                 --standalone \
                 -d "$SSL_DOMAIN" \
                 --non-interactive \
                 --agree-tos \
+                --pre-hook "systemctl stop ${standalone_svc} 2>/dev/null || true" \
+                --post-hook "systemctl start ${standalone_svc} 2>/dev/null || true" \
                 --email "$SSL_EMAIL" || {
                 sre_error "Certbot failed (both webroot and standalone)."
                 sre_error "Check:"
@@ -601,7 +697,21 @@ case "$web_server" in
         # Detect vhost type from existing config content to preserve PHP/proxy setup
         vhost_type="generic"
         if grep -q 'fastcgi_pass' "$vhost_conf" 2>/dev/null; then
-            if grep -q 'pluginfile.php\|moodledata' "$vhost_conf" 2>/dev/null; then
+            # phpMyAdmin must be checked BEFORE the laravel fallback. Without
+            # this branch it matched only `fastcgi_pass` and was re-rendered
+            # from nginx-laravel.conf, silently dropping every hardening rule
+            # the phpMyAdmin template carries: deny all on
+            # libraries|setup/lib|setup/frames|templates|vendor, the
+            # README/composer.json denials, X-Frame-Options DENY and the
+            # noindex robots.txt. Enabling SSL must not weaken a vhost.
+            # Match the phpMyAdmin template's OWN hardening rule, not the
+            # substring "pma" - that would catch any ordinary domain or path
+            # containing it and re-render a Laravel site as phpMyAdmin,
+            # denying /vendor/*.php and adding robots.txt Disallow: /.
+            if grep -qE 'setup/lib|setup/frames' "$vhost_conf" 2>/dev/null \
+               || [[ -f "${doc_root}/config.inc.php" ]]; then
+                vhost_type="phpmyadmin"
+            elif grep -q 'pluginfile.php\|moodledata' "$vhost_conf" 2>/dev/null; then
                 vhost_type="moodle"
             elif grep -q 'wp-config\.php\|wp-content' "$vhost_conf" 2>/dev/null \
                  || [[ -f "${doc_root}/wp-config.php" ]]; then
@@ -629,16 +739,25 @@ case "$web_server" in
 
         # Extract inner lines: strip outer server{} wrapper, listen 80,
         # and the acme-challenge block (HTTPS block doesn't need it)
-        existing_inner=$(sed -n '/^server {/,/^}$/p' "$template_file" \
+        # Render FIRST through the shared helper, then extract. Keeping a
+        # second sed-based renderer here is what let dfc4b24/0934d19 fix only
+        # one copy; render_template also resolves ${APACHE_LOG_DIR} per OS and
+        # fails loudly on a token nobody set.
+        rendered_template=$(
+            RT_DOMAIN="$SSL_DOMAIN" \
+            RT_DOCUMENT_ROOT="$doc_root" \
+            RT_PROJECT_DIR="$(dirname "$doc_root")" \
+            RT_PHP_VERSION="$php_version" \
+            RT_FPM_SOCKET="$fpm_socket" \
+            RT_PORT="${nuxt_port:-0}" \
+            render_template "$template_file"
+        ) || exit 1
+
+        existing_inner=$(sed -n '/^server {/,/^}$/p' <<<"$rendered_template" \
             | sed '1d;$d' \
             | grep -v 'listen 80\|listen \[::\]:80' \
             | sed '/well-known/,/}/d' \
-            | grep -v 'add_header X-Frame-Options\|add_header X-Content-Type-Options\|add_header X-XSS-Protection\|add_header Referrer-Policy' \
-            | sed "s|{DOMAIN}|${SSL_DOMAIN}|g" \
-            | sed "s|{DOCUMENT_ROOT}|${doc_root}|g" \
-            | sed "s|{PHP_VERSION}|${php_version}|g" \
-            | sed "s|{FPM_SOCKET}|${fpm_socket}|g" \
-            | sed "s|{PORT}|${nuxt_port:-3000}|g")
+            | grep -v 'add_header X-Frame-Options\|add_header X-Content-Type-Options\|add_header X-XSS-Protection\|add_header Referrer-Policy')
 
         # Fail loudly rather than writing a config with unfilled placeholders
         if grep -q '{[A-Z_]\+}' <<<"$existing_inner"; then
@@ -729,12 +848,21 @@ NGINX_CONF
             apache_template="${SCRIPT_DIR}/vhost/templates/apache-${apache_type}.conf"
             [[ ! -f "$apache_template" ]] && apache_template="${SCRIPT_DIR}/vhost/templates/apache-laravel.conf"
 
-            existing_inner=$(sed -n '/<VirtualHost/,/<\/VirtualHost>/p' "$apache_template" \
-                | sed '1d;$d' \
-                | sed "s|{DOMAIN}|${SSL_DOMAIN}|g" \
-                | sed "s|{DOCUMENT_ROOT}|${doc_root}|g" \
-                | sed "s|{PHP_VERSION}|${php_version}|g" \
-                | sed "s|{FPM_SOCKET}|${fpm_socket}|g")
+            # Render through the shared helper, then extract. This also
+            # resolves ${APACHE_LOG_DIR}, which is defined only in Debian's
+            # /etc/apache2/envvars - leaving it literal made every SSL vhost
+            # on RHEL + Apache fail to load.
+            rendered_apache=$(
+                RT_DOMAIN="$SSL_DOMAIN" \
+                RT_DOCUMENT_ROOT="$doc_root" \
+                RT_PROJECT_DIR="$(dirname "$doc_root")" \
+                RT_PHP_VERSION="$php_version" \
+                RT_FPM_SOCKET="$fpm_socket" \
+                render_template "$apache_template"
+            ) || exit 1
+
+            existing_inner=$(sed -n '/<VirtualHost/,/<\/VirtualHost>/p' <<<"$rendered_apache" \
+                | sed '1d;$d')
 
             # Fail loudly rather than writing a config with unfilled placeholders
             # (note: ${APACHE_LOG_DIR} and %{REQUEST_FILENAME} are Apache's own

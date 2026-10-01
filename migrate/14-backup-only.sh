@@ -436,27 +436,22 @@ if [[ "$do_db" == "true" ]]; then
                 set +e
                 # Stream to a here-doc'd remote script: write a private my.cnf,
                 # mysqldump | gzip, capture and forward to local file
-                ssh -p "$BK_SOURCE_PORT" "${BK_SOURCE_USER}@${BK_SOURCE_HOST}" \
-                    "bash -s" <<REMOTE_DUMP > "$db_dump" 2>"$dump_err_file"
-#!/bin/bash
-_tmpdir=\$(mktemp -d)
-_cnf="\${_tmpdir}/.my.cnf"
-chmod 700 "\${_tmpdir}"
-cat > "\${_cnf}" <<CNF
-[client]
-host=${BK_DB_HOST}
-user=${BK_DB_USER}
-password=${BK_DB_PASS}
-CNF
-chmod 600 "\${_cnf}"
-mysqldump --defaults-extra-file="\${_cnf}" \
-    '${BK_DB_NAME}' --single-transaction --quick --routines --triggers --events \
-    | gzip -c
-rc=\${PIPESTATUS[0]}
-rm -rf "\${_tmpdir}"
-exit \$rc
-REMOTE_DUMP
-                dump_rc=$?
+                # Credentials over STDIN only: ssh re-parses anything on its
+                # command line, which mangled passwords containing $ # or a
+                # space. See db_remote_dump_stream in dbconn.sh.
+                #
+                # gzip runs locally rather than remotely so the remote script
+                # stays a plain mysqldump; the wire is already ssh-compressed.
+                db_remote_dump_stream \
+                    "$BK_DB_USER" "$BK_DB_PASS" "$BK_DB_NAME" "$BK_DB_HOST" \
+                    --single-transaction --quick --routines --triggers --events \
+                | ssh -p "$BK_SOURCE_PORT" \
+                      "${BK_SOURCE_USER}@${BK_SOURCE_HOST}" \
+                      "bash -s" 2>"$dump_err_file" \
+                | gzip -c > "$db_dump"
+                # ssh's status, not gzip's: gzip succeeds happily on an empty
+                # stream, so $? would hide a failed dump.
+                dump_rc=${PIPESTATUS[1]}
                 set -e
 
                 if [[ -s "$dump_err_file" ]]; then

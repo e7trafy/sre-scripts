@@ -197,12 +197,18 @@ esac
 # Read and substitute placeholders
 # FPM socket: per-project when the site has a dedicated pool, shared otherwise
 fpm_socket=$(iso_socket_or_shared "$VHOST_DOMAIN" "$php_version")
-vhost_content=$(cat "$template_file")
-vhost_content="${vhost_content//\{DOMAIN\}/$VHOST_DOMAIN}"
-vhost_content="${vhost_content//\{DOCUMENT_ROOT\}/$VHOST_ROOT}"
-vhost_content="${vhost_content//\{PHP_VERSION\}/$php_version}"
-vhost_content="${vhost_content//\{PORT\}/$VHOST_PORT}"
-vhost_content="${vhost_content//\{FPM_SOCKET\}/$fpm_socket}"
+# Rendered by lib.sh's render_template so step 8 and step 11 fill placeholders
+# through the same code path, and so an unset token fails loudly here instead
+# of reaching nginx as a literal {TOKEN}.
+vhost_content=$(
+    RT_DOMAIN="$VHOST_DOMAIN" \
+    RT_DOCUMENT_ROOT="$VHOST_ROOT" \
+    RT_PROJECT_DIR="$project_base" \
+    RT_PHP_VERSION="$php_version" \
+    RT_PORT="$VHOST_PORT" \
+    RT_FPM_SOCKET="$fpm_socket" \
+    render_template "$template_file"
+) || exit 1
 
 # --- Determine destination path ---
 case "$web_server" in
@@ -287,46 +293,18 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         chmod 755 "$subpath_dir"
     fi
 
-    echo "$vhost_content" > "$vhost_dest"
-    sre_success "Written vhost config: $vhost_dest"
-
-    # Create symlink for Debian-style sites-enabled
-    if [[ -n "$vhost_link" ]]; then
-        ln -sf "$vhost_dest" "$vhost_link"
-        sre_success "Enabled site: $vhost_link"
+    # Write + test + reload, rolling back on failure.
+    #
+    # This previously wrote the file, created the sites-enabled symlink, ran
+    # the config test, and on failure printed an error and exited - leaving a
+    # BROKEN CONFIG ENABLED. The running server keeps its last-good config in
+    # memory, so nothing looks wrong until the next reload from any other
+    # script (or a reboot) fails to start every site on the host.
+    if ! webserver_apply_or_rollback \
+            "$vhost_dest" "$vhost_content" "$vhost_link" "$web_server"; then
+        sre_error "Vhost not applied for ${VHOST_DOMAIN}."
+        exit 1
     fi
-
-    # Test configuration
-    case "$web_server" in
-        nginx)
-            if nginx -t 2>&1; then
-                sre_success "Nginx config test passed"
-                svc_reload nginx
-                sre_success "Nginx reloaded"
-            else
-                sre_error "Nginx config test failed! Check: $vhost_dest"
-                exit 1
-            fi
-            ;;
-        apache)
-            test_cmd=""
-            case "$os_family" in
-                debian) test_cmd="apachectl configtest" ;;
-                rhel)   test_cmd="httpd -t" ;;
-            esac
-            if $test_cmd 2>&1; then
-                sre_success "Apache config test passed"
-                case "$os_family" in
-                    debian) svc_reload apache2 ;;
-                    rhel)   svc_reload httpd ;;
-                esac
-                sre_success "Apache reloaded"
-            else
-                sre_error "Apache config test failed! Check: $vhost_dest"
-                exit 1
-            fi
-            ;;
-    esac
 else
     sre_info "[DRY-RUN] Would apply isolated ownership on /var/www/${VHOST_DOMAIN} (owner $proj_user)"
     [[ "$VHOST_TYPE" == "moodle" ]] && sre_info "[DRY-RUN] Would apply isolated ownership on moodledata (prompted path, may be external block storage)"

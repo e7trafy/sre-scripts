@@ -728,6 +728,7 @@ fix_php_version() {
 
     if [[ "$SRE_DRY_RUN" != "true" ]]; then
         backup_config "$vhost_file"
+        local vhost_backup="${SRE_LAST_BACKUP:-}"
 
         # Replace PHP version in vhost config (socket path and any version references)
         if [[ -n "$current_ver" ]]; then
@@ -767,7 +768,11 @@ fix_php_version() {
                     sre_success "Nginx reloaded"
                 else
                     sre_error "Nginx config test failed! Restoring backup..."
-                    cp "${vhost_file}.bak."* "$vhost_file" 2>/dev/null || true
+                    # backup_config writes to /etc/sre-helpers/backups/, NOT
+                    # beside the original, so the old "${vhost_file}.bak.*"
+                    # glob never matched and this restored nothing.
+                    restore_config "$vhost_file" "$vhost_backup" || \
+                        sre_error "Restore failed - $vhost_file left as written."
                     return 1
                 fi
                 ;;
@@ -875,6 +880,7 @@ fix_nuxt_port() {
     # proxy_pass line, so replacing only the first would leave HTTPS broken.
     if [[ "$SRE_DRY_RUN" != "true" ]]; then
         backup_config "$vhost_file"
+        local vhost_backup="${SRE_LAST_BACKUP:-}"
 
         sed -i "s|proxy_pass[[:space:]]\+http://127\.0\.0\.1:${current_port}\b|proxy_pass http://127.0.0.1:${suggested}|g" \
             "$vhost_file"
@@ -885,10 +891,10 @@ fix_nuxt_port() {
 
         if ! nginx -t 2>&1; then
             sre_error "Nginx config test failed after rewrite — restoring backup."
-            # backup_config saved <file>.bak.<timestamp>; pick the newest.
-            local backup
-            backup=$(ls -1t "${vhost_file}.bak."* 2>/dev/null | head -1)
-            [[ -n "$backup" ]] && cp "$backup" "$vhost_file"
+            # The old glob looked beside the original; backup_config writes to
+            # /etc/sre-helpers/backups/, so it silently restored nothing.
+            restore_config "$vhost_file" "$vhost_backup" || \
+                sre_error "Restore failed - $vhost_file left as written."
             return 1
         fi
         svc_reload nginx
@@ -1200,7 +1206,7 @@ PRESETEOF
                         _set_ini "max_input_time"       "600"   "$ini_file"
 
                         sre_success "Updated: $ini_file"
-                        ((touched++))
+                        touched=$((touched + 1))
                     done
 
                     if [[ $touched -eq 0 ]]; then
@@ -1220,13 +1226,25 @@ PRESETEOF
                     if prompt_yesno "Also update nginx client_max_body_size to 256M?" "yes"; then
                         local nginx_conf="/etc/nginx/conf.d/security.conf"
                         if [[ -f "$nginx_conf" ]]; then
-                            if grep -q "client_max_body_size" "$nginx_conf"; then
+                            backup_config "$nginx_conf"
+                            local sec_backup="${SRE_LAST_BACKUP:-}"
+                            backup_config "$nginx_conf"
+                        local sec_backup="${SRE_LAST_BACKUP:-}"
+                        if grep -q "client_max_body_size" "$nginx_conf"; then
                                 sed -i "s/client_max_body_size.*/client_max_body_size 256M;/" "$nginx_conf"
                             else
                                 echo "client_max_body_size 256M;" >> "$nginx_conf"
                             fi
-                            nginx -t 2>/dev/null && svc_reload nginx
-                            sre_success "Nginx client_max_body_size updated to 256M"
+                            # Don't claim success on a failed config test:
+                            # the && meant a bad config silently skipped the
+                            # reload while still reporting "updated".
+                            if nginx -t >/dev/null 2>&1; then
+                                svc_reload nginx
+                                sre_success "Nginx client_max_body_size updated to 256M"
+                            else
+                                sre_error "nginx -t failed after editing $nginx_conf - not reloading."
+                                restore_config "$nginx_conf" "$sec_backup" || true
+                            fi
                         else
                             sre_warning "Nginx security.conf not found at $nginx_conf — skipped"
                         fi
@@ -1257,7 +1275,7 @@ PRESETEOF
                         echo "max_input_vars = ${new_val}" >> "$ini_file"
                     fi
                     sre_success "Updated: $ini_file"
-                    ((touched++))
+                    touched=$((touched + 1))
                 done
 
                 if [[ $touched -eq 0 ]]; then
@@ -1297,8 +1315,13 @@ PRESETEOF
                         else
                             echo "client_max_body_size ${new_size};" >> "$nginx_conf"
                         fi
-                        nginx -t 2>/dev/null && svc_reload nginx
-                        sre_success "Nginx client_max_body_size updated to ${new_size}"
+                        if nginx -t >/dev/null 2>&1; then
+                            svc_reload nginx
+                            sre_success "Nginx client_max_body_size updated to ${new_size}"
+                        else
+                            sre_error "nginx -t failed after editing $nginx_conf - not reloading."
+                            restore_config "$nginx_conf" "$sec_backup" || true
+                        fi
                     else
                         sre_warning "Nginx security.conf not found at $nginx_conf"
                     fi
@@ -1509,7 +1532,7 @@ fix_nginx() {
                 sre_info "Check socket path matches nginx config:"
                 grep -r "fastcgi_pass\|php-fpm" /etc/nginx/sites-enabled/ 2>/dev/null | head -5
                 sre_info "FPM listen directive:"
-                grep -r "^listen\s*=" /etc/php/${php_ver}/fpm/pool.d/ 2>/dev/null | head -5
+                grep -r "^listen\s*=" "/etc/php/${php_ver}/fpm/pool.d/" 2>/dev/null | head -5
             else
                 sre_warning "$fpm_svc is NOT running"
                 if prompt_yesno "Restart $fpm_svc?" "yes"; then
@@ -1656,7 +1679,7 @@ EOCNF
                         while IFS= read -r tbl; do
                             [[ -z "$tbl" ]] && continue
                             $mysql_cmd -e "ALTER TABLE \`${db_name}\`.\`${tbl}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE ${collation};" 2>&1 || true
-                            ((count++))
+                            count=$((count + 1))
                         done <<< "$tables"
                         sre_success "Converted $count tables in '$db_name' to utf8mb4"
                     else

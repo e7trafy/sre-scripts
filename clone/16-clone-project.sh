@@ -1845,7 +1845,7 @@ if [[ "$do_db" == "true" ]] && ! progress_phase_done DB; then
             src_db_bytes=$($mysql_cmd -N -B -e \
                 "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema='${src_db_name}';" 2>/dev/null || echo 0)
             if [[ "$src_db_bytes" =~ ^[0-9]+$ ]] && [[ "$src_db_bytes" -gt 0 ]]; then
-                sre_info "Source DB size (approx): $(numfmt --to=iec --suffix=B $src_db_bytes 2>/dev/null || echo "${src_db_bytes}B")"
+                sre_info "Source DB size (approx): $(numfmt --to=iec --suffix=B "$src_db_bytes" 2>/dev/null || echo "${src_db_bytes}B")"
             fi
 
             # Build dump arg vector. --ignore-table applies to BOTH skip lists
@@ -2246,14 +2246,16 @@ vhost_args=( --domain "$CL_TARGET_DOMAIN" --type "$src_type" --yes )
 
 if [[ "$src_type" == "nuxt" ]]; then
     # Source port from source vhost; pick next free
-    src_port=$( { grep -oP 'proxy_pass\s+http://127\.0\.0\.1:\K[0-9]+' "$src_vhost" || true; } | head -1)
-    src_port="${src_port:-3000}"
-    new_port=$((src_port + 1))
-    while ss -tlnp 2>/dev/null | grep -q ":${new_port} " ; do
-        new_port=$((new_port + 1))
-        [[ $new_port -gt 65000 ]] && { sre_error "No free port"; exit 1; }
-    done
-    sre_info "Source Nuxt port: $src_port → target: $new_port"
+    src_port="$(nuxt_port_from_conf "$src_vhost")"
+    # Allocate through the shared helper: it scans every sibling vhost AND the
+    # live listeners, so a Nuxt site that is configured but currently stopped
+    # is still treated as taken. The old src_port+1 probed `ss` only, so a
+    # stopped sibling was invisible and the clone collided with it on start.
+    new_port="$(nuxt_alloc_port "$CL_TARGET_DOMAIN" "$web_server")" || {
+        sre_error "No free Nuxt proxy port available."
+        exit 1
+    }
+    sre_info "Source Nuxt port: ${src_port:-unknown} → target: $new_port"
     vhost_args+=( --port "$new_port" --root "$tgt_doc_root" )
     CL_TGT_PORT="$new_port"
 else
@@ -2330,8 +2332,18 @@ case "$src_type" in
                 [[ -f "${tgt_proj_base}/current/$f" ]] && { entry="${tgt_proj_base}/current/$f"; break; }
             done
             if [[ -n "$entry" ]]; then
+                # PM2 must bind the port nginx proxies to. A :-3001 default
+                # would silently start the app somewhere nginx never looks.
+                if [[ -z "${CL_TGT_PORT:-}" ]]; then
+                    CL_TGT_PORT="$(nuxt_port_from_conf "$(get_vhost_dir "$web_server")/${CL_TARGET_DOMAIN}.conf")"
+                fi
+                if [[ -z "${CL_TGT_PORT:-}" ]]; then
+                    sre_error "No proxy port known for ${CL_TARGET_DOMAIN}; not starting PM2."
+                    sre_error "Check the vhost, then: pm2 start '$entry' --name '$CL_TARGET_DOMAIN'"
+                    exit 1
+                fi
                 pm2 delete "$CL_TARGET_DOMAIN" 2>/dev/null || true
-                PORT="${CL_TGT_PORT:-3001}" pm2 start "$entry" \
+                PORT="${CL_TGT_PORT}" pm2 start "$entry" \
                     --name "$CL_TARGET_DOMAIN" \
                     --cwd "${tgt_proj_base}/current" \
                     --update-env

@@ -196,9 +196,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
     # Check current ImageMagick version
     current_im_ver=""
     if command -v magick &>/dev/null; then
-        current_im_ver=$(magick --version 2>/dev/null | head -1 | grep -oP 'ImageMagick \K[0-9]+')
+        current_im_ver=$( { magick --version 2>/dev/null | head -1 | grep -oP 'ImageMagick \K[0-9]+' || true; } )
     elif command -v convert &>/dev/null; then
-        current_im_ver=$(convert --version 2>/dev/null | head -1 | grep -oP 'ImageMagick \K[0-9]+')
+        current_im_ver=$( { convert --version 2>/dev/null | head -1 | grep -oP 'ImageMagick \K[0-9]+' || true; } )
     fi
 
     # Skipping requires BOTH conditions: version 7 AND the Arabic shaping
@@ -489,6 +489,8 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
             sre_error "  imagick does NOT load for PHP ${_php_ver} despite building."
             # Distinguish the two causes instead of leaving it to guesswork:
             # the .so in the wrong place, versus the .ini never being read.
+            # shellcheck disable=SC2086  # _php_ver is part of the binary
+            # NAME (php-config8.3), not an argument; quoting would break it.
             _ed=$(/usr/bin/php-config${_php_ver} --extension-dir 2>/dev/null \
                   || php-config --extension-dir 2>/dev/null || true)
             if [[ -n "$_ed" && -f "${_ed}/imagick.so" ]]; then

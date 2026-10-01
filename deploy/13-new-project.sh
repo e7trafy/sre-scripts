@@ -915,7 +915,15 @@ MOODLE_CONFIG
                         # is the source of truth (11-ssl.sh reads it the same way);
                         # PM2 must bind that exact port or nginx will proxy blindly.
                         nuxt_port=$(nuxt_port_from_conf "$vhost_conf_path")
-                        [[ -z "$nuxt_port" ]] && nuxt_port="3000"
+                        # No 3000 fallback: the vhost step 8 just wrote is the
+                        # source of truth, and defaulting to a constant is how
+                        # every Nuxt site ended up proxying to the same app
+                        # (2eb1384). If it cannot be read, stop.
+                        if [[ -z "$nuxt_port" ]]; then
+                            sre_error "No proxy port found in $vhost_conf_path."
+                            sre_error "Re-run step 8 for this domain, then retry."
+                            exit 1
+                        fi
                         sre_info "PM2 will bind PORT=${nuxt_port} (HOST=127.0.0.1)"
 
                         # PM2 runs a per-project daemon as the project user.

@@ -231,15 +231,103 @@ fi
 sre_header "SSH Hardening"
 
 if prompt_yesno "Harden SSH? (disable root password login, enforce key auth)" "yes"; then
-    sshd_config="/etc/ssh/sshd_config"
     if [[ "$SRE_DRY_RUN" != "true" ]]; then
-        backup_config "$sshd_config"
-        # Disable root password login
-        sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
-        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$sshd_config"
-        sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$sshd_config"
-        svc_restart sshd
-        sre_success "SSH hardened: root password login disabled, key auth enforced"
+        # Refuse to turn off password auth unless a usable key is already
+        # installed, or this run locks the operator out of the box. This
+        # defaults to "yes", so under --yes it applied unattended.
+        #
+        # Check the invoking user's keys, not root's: cloud-init's
+        # disable_root installs a forced-command "Please login as..." key in
+        # root's authorized_keys, so a bare non-empty test on root passes
+        # while no usable login key exists.
+        _ssh_key_user="${SUDO_USER:-root}"
+        _ssh_key_home=$(getent passwd "$_ssh_key_user" 2>/dev/null | cut -d: -f6 || true)
+        [[ -n "$_ssh_key_home" ]] || _ssh_key_home="/root"
+        _have_key="false"
+        for _ak in "${_ssh_key_home}/.ssh/authorized_keys" /root/.ssh/authorized_keys; do
+            [[ -f "$_ak" ]] || continue
+            # A real key line, ignoring comments, blanks, and the cloud-init
+            # forced-command placeholder.
+            if grep -qE '^[^#].*ssh-(rsa|ed25519|dss)|^[^#].*ecdsa-sha2' "$_ak" 2>/dev/null \
+               && ! grep -q 'Please login as' "$_ak" 2>/dev/null; then
+                _have_key="true"
+                break
+            fi
+        done
+
+        if [[ "$_have_key" != "true" ]]; then
+            sre_warning "No usable SSH public key found for '${_ssh_key_user}' or root."
+            sre_warning "Disabling password authentication now would lock you out."
+            sre_skipped "SSH hardening skipped — add a key (step 9), then re-run."
+        else
+            # Write a drop-in rather than sed-ing sshd_config. Ubuntu's
+            # sshd_config starts with `Include sshd_config.d/*.conf` and sshd
+            # keeps the FIRST value it reads, so edits to the main file can be
+            # silently overridden by a cloud-init drop-in while this reports
+            # success. A 00- prefix sorts ahead of the vendor drop-ins.
+            sshd_dropin_dir="/etc/ssh/sshd_config.d"
+            sshd_config="/etc/ssh/sshd_config"
+            if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$sshd_config" 2>/dev/null \
+               && [[ -d "$sshd_dropin_dir" ]]; then
+                sshd_target="${sshd_dropin_dir}/00-sre-hardening.conf"
+                # Remember whether we created this file, so a revert removes
+                # only our own drop-in and never an administrator's.
+                sshd_target_was_new="false"
+                [[ -f "$sshd_target" ]] || sshd_target_was_new="true"
+                backup_config "$sshd_target"
+                sshd_backup="${SRE_LAST_BACKUP:-}"
+                cat > "$sshd_target" <<'SSHD'
+# Managed by sre-helpers (step 1). Remove this file to revert.
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+SSHD
+                chmod 644 "$sshd_target"
+            else
+                # No Include support (older sshd): fall back to editing in place.
+                sshd_target="$sshd_config"
+                sshd_target_was_new="false"
+                backup_config "$sshd_config"
+                sshd_backup="${SRE_LAST_BACKUP:-}"
+                sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
+                sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$sshd_config"
+                sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$sshd_config"
+            fi
+
+            # Revert safely. Never `rm -f` the target blindly: on the
+            # in-place path that is /etc/ssh/sshd_config itself, and deleting
+            # it would leave the host with no sshd config at all.
+            _sshd_revert() {
+                if [[ -n "${sshd_backup:-}" ]]; then
+                    restore_config "$sshd_target" "$sshd_backup" || \
+                        sre_error "Could not restore $sshd_target - check it by hand."
+                elif [[ "${sshd_target_was_new:-false}" == "true" ]]; then
+                    # Our own drop-in, which did not exist before this run.
+                    rm -f "$sshd_target"
+                    sre_info "Removed $sshd_target"
+                else
+                    sre_error "No backup for $sshd_target and it is not ours - leaving as is."
+                fi
+            }
+
+            # Validate syntax, then confirm the EFFECTIVE config, since a
+            # drop-in elsewhere can still win. `sshd -t` only checks syntax.
+            if ! sshd -t 2>/dev/null; then
+                sre_error "sshd config test failed — reverting, not restarting."
+                sshd -t 2>&1 | sed 's/^/    /' >&2 || true
+                _sshd_revert
+                sre_skipped "SSH hardening reverted."
+            elif ! sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then
+                sre_error "Another sshd drop-in still enables password auth."
+                sre_error "Check: sshd -T | grep -Ei 'passwordauthentication|permitrootlogin'"
+                _sshd_revert
+                sre_skipped "SSH hardening reverted (would not have taken effect)."
+            else
+                svc_restart sshd
+                sre_success "SSH hardened via ${sshd_target}"
+                sre_info "Keep this session open and verify a NEW login before closing it."
+            fi
+        fi
     else
         sre_info "[DRY-RUN] Would harden SSH configuration"
     fi
