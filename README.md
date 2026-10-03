@@ -20,7 +20,7 @@ Supports **LAMP** and **LEMP** stacks for **Laravel**, **Moodle**, **Nuxt**, and
 ```bash
 git clone https://github.com/e7trafy/sre-scripts.git /opt/sre-scripts
 cd /opt/sre-scripts
-chmod +x common/lib.sh server/*.sh stack/*.sh tuning/*.sh vhost/*.sh migrate/*.sh ssl/*.sh
+chmod +x */*.sh
 ```
 
 ---
@@ -30,11 +30,12 @@ chmod +x common/lib.sh server/*.sh stack/*.sh tuning/*.sh vhost/*.sh migrate/*.s
 | Step | Script | Purpose | Required |
 |------|--------|---------|----------|
 | 0 | `server/00-block-volume.sh` | Mount Oracle block volume as `/var` | Optional |
+| 0b | `server/00-block-to-boot.sh` | Move `/var` back off a block volume onto the boot disk | Optional |
 | 1 | `server/01-base-setup.sh` | Detect specs, choose LAMP/LEMP, PHP version, DB engine, SSH hardening | Yes |
 | 2 | `server/02-firewall.sh` | Configure ufw (Ubuntu) or firewalld (Oracle Linux) | Yes |
 | 3 | `stack/03-web-server.sh` | Install Nginx or Apache with secure defaults | Yes |
 | 4 | `stack/04-php.sh` | Install PHP-FPM + 15 extensions | Yes |
-| 5 | `stack/05-database.sh` | Install MariaDB / MySQL / PostgreSQL | If using DB |
+| 5 | `stack/05-database.sh` | Install MariaDB / MySQL / PostgreSQL, or point the stack at a remote DB — [docs](docs/remote-database.md) | If using DB |
 | 6 | `stack/06-node.sh` | Install Node.js + PM2 + Composer | If using Node/PHP |
 | 7 | `tuning/07-tune.sh` | Auto-tune PHP-FPM, Nginx/Apache, DB based on server specs | Yes |
 | 8 | `vhost/08-vhost.sh` | Create virtual host for a project | Per project |
@@ -49,10 +50,12 @@ chmod +x common/lib.sh server/*.sh stack/*.sh tuning/*.sh vhost/*.sh migrate/*.s
 | 17 | `stack/17-phpmyadmin.sh` | Install phpMyAdmin (optional, protection-on-by-default) | Optional |
 | 18 | `ssl/18-custom-ssl.sh` | Install a custom wildcard / single SSL cert across vhosts | Optional |
 | 19 | `vhost/19-mount-subpath.sh` | Mount a project as a subpath under another (e.g. `host.tld/lms`) — [docs](docs/step-19-mount-subpath.md) | Optional |
+| 20 | `migrate/20-isolate-existing.sh` | Retrofit per-project user + FPM pool isolation onto existing sites | Optional |
+| 21 | `setup/21-claude-code.sh` | Install Claude Code with agents, skills and MCP servers | Optional |
 
 Each script prints a full step map at the end showing your progress and the recommended next step.
 
-Optional steps (12–19) are runbooks for specific operations — see [`docs/`](docs/) for detailed usage of the more involved ones.
+Optional steps (12–21) are runbooks for specific operations — see [`docs/`](docs/) for detailed usage of the more involved ones.
 
 ---
 
@@ -270,13 +273,19 @@ This file is sourced by every script. Backups are saved to `/etc/sre-helpers/bac
 ## Structure
 
 ```
-common/lib.sh          # Shared library: logging, OS detection, config, prompts
+common/                # lib.sh (logging, OS detection, config, prompts, templates),
+                       # dbconn.sh (local/remote DB), isolation.sh (per-project users)
 server/                # 00-block-volume, 00-block-to-boot, 01-base-setup, 02-firewall, 09-ssh-keys
-stack/                 # 03-web-server, 04-php, 05-database, 06-node
+stack/                 # 03-web-server, 04-php, 05-database, 06-node, 17-phpmyadmin
 tuning/                # 07-tune
-vhost/                 # 08-vhost + templates/
-migrate/               # 10-migrate-cpanel
-ssl/                   # 11-ssl
+vhost/                 # 08-vhost, 19-mount-subpath + templates/
+ssl/                   # 11-ssl, 18-custom-ssl
+fixes/                 # 12-fixes
+deploy/                # 13-new-project
+migrate/               # 10-migrate-cpanel, 14-backup-only, 15-migrate-cpanel-bulk, 20-isolate-existing
+clone/                 # 16-clone-project
+setup/                 # 21-claude-code
+docs/                  # per-step runbooks
 ```
 
 ---
