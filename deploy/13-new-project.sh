@@ -492,16 +492,18 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 exit 1
             fi
 
-            # Create current symlink (remove dir if vhost step created it)
-            [[ -d "${project_dir}/current" && ! -L "${project_dir}/current" ]] && rm -rf "${project_dir}/current"
-            ln -sfn "$release_dir" "${project_dir}/current"
+            # Point current at the release (moves aside a real dir that the
+            # vhost step's mkdir may have created)
+            release_activate "$project_dir" "$release_dir" || exit 1
             sre_success "Release directory: $release_dir"
             sre_success "Current symlink → $release_dir"
 
             # Symlink shared resources
             if [[ -d "${project_dir}/shared/storage" ]]; then
                 rm -rf "${release_dir}/storage"
-                ln -sfn "${project_dir}/shared/storage" "${release_dir}/storage"
+                # Relative, so a clone of this project links to ITS OWN
+                # shared/ instead of this project's.
+                ln -sfn ../../shared/storage "${release_dir}/storage"
                 sre_success "Linked shared/storage"
             fi
 
@@ -562,8 +564,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 exit 1
             fi
 
-            [[ -d "${project_dir}/current" && ! -L "${project_dir}/current" ]] && rm -rf "${project_dir}/current"
-            ln -sfn "$release_dir" "${project_dir}/current"
+            release_activate "$project_dir" "$release_dir" || exit 1
             sre_success "Cloned and linked: current → $release_dir"
             local_root="$release_dir"
             ;;
@@ -583,8 +584,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 exit 1
             fi
 
-            [[ -d "${project_dir}/current" && ! -L "${project_dir}/current" ]] && rm -rf "${project_dir}/current"
-            ln -sfn "$release_dir" "${project_dir}/current"
+            release_activate "$project_dir" "$release_dir" || exit 1
             sre_success "Cloned and linked: current → $release_dir"
             local_root="$release_dir"
             ;;
@@ -604,8 +604,7 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
                 exit 1
             fi
 
-            [[ -d "${project_dir}/current" && ! -L "${project_dir}/current" ]] && rm -rf "${project_dir}/current"
-            ln -sfn "$release_dir" "${project_dir}/current"
+            release_activate "$project_dir" "$release_dir" || exit 1
             sre_success "Cloned and linked: current → $release_dir"
             local_root="$release_dir"
             ;;

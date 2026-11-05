@@ -2234,26 +2234,14 @@ fix_staging_protection() {
     domain=$(prompt_choice "Clone to (re)protect:" "${candidates[@]}")
     state="${state_dir}/${domain}.conf"
 
-    # It holds the staging password and is sourced below: root-owned, 600 only.
-    local own
-    own=$(stat -c '%u:%a' "$state" 2>/dev/null || true)
-    if [[ "$own" != "0:600" ]]; then
-        sre_error "Refusing to read $state: expected root-owned mode 600, found ${own:-unknown}"
+    # Holds the staging password: state_file_read insists on root:600 and
+    # sources it in a subshell. Later lines win (step 16 appends).
+    local fields=()
+    mapfile -d '' -t fields < <(state_file_read "$state" CL_PROTECT_USER CL_PROTECT_PASS \
+        CL_HTPASSWD_FILE CL_ALLOW_IPS CL_NOINDEX CL_HTPASSWD)
+    if [[ ${#fields[@]} -ne 6 ]]; then
         return 1
     fi
-
-    # Values were written with printf %q, so sourcing is the faithful reader.
-    # Subshell: nothing else in the file can touch this shell. NUL-separated
-    # so no value can split into two. Later lines win (step 16 appends).
-    local fields=()
-    mapfile -d '' -t fields < <(
-        CL_PROTECT_USER="" CL_PROTECT_PASS="" CL_HTPASSWD_FILE="" CL_ALLOW_IPS=""
-        CL_NOINDEX="yes" CL_HTPASSWD=""
-        # shellcheck source=/dev/null
-        . "$state" >/dev/null 2>&1
-        printf '%s\0' "$CL_PROTECT_USER" "$CL_PROTECT_PASS" "$CL_HTPASSWD_FILE" \
-                      "$CL_ALLOW_IPS" "$CL_NOINDEX" "$CL_HTPASSWD"
-    )
     local user="${fields[0]:-}" pass="${fields[1]:-}" old_htfile="${fields[2]:-}"
     local allow="${fields[3]:-}" noindex="${fields[4]:-yes}" htpw="${fields[5]:-}"
     # Clones made before CL_HTPASSWD was recorded: an htpasswd path means it was on.

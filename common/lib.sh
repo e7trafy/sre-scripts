@@ -1854,6 +1854,217 @@ _protect_log_hints() {
 }
 
 ################################################################################
+# Release layout helpers (step 13 deploys, step 16 clones)
+#
+#   <base>/releases/<ts>/   one directory per release
+#   <base>/current          symlink to the live release (the vhost root)
+#   <base>/shared/          .env + storage, linked into every release
+################################################################################
+
+# release_activate <base> <release_dir>
+# Point <base>/current at <release_dir>. When current is a real directory -
+# left by step 8's `mkdir -p <root>`, a flat copy, or an earlier broken run -
+# `ln -sfn` cannot replace it and instead drops the link INSIDE it
+# (current/<ts>), so the site keeps serving the stale directory. Move it aside
+# (reversible, never rm -rf), link, then prove the link resolves.
+release_activate() {
+    local base="${1%/}" rel="$2" cur aside
+    cur="${base}/current"
+    if [[ ! -d "$rel" ]]; then
+        sre_error "Release directory missing: $rel"
+        return 1
+    fi
+    if [[ -d "$cur" && ! -L "$cur" ]]; then
+        aside="${base}/current.pre-$(date +%Y%m%d%H%M%S)"
+        mv "$cur" "$aside" || { sre_error "Could not move $cur aside"; return 1; }
+        sre_warning "${cur} was a real directory, not a symlink - moved aside to ${aside}"
+        sre_warning "  Inspect it, then remove it: rm -rf '${aside}'"
+    fi
+    ln -sfn "$rel" "$cur" || return 1
+    if [[ ! -L "$cur" || "$(readlink -f "$cur")" != "$(readlink -f "$rel")" ]]; then
+        sre_error "${cur} does not resolve to ${rel} after linking"
+        return 1
+    fi
+}
+
+# release_relink_symlinks <dir> <old_prefix> <new_prefix>
+# rsync -a copies symlinks verbatim, so a cloned release keeps absolute links
+# into the SOURCE project (storage -> /var/www/<src>/shared/storage,
+# .env -> /var/www/<src>/shared/.env, public/storage -> ...). The clone would
+# then read the source's .env and write into the source's storage. Rewrite
+# every link under <dir> whose target starts with <old_prefix> to the same
+# path under <new_prefix>. Sets RELINK_COUNT. node_modules and moodledata are
+# skipped (millions of files; npm links are relative, moodledata has none).
+RELINK_COUNT=0
+release_relink_symlinks() {
+    local dir="${1%/}" old="${2%/}" new="${3%/}" link tgt
+    RELINK_COUNT=0
+    [[ -d "$dir" && -n "$old" && "$old" != "$new" ]] || return 0
+    while IFS= read -r -d '' link; do
+        tgt=$(readlink "$link") || continue
+        case "$tgt" in
+            "$old"|"$old"/*)
+                ln -sfn "${new}${tgt#"$old"}" "$link" || return 1
+                RELINK_COUNT=$((RELINK_COUNT + 1))
+                ;;
+        esac
+    done < <(find "$dir" \( -name node_modules -o -name moodledata \) -prune -o -type l -print0)
+}
+
+# release_prune <base> <keep>
+# Delete all but the <keep> newest release dirs (by name - they are
+# timestamps). The live release is never deleted, whatever its age.
+release_prune() {
+    local base="${1%/}" keep="$2" live d n=0
+    local dirs=()
+    live=$(readlink -f "${base}/current" 2>/dev/null || true)
+    [[ -d "${base}/releases" ]] || return 0
+    mapfile -t dirs < <(find "${base}/releases" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' | sort -r)
+    for d in "${dirs[@]}"; do
+        n=$((n + 1))
+        [[ $n -le $keep ]] && continue
+        [[ "$(readlink -f "$d")" == "$live" ]] && continue
+        rm -rf -- "$d" && sre_info "Pruned old release: $d"
+    done
+}
+
+# laravel_env_resolve <app_dir> <base>
+# Print the .env file the app actually reads. Laravel loads <app_dir>/.env;
+# when that is a symlink, writing to the link path with `sed -i` would replace
+# the link with a copy, so resolve it. A release with no .env but a
+# shared/.env gets linked to it (relative, so it survives being cloned).
+# Refuses (return 1) when the file lives outside <base>: that is another
+# site's .env and must never be edited.
+laravel_env_resolve() {
+    local app="${1%/}" base="${2%/}" env real_base
+    env="${app}/.env"
+    if [[ ! -e "$env" && ! -L "$env" && -f "${base}/shared/.env" ]]; then
+        ln -s ../../shared/.env "$env" || return 1
+        # Relative only works for <base>/releases/<ts>; otherwise go absolute.
+        if [[ ! -e "$env" ]]; then
+            rm -f "$env"
+            ln -s "${base}/shared/.env" "$env" || return 1
+        fi
+    fi
+    [[ -e "$env" ]] || return 1
+    env=$(readlink -f "$env") || return 1
+    real_base=$(readlink -f "$base") || return 1
+    case "$env" in
+        "$real_base"/*) printf '%s\n' "$env" ;;
+        *) sre_error ".env resolves outside ${base}: ${env}"; return 1 ;;
+    esac
+}
+
+# laravel_clear_boot_cache <app_dir>
+# Delete Laravel's cached config/routes/events. While bootstrap/cache/config.php
+# exists Laravel never reads .env, so a clone keeps the SOURCE's DB, APP_URL
+# and paths no matter how .env is rewritten. Removing the files works even
+# when `artisan config:clear` cannot run.
+laravel_clear_boot_cache() {
+    local dir="${1%/}/bootstrap/cache" f
+    [[ -d "$dir" ]] || return 0
+    for f in "$dir"/config.php "$dir"/routes.php "$dir"/routes-*.php "$dir"/events.php; do
+        [[ -f "$f" ]] || continue
+        rm -f -- "$f" && sre_info "Removed cached $(basename "$f")"
+    done
+}
+
+# phpfpm_reload_all
+# Test then reload every running PHP-FPM service. Step 07 sets
+# opcache.validate_timestamps=0, so FPM keeps serving the code it compiled
+# until it is reloaded - a new release or .env is invisible until then.
+phpfpm_reload_all() {
+    local units u v bin rc=0
+    units=$( { systemctl list-units --type=service --state=running --no-legend --plain 'php*-fpm*' 2>/dev/null || true; } \
+        | awk '{print $1}')
+    [[ -n "$units" ]] || return 0
+    for u in $units; do
+        u="${u%.service}"
+        v="${u#php}"; v="${v%-fpm}"
+        bin="php-fpm${v}"
+        if command -v "$bin" >/dev/null 2>&1 && ! "$bin" -t >/dev/null 2>&1; then
+            sre_warning "${bin} -t failed - not reloading ${u}"
+            rc=1
+            continue
+        fi
+        svc_reload "$u" && sre_info "Reloaded ${u}" || rc=1
+    done
+    return $rc
+}
+
+# state_file_read <file> <var>...
+# Print the named variables from a root-owned mode-600 state file as
+# NUL-separated values, in order (absent -> empty). Values were written with
+# printf %q, so sourcing is the faithful reader; it runs in a subshell so the
+# file cannot touch the caller. Later lines win (callers append).
+# Usage: mapfile -d '' -t vals < <(state_file_read "$f" A B) || ...
+state_file_read() {
+    local file="$1" own
+    shift
+    own=$(stat -c '%u:%a' "$file" 2>/dev/null || true)
+    if [[ "$own" != "0:600" ]]; then
+        sre_error "Refusing to read $file: expected root-owned mode 600, found ${own:-unknown}"
+        return 1
+    fi
+    _state_file_source "$file" "$@"
+}
+# The reader without the ownership gate - for state_file_read and tests only.
+_state_file_source() {
+    local file="$1" v
+    shift
+    (
+        for v in "$@"; do unset "$v"; done
+        # shellcheck source=/dev/null
+        . "$file" >/dev/null 2>&1
+        for v in "$@"; do printf '%s\0' "${!v:-}"; done
+    )
+}
+
+# maint_on <vhost> <domain> <ws> / maint_off <domain> <ws>
+# Make a site answer 503 while its files and config are being replaced (a
+# clone --refresh copies the SOURCE's .env/config.php over the live clone
+# before rewriting them). The snippet goes in the <domain>-protect/ dir every
+# vhost already includes; maint_on goes through protect_apply, so a failed
+# config test rolls back. Fails safe: if a run dies, the site stays at 503.
+maint_snippet_file() {
+    printf '%s/00-maintenance.conf\n' "$(protect_snippet_dir "$1" "$2")"
+}
+maint_render() {
+    case "$1" in
+        nginx)  printf '%s\n' '# sre-helpers maintenance: removed when the refresh completes' 'return 503;' ;;
+        apache) printf '%s\n' '# sre-helpers maintenance: removed when the refresh completes' 'RedirectMatch 503 ^/' ;;
+        *) return 1 ;;
+    esac
+}
+maint_on() {
+    local vhost="$1" domain="$2" ws="$3" body
+    body="$(maint_render "$ws")" || { sre_error "Unknown web server: $ws"; return 1; }
+    protect_apply "$vhost" "$(maint_snippet_file "$domain" "$ws")" "$ws" "$body"
+}
+maint_off() {
+    local domain="$1" ws="$2" f held test_cmd reload_svc
+    f="$(maint_snippet_file "$domain" "$ws")"
+    [[ -f "$f" ]] || return 0
+    test_cmd="$(webserver_test_cmd "$ws")" || return 1
+    reload_svc="$(webserver_reload_svc "$ws")" || return 1
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would remove $f and reload ${reload_svc}"
+        return 0
+    fi
+    held="$(mktemp)"
+    mv "$f" "$held"
+    if $test_cmd >/dev/null 2>&1; then
+        svc_reload "$reload_svc"
+        rm -f "$held"
+        sre_success "Maintenance off: ${domain}"
+        return 0
+    fi
+    mv "$held" "$f"
+    sre_error "${ws} config test failed without the maintenance snippet - left it in place: $f"
+    return 1
+}
+
+################################################################################
 # Per-project isolation library (users, FPM pools, permissions)
 ################################################################################
 # shellcheck source=isolation.sh
