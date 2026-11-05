@@ -1928,6 +1928,30 @@ release_prune() {
     done
 }
 
+# disk_preflight <dest> <src_dir>
+# Refuse to start a copy of <src_dir> into <dest>'s filesystem unless the
+# copy plus a 10% / 1 GiB margin fits. A clone that fills the disk breaks
+# every site on the host (logs, sessions, MySQL), not just itself.
+disk_preflight() {
+    local dest="$1" src="$2" probe need_kb avail_kb margin_kb
+    probe="$dest"
+    while [[ ! -d "$probe" ]]; do probe="$(dirname "$probe")"; done
+    need_kb=$( { du -sk "$src" 2>/dev/null || true; } | awk '{print $1}')
+    avail_kb=$( { df -Pk "$probe" 2>/dev/null || true; } | awk 'NR==2 {print $4}')
+    if [[ ! "$need_kb" =~ ^[0-9]+$ || ! "$avail_kb" =~ ^[0-9]+$ ]]; then
+        sre_warning "Could not measure disk space for ${src} -> ${probe}; continuing"
+        return 0
+    fi
+    margin_kb=$(( need_kb / 10 ))
+    [[ $margin_kb -lt 1048576 ]] && margin_kb=1048576
+    if (( need_kb + margin_kb > avail_kb )); then
+        sre_error "Not enough disk space: copying ${src} needs ~$(( need_kb / 1024 )) MiB (+$(( margin_kb / 1024 )) MiB margin),"
+        sre_error "  only $(( avail_kb / 1024 )) MiB free on the filesystem of ${probe}."
+        sre_error "  Free space first (df -h; old releases, current.pre-* dirs, logs), then re-run."
+        return 1
+    fi
+}
+
 # laravel_env_resolve <app_dir> <base>
 # Print the .env file the app actually reads. Laravel loads <app_dir>/.env;
 # when that is a symlink, writing to the link path with `sed -i` would replace

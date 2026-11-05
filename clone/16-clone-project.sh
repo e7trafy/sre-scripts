@@ -1426,6 +1426,20 @@ phase_skipped() {
     sre_info "[${CLONE_PHASE_NUM}/${CLONE_TOTAL_PHASES}] ${label} — already done, skipping"
 }
 
+# What does an anonymous visitor get? Expect 401 (see protect_verify).
+CL_VERIFY_PENDING="no"
+_clone_verify_protection() {
+    local scheme="http"
+    if grep -qE 'ssl_certificate|SSLCertificateFile' "$tgt_vhost" 2>/dev/null; then
+        scheme="https"
+    fi
+    if ! protect_verify "$CL_TARGET_DOMAIN" "$scheme" "$web_server" \
+            ${CL_ALLOW_IPS[@]+"${CL_ALLOW_IPS[@]}"}; then
+        sre_warning "Protection is configured but the check above failed."
+        sre_warning "Re-check and repair: sudo bash ${SRE_SCRIPTS_DIR}/fixes/12-fixes.sh  -> staging-protection"
+    fi
+}
+
 ################################################################################
 # COPY FILES
 #
@@ -1457,6 +1471,12 @@ if [[ "$do_files" == "true" ]] && ! progress_phase_done FILES; then
             src_release_actual=$(readlink -f "${src_proj_base}/current" 2>/dev/null || echo "${src_proj_base}/current")
             # Reuse the same target release dir across resumes (persisted)
             if [[ -z "${tgt_release_dir:-}" || ! -d "${tgt_release_dir:-/nonexistent}" ]]; then
+                # Re-clone: each release is a full copy. Free the old ones
+                # (all but the live one) BEFORE copying the next.
+                if [[ "$CL_REFRESH" == "yes" ]]; then
+                    release_prune "$tgt_proj_base" 1
+                fi
+                disk_preflight "$tgt_proj_base" "$src_release_actual" || exit 1
                 tgt_release_dir="${tgt_proj_base}/releases/$(date +%Y%m%d%H%M%S)"
                 progress_set "tgt_release_dir" "$tgt_release_dir"
             fi
@@ -1534,6 +1554,10 @@ if [[ "$do_files" == "true" ]] && ! progress_phase_done FILES; then
             elif [[ -L "${src_proj_base}/current" ]]; then
                 src_release_actual=$(readlink -f "${src_proj_base}/current")
                 if [[ -z "${tgt_release_dir:-}" || ! -d "${tgt_release_dir:-/nonexistent}" ]]; then
+                    if [[ "$CL_REFRESH" == "yes" ]]; then
+                        release_prune "$tgt_proj_base" 1
+                    fi
+                    disk_preflight "$tgt_proj_base" "$src_release_actual" || exit 1
                     tgt_release_dir="${tgt_proj_base}/releases/$(date +%Y%m%d%H%M%S)"
                     progress_set "tgt_release_dir" "$tgt_release_dir"
                 fi
@@ -2593,13 +2617,13 @@ ROBOTS
     # --- What does an anonymous visitor actually get? ---
     # A 403 here used to look like "htpasswd is broken" with no clue why;
     # protect_verify names the cause from the status code and the error log.
+    # A re-clone is still in maintenance here (503 by design), so its check
+    # runs after maint_off at the end of the script.
     if [[ "$CL_HTPASSWD" == "yes" ]]; then
-        _verify_scheme="http"
-        grep -qE 'ssl_certificate|SSLCertificateFile' "$tgt_vhost" && _verify_scheme="https"
-        if ! protect_verify "$CL_TARGET_DOMAIN" "$_verify_scheme" "$web_server" \
-                ${CL_ALLOW_IPS[@]+"${CL_ALLOW_IPS[@]}"}; then
-            sre_warning "Protection is configured but the check above failed."
-            sre_warning "Re-check and repair: sudo bash ${SRE_SCRIPTS_DIR}/fixes/12-fixes.sh  -> staging-protection"
+        if [[ -f "$(maint_snippet_file "$CL_TARGET_DOMAIN" "$web_server")" ]]; then
+            CL_VERIFY_PENDING="yes"
+        else
+            _clone_verify_protection
         fi
     fi
 
@@ -2637,8 +2661,13 @@ case "$src_type" in
         ;;
 esac
 # Only now, with config rewritten and FPM reloaded, serve the clone again.
-maint_off "$CL_TARGET_DOMAIN" "$web_server" \
-    || sre_warning "Site still answers 503 — remove $(maint_snippet_file "$CL_TARGET_DOMAIN" "$web_server") after fixing the config test"
+if maint_off "$CL_TARGET_DOMAIN" "$web_server"; then
+    if [[ "$CL_VERIFY_PENDING" == "yes" ]]; then
+        _clone_verify_protection
+    fi
+else
+    sre_warning "Site still answers 503 — remove $(maint_snippet_file "$CL_TARGET_DOMAIN" "$web_server") after fixing the config test"
+fi
 
 progress_mark_phase FINISH
 rm -f "$CLONE_PROGRESS"
