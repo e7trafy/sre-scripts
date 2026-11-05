@@ -292,6 +292,9 @@ if [[ "$SRE_DRY_RUN" != "true" ]]; then
         mkdir -p "$subpath_dir"
         chmod 755 "$subpath_dir"
     fi
+    # Same for the basic-auth / noindex include (steps 16/17). Needed on Apache
+    # too: the template's IncludeOptional points at it.
+    protect_ensure_dir "$VHOST_DOMAIN" "$web_server"
 
     # Write + test + reload, rolling back on failure.
     #

@@ -441,8 +441,9 @@ fi
 ################################################################################
 # Protection (htpasswd + IP allowlist)
 #
-# Same injection mechanism as step 16. Inserts directives into every server { }
-# block so HTTP + HTTPS are both gated. Robots header is already in the template.
+# Same mechanism as step 16 (lib.sh protect_*): the directives live in
+# <snippets>/<domain>-protect/protect.conf, which the vhost template includes,
+# so re-rendering the vhost (step 11) keeps them. Robots is in the template.
 ################################################################################
 
 if [[ "$PMA_PROTECT" == "yes" ]] && [[ "$PMA_HTPASSWD" == "yes" || ${#PMA_ALLOW_IPS[@]} -gt 0 ]]; then
@@ -464,104 +465,24 @@ if [[ "$PMA_PROTECT" == "yes" ]] && [[ "$PMA_HTPASSWD" == "yes" || ${#PMA_ALLOW_
             [[ -z "$PMA_PROTECT_USER" ]] && PMA_PROTECT_USER="admin"
             [[ -z "$PMA_PROTECT_PASS" ]] && PMA_PROTECT_PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 18)
 
-            htpasswd_file="/etc/nginx/htpasswd-${PMA_DOMAIN}"
-            [[ "$web_server" == "apache" ]] && htpasswd_file="/etc/apache2/htpasswd-${PMA_DOMAIN}"
-            [[ "$os_family" == "rhel" && "$web_server" == "apache" ]] && htpasswd_file="/etc/httpd/htpasswd-${PMA_DOMAIN}"
-
-            htpasswd -bc "$htpasswd_file" "$PMA_PROTECT_USER" "$PMA_PROTECT_PASS" >/dev/null
-            chmod 640 "$htpasswd_file"
-            chown root:www-data "$htpasswd_file" 2>/dev/null || true
-            sre_success "Basic auth: $htpasswd_file"
+            htpasswd_file="$(protect_htpasswd_path "$PMA_DOMAIN" "$web_server")"
+            if ! protect_write_htpasswd "$htpasswd_file" "$PMA_PROTECT_USER" "$PMA_PROTECT_PASS"; then
+                sre_error "Could not write $htpasswd_file - phpMyAdmin would be reachable without a login."
+                exit 1
+            fi
         fi
     fi
 
-    # Build snippet
-    snippet=""
-    case "$web_server" in
-        nginx)
-            snippet+=$'\n    # --- BEGIN sre-helpers staging protection ---\n'
-            if [[ "$PMA_HTPASSWD" == "yes" ]]; then
-                if [[ ${#PMA_ALLOW_IPS[@]} -gt 0 ]]; then
-                    snippet+=$'    satisfy any;\n'
-                    for ip in "${PMA_ALLOW_IPS[@]}"; do
-                        [[ -n "$ip" ]] && snippet+="    allow ${ip};"$'\n'
-                    done
-                    snippet+=$'    deny all;\n'
-                fi
-                snippet+=$'    auth_basic           "phpMyAdmin - Restricted";\n'
-                snippet+="    auth_basic_user_file ${htpasswd_file};"$'\n'
-            elif [[ ${#PMA_ALLOW_IPS[@]} -gt 0 ]]; then
-                # IP-only gate
-                for ip in "${PMA_ALLOW_IPS[@]}"; do
-                    [[ -n "$ip" ]] && snippet+="    allow ${ip};"$'\n'
-                done
-                snippet+=$'    deny all;\n'
-            fi
-            snippet+=$'    # --- END sre-helpers staging protection ---\n'
-            ;;
-        apache)
-            snippet+=$'\n    # --- BEGIN sre-helpers staging protection ---\n'
-            if [[ "$PMA_HTPASSWD" == "yes" ]]; then
-                snippet+=$'    <Location "/">\n'
-                snippet+=$'        AuthType Basic\n'
-                snippet+=$'        AuthName "phpMyAdmin - Restricted"\n'
-                snippet+="        AuthUserFile ${htpasswd_file}"$'\n'
-                if [[ ${#PMA_ALLOW_IPS[@]} -gt 0 ]]; then
-                    snippet+=$'        <RequireAny>\n'
-                    snippet+=$'            Require valid-user\n'
-                    for ip in "${PMA_ALLOW_IPS[@]}"; do
-                        [[ -n "$ip" ]] && snippet+="            Require ip ${ip}"$'\n'
-                    done
-                    snippet+=$'        </RequireAny>\n'
-                else
-                    snippet+=$'        Require valid-user\n'
-                fi
-                snippet+=$'    </Location>\n'
-            elif [[ ${#PMA_ALLOW_IPS[@]} -gt 0 ]]; then
-                snippet+=$'    <Location "/">\n'
-                snippet+=$'        <RequireAny>\n'
-                for ip in "${PMA_ALLOW_IPS[@]}"; do
-                    [[ -n "$ip" ]] && snippet+="            Require ip ${ip}"$'\n'
-                done
-                snippet+=$'        </RequireAny>\n'
-                snippet+=$'    </Location>\n'
-            fi
-            snippet+=$'    # --- END sre-helpers staging protection ---\n'
-            ;;
-    esac
-
-    # Strip prior block + inject
-    sed -i '/# --- BEGIN sre-helpers staging protection ---/,/# --- END sre-helpers staging protection ---/d' "$pma_vhost"
-
-    tmp_snip=$(mktemp)
-    printf '%s' "$snippet" > "$tmp_snip"
-
-    case "$web_server" in
-        nginx)
-            awk -v snippet_file="$tmp_snip" '
-                BEGIN { while ((getline ln < snippet_file) > 0) snippet = snippet ln "\n"; close(snippet_file); in_server = 0; depth = 0 }
-                { buf = $0; out = ""; n = length(buf)
-                  for (i = 1; i <= n; i++) {
-                    c = substr(buf, i, 1)
-                    if (!in_server && c == "{") { tail = substr(buf, 1, i - 1); if (tail ~ /(^|[^A-Za-z_])server[[:space:]]*$/) { in_server = 1; depth = 1; out = out c; continue } }
-                    if (in_server) { if (c == "{") depth++; else if (c == "}") { depth--; if (depth == 0) { out = out "\n" snippet; in_server = 0 } } }
-                    out = out c
-                  }
-                  print out
-                }
-            ' "$pma_vhost" > "${pma_vhost}.tmp" && mv "${pma_vhost}.tmp" "$pma_vhost"
-            ;;
-        apache)
-            awk -v snippet_file="$tmp_snip" '
-                BEGIN { while ((getline ln < snippet_file) > 0) snippet = snippet ln "\n"; close(snippet_file) }
-                /<\/VirtualHost>/ { printf "%s", snippet }
-                { print }
-            ' "$pma_vhost" > "${pma_vhost}.tmp" && mv "${pma_vhost}.tmp" "$pma_vhost"
-            ;;
-    esac
-    rm -f "$tmp_snip"
-
-    sre_success "Protection injected into $pma_vhost"
+    # --- Protection snippet, included by the vhost (protect_apply, lib.sh) ---
+    # Its own file so a step-11 re-render keeps it; both files roll back together
+    # if the config test fails. noindex is "no": the template serves robots.txt.
+    snippet="$(protect_render "$web_server" "phpMyAdmin - Restricted" "$htpasswd_file" \
+        no "$PMA_HTPASSWD" ${PMA_ALLOW_IPS[@]+"${PMA_ALLOW_IPS[@]}"})"
+    snippet_file="$(protect_snippet_dir "$PMA_DOMAIN" "$web_server")/protect.conf"
+    if ! protect_apply "$pma_vhost" "$snippet_file" "$web_server" "$snippet"; then
+        sre_error "Protection was NOT applied; ${web_server} is still on its previous config."
+        exit 1
+    fi
 
     # robots.txt (template already returns one inline for /robots.txt; this is
     # a static file fallback)
@@ -571,29 +492,14 @@ if [[ "$PMA_PROTECT" == "yes" ]] && [[ "$PMA_HTPASSWD" == "yes" || ${#PMA_ALLOW_
         chmod 644 "${pma_current}/robots.txt"
     fi
 
-    # Reload + test
-    case "$web_server" in
-        nginx)
-            if nginx -t 2>&1 | tail -2; then
-                svc_reload nginx && sre_success "Nginx reloaded"
-            else
-                sre_error "Nginx config test failed — review $pma_vhost"
-            fi
-            ;;
-        apache)
-            test_cmd="apachectl configtest"
-            [[ "$os_family" == "rhel" ]] && test_cmd="httpd -t"
-            if $test_cmd 2>&1 | tail -2; then
-                case "$os_family" in
-                    debian) svc_reload apache2 ;;
-                    rhel)   svc_reload httpd ;;
-                esac
-                sre_success "Apache reloaded"
-            else
-                sre_error "Apache config test failed — review $pma_vhost"
-            fi
-            ;;
-    esac
+    # --- What does an anonymous visitor actually get? ---
+    if [[ "$PMA_HTPASSWD" == "yes" ]]; then
+        _verify_scheme="http"
+        grep -qE 'ssl_certificate|SSLCertificateFile' "$pma_vhost" && _verify_scheme="https"
+        protect_verify "$PMA_DOMAIN" "$_verify_scheme" "$web_server" \
+                ${PMA_ALLOW_IPS[@]+"${PMA_ALLOW_IPS[@]}"} \
+            || sre_warning "phpMyAdmin protection is configured but the check above failed."
+    fi
 fi
 
 ################################################################################

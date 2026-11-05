@@ -601,26 +601,41 @@ render_template() {
 # Returns 0 if the config tests clean and was reloaded.
 ################################################################################
 
+# Config-test command and service name per web server, shared by every
+# apply-with-rollback path so they cannot drift apart.
+webserver_test_cmd() {
+    case "$1" in
+        nginx)  printf 'nginx -t' ;;
+        apache)
+            case "${SRE_OS_FAMILY:-debian}" in
+                rhel) printf 'httpd -t' ;;
+                *)    printf 'apachectl configtest' ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+webserver_reload_svc() {
+    case "$1" in
+        nginx)  printf 'nginx' ;;
+        apache)
+            case "${SRE_OS_FAMILY:-debian}" in
+                rhel) printf 'httpd' ;;
+                *)    printf 'apache2' ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
 webserver_apply_or_rollback() {
     local dest="$1" content="$2" link="${3:-}" server="${4:-nginx}"
 
     local test_cmd reload_svc
-    case "$server" in
-        nginx)
-            test_cmd="nginx -t"
-            reload_svc="nginx"
-            ;;
-        apache)
-            case "${SRE_OS_FAMILY:-debian}" in
-                rhel) test_cmd="httpd -t";          reload_svc="httpd"   ;;
-                *)    test_cmd="apachectl configtest"; reload_svc="apache2" ;;
-            esac
-            ;;
-        *)
-            sre_error "Unknown web server: $server"
-            return 1
-            ;;
-    esac
+    if ! test_cmd="$(webserver_test_cmd "$server")" \
+       || ! reload_svc="$(webserver_reload_svc "$server")"; then
+        sre_error "Unknown web server: $server"
+        return 1
+    fi
 
     if [[ "$SRE_DRY_RUN" == "true" ]]; then
         sre_info "[DRY-RUN] Would write $dest, test with '$test_cmd', reload $reload_svc"
@@ -1389,6 +1404,453 @@ sre_write_file() {
     [[ -f "$dest" ]] && backup_config "$dest"
     echo "$content" > "$dest"
     sre_success "Written: $dest"
+}
+
+################################################################################
+# Basic-auth / noindex protection (step 16 clones, step 17 phpMyAdmin)
+#
+# Protection lives in its own include file, never spliced into the vhost:
+#   nginx   /etc/nginx/snippets/<domain>-protect/protect.conf
+#   apache  <ServerRoot>/snippets/<domain>-protect/protect.conf
+# Every vhost template includes that directory, so step 11 re-rendering a vhost
+# from its template keeps the protection. It used to be spliced inline, and a
+# re-run of step 11 silently stripped it: the staging site went public.
+#
+# Status codes worth knowing when it misbehaves (nginx auth_basic):
+#   user file MISSING     -> 403   (not 401 - easy to misread as a deny rule)
+#   user file UNREADABLE  -> 500
+#   wrong user/password   -> 401 again
+################################################################################
+
+protect_snippet_dir() {
+    local domain="$1" ws="${2:-nginx}"
+    case "$ws" in
+        apache)
+            case "${SRE_OS_FAMILY:-debian}" in
+                rhel) printf '/etc/httpd/snippets/%s-protect' "$domain" ;;
+                *)    printf '/etc/apache2/snippets/%s-protect' "$domain" ;;
+            esac ;;
+        *) printf '/etc/nginx/snippets/%s-protect' "$domain" ;;
+    esac
+}
+
+# The include in every template is a glob over this directory. A glob that
+# matches nothing is fine, but nginx fails `nginx -t` if the directory itself
+# is missing - so anything that writes a vhost must make sure it exists.
+protect_ensure_dir() {
+    local dir
+    dir="$(protect_snippet_dir "$1" "${2:-nginx}")"
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would create $dir"
+        return 0
+    fi
+    mkdir -p "$dir"
+    chmod 755 "$dir"
+}
+
+# Paths unchanged from before the snippet move, so existing clones and
+# step 16's --reset keep finding their files.
+protect_htpasswd_path() {
+    local domain="$1" ws="${2:-nginx}"
+    case "$ws" in
+        apache)
+            case "${SRE_OS_FAMILY:-debian}" in
+                rhel) printf '/etc/httpd/htpasswd-%s' "$domain" ;;
+                *)    printf '/etc/apache2/htpasswd-%s' "$domain" ;;
+            esac ;;
+        *) printf '/etc/nginx/htpasswd-%s' "$domain" ;;
+    esac
+}
+
+# protect_write_htpasswd <file> <user> <password>
+#
+#   - Password on stdin (-i). `htpasswd -b file user PASS` puts it in argv,
+#     where `ps` shows it to every user on the host.
+#   - Mode and group are set BEFORE the hash is written. `htpasswd -c` creates
+#     the file with the process umask (usually 644), world-readable until the
+#     later chmod.
+#   - Group is the real web-server user (iso_web_user), not a hardcoded
+#     www-data: on RHEL that group does not exist, the chown failed silently,
+#     and nginx could not read the file.
+#   - -m (apr1-MD5) because every nginx build verifies it; bcrypt depends on
+#     the libc crypt() and fails on some.
+protect_write_htpasswd() {
+    local file="$1" user="$2" pass="$3"
+    local web_user tmp
+    web_user="$(iso_web_user)"
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would write $file for user $user (group $web_user)"
+        return 0
+    fi
+    if ! command -v htpasswd >/dev/null 2>&1; then
+        sre_error "htpasswd is not installed (apache2-utils / httpd-tools)"
+        return 1
+    fi
+
+    tmp="$(mktemp "${file}.XXXXXX")"          # mode 600 from mktemp
+    if ! chgrp "$web_user" "$tmp" || ! chmod 640 "$tmp"; then
+        rm -f "$tmp"
+        sre_error "Could not set group $web_user / mode 640 on $tmp"
+        return 1
+    fi
+    if ! printf '%s\n' "$pass" | htpasswd -i -m "$tmp" "$user" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        sre_error "htpasswd failed writing $file"
+        return 1
+    fi
+    mv -f "$tmp" "$file"
+
+    # The worker opens this on every request. If it cannot, nginx answers 500
+    # (or 403 when the path does not exist) instead of the login prompt.
+    if ! sudo -u "$web_user" test -r "$file" 2>/dev/null; then
+        sre_error "$web_user cannot read $file - the site would answer 500"
+        return 1
+    fi
+    sre_success "Basic auth credentials written: $file (group $web_user, mode 640)"
+}
+
+# protect_render <ws> <realm> <htpasswd_file> <noindex yes|no> <htpasswd yes|no> [allow-ip...]
+#
+# Prints the contents of protect.conf. Modes:
+#   htpasswd only        -> basic auth
+#   htpasswd + IPs       -> listed IPs skip the prompt, everyone else logs in
+#   IPs only             -> listed IPs only, no prompt
+#   noindex              -> X-Robots-Tag header (combines with any of the above)
+protect_render() {
+    local ws="$1" realm="$2" htfile="$3" noindex="$4" htpasswd="$5"
+    shift 5
+    local ips=() ip
+    for ip in "$@"; do
+        [[ -n "$ip" ]] && ips+=("$ip")
+    done
+
+    printf '# Managed by sre-helpers (steps 16/17, fixes -> staging-protection).\n'
+    printf '# Regenerated on every run - edits here are overwritten.\n'
+
+    case "$ws" in
+        nginx)
+            if [[ "$noindex" == "yes" ]]; then
+                printf 'add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;\n'
+            fi
+            if [[ "$htpasswd" == "yes" ]]; then
+                if [[ ${#ips[@]} -gt 0 ]]; then
+                    printf 'satisfy any;\n'
+                    for ip in "${ips[@]}"; do printf 'allow %s;\n' "$ip"; done
+                    printf 'deny all;\n'
+                fi
+                printf 'auth_basic "%s";\n' "$realm"
+                printf 'auth_basic_user_file %s;\n' "$htfile"
+            elif [[ ${#ips[@]} -gt 0 ]]; then
+                for ip in "${ips[@]}"; do printf 'allow %s;\n' "$ip"; done
+                printf 'deny all;\n'
+            fi
+            ;;
+        apache)
+            if [[ "$noindex" == "yes" ]]; then
+                printf 'Header always set X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"\n'
+            fi
+            if [[ "$htpasswd" == "yes" ]]; then
+                printf '<Location "/">\n'
+                printf '    AuthType Basic\n'
+                printf '    AuthName "%s"\n' "$realm"
+                printf '    AuthUserFile %s\n' "$htfile"
+                if [[ ${#ips[@]} -gt 0 ]]; then
+                    printf '    <RequireAny>\n'
+                    printf '        Require valid-user\n'
+                    for ip in "${ips[@]}"; do printf '        Require ip %s\n' "$ip"; done
+                    printf '    </RequireAny>\n'
+                else
+                    printf '    Require valid-user\n'
+                fi
+                printf '</Location>\n'
+            elif [[ ${#ips[@]} -gt 0 ]]; then
+                printf '<Location "/">\n'
+                printf '    <RequireAny>\n'
+                for ip in "${ips[@]}"; do printf '        Require ip %s\n' "$ip"; done
+                printf '    </RequireAny>\n'
+                printf '</Location>\n'
+            fi
+            if [[ "$htpasswd" == "yes" || ${#ips[@]} -gt 0 ]]; then
+                # A later <Location> replaces the authz of "/" (AuthMerging Off),
+                # so certbot can still renew through the gate.
+                printf '<Location "/.well-known/acme-challenge/">\n'
+                printf '    Require all granted\n'
+                printf '</Location>\n'
+            fi
+            ;;
+    esac
+}
+
+# vhost_inject_server_blocks <file> <ws> <text>
+#
+# Insert <text> just before the closing brace of every top-level `server { }`
+# block (nginx), or before every </VirtualHost> (apache). Edits <file> in place.
+# Brace depth is tracked character by character so nested location blocks and
+# one-line `location x { ... }` forms are handled.
+vhost_inject_server_blocks() {
+    local file="$1" ws="$2" text="$3"
+    local tmp
+    tmp="$(mktemp)"
+    printf '%s' "$text" > "$tmp"
+
+    case "$ws" in
+        nginx)
+            awk -v snippet_file="$tmp" '
+                BEGIN {
+                    while ((getline ln < snippet_file) > 0) snippet = snippet ln "\n"
+                    close(snippet_file)
+                    in_server = 0; depth = 0
+                }
+                {
+                    buf = $0; out = ""; n = length(buf)
+                    for (i = 1; i <= n; i++) {
+                        c = substr(buf, i, 1)
+                        if (!in_server && c == "{") {
+                            tail = substr(buf, 1, i - 1)
+                            if (tail ~ /(^|[^A-Za-z_])server[[:space:]]*$/) {
+                                in_server = 1; depth = 1; out = out c; continue
+                            }
+                        }
+                        if (in_server) {
+                            if (c == "{") depth++
+                            else if (c == "}") {
+                                depth--
+                                if (depth == 0) { out = out "\n" snippet; in_server = 0 }
+                            }
+                        }
+                        out = out c
+                    }
+                    print out
+                }
+            ' "$file" > "${file}.inj" && mv "${file}.inj" "$file"
+            ;;
+        apache)
+            awk -v snippet_file="$tmp" '
+                BEGIN {
+                    while ((getline ln < snippet_file) > 0) snippet = snippet ln "\n"
+                    close(snippet_file)
+                }
+                /<\/VirtualHost>/ { printf "%s", snippet }
+                { print }
+            ' "$file" > "${file}.inj" && mv "${file}.inj" "$file"
+            ;;
+    esac
+    rm -f "$tmp"
+}
+
+# Add `auth_basic off; allow all;` to every nginx ACME location that lacks it.
+# Server-level auth_basic is inherited by that location, so without this
+# certbot's renewal request gets a 401 and the cert expires. Edits in place.
+_protect_exempt_acme() {
+    local file="$1"
+    awk '
+        /location[[:space:]]+\^~[[:space:]]+\/\.well-known\/acme-challenge\/[[:space:]]*\{/ {
+            if ($0 ~ /\}/) {                               # one-line form
+                if ($0 !~ /auth_basic[[:space:]]+off/) sub(/\{/, "{ auth_basic off; allow all;")
+                print; next
+            }
+            inb = 1; n = 0; has = 0; head = $0; next
+        }
+        inb {
+            body[++n] = $0
+            if ($0 ~ /auth_basic[[:space:]]+off/) has = 1
+            if ($0 ~ /^[[:space:]]*\}/) {
+                print head
+                if (!has) {
+                    match(head, /^[[:space:]]*/); ind = substr(head, 1, RLENGTH)
+                    print ind "    auth_basic off;"
+                    print ind "    allow all;"
+                }
+                for (i = 1; i <= n; i++) print body[i]
+                inb = 0
+            }
+            next
+        }
+        { print }
+    ' "$file" > "${file}.acme" && mv "${file}.acme" "$file"
+}
+
+# protect_apply <vhost> <snippet_file> <ws> <snippet>
+#
+# Write the snippet and migrate the vhost to include it, as ONE change: both
+# files are written, the config is tested, and on failure BOTH are put back,
+# and the web server is reloaded only if the restored config tests clean.
+# (webserver_apply_or_rollback covers a single file; restoring only the vhost
+# while a broken snippet stays included would still leave a failing config.)
+#
+# Vhost migration, all idempotent:
+#   - drop the legacy inline "sre-helpers staging protection" block
+#   - add the include if the vhost predates the template that carries it
+#   - exempt ACME locations from auth (nginx)
+protect_apply() {
+    local vhost="$1" snippet_file="$2" ws="$3" snippet="$4"
+    local dir test_cmd reload_svc
+    dir="$(dirname "$snippet_file")"
+
+    if [[ ! -f "$vhost" ]]; then
+        sre_error "Vhost not found: $vhost"
+        return 1
+    fi
+    if ! test_cmd="$(webserver_test_cmd "$ws")" || ! reload_svc="$(webserver_reload_svc "$ws")"; then
+        sre_error "Unknown web server: $ws"
+        return 1
+    fi
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would write $snippet_file, migrate $vhost, test with '$test_cmd'"
+        return 0
+    fi
+
+    # --- New vhost content, built on a scratch copy ---
+    local work
+    work="$(mktemp)"
+    # Not `sed -i`: its syntax differs between GNU and BSD sed, and the unit
+    # tests run this on a workstation.
+    sed '/# --- BEGIN sre-helpers staging protection ---/,/# --- END sre-helpers staging protection ---/d' \
+        "$vhost" > "$work"
+    # Match on "<domain>-protect/*.conf": templates use an absolute path for
+    # nginx but a ServerRoot-relative one for Apache.
+    if ! grep -qF "$(basename "$dir")/*.conf" "$work"; then
+        local inc
+        case "$ws" in
+            nginx)  inc="    # --- BEGIN sre-helpers protect include ---
+    include ${dir}/*.conf;
+    # --- END sre-helpers protect include ---
+" ;;
+            apache) inc="    # --- BEGIN sre-helpers protect include ---
+    IncludeOptional ${dir}/*.conf
+    # --- END sre-helpers protect include ---
+" ;;
+        esac
+        vhost_inject_server_blocks "$work" "$ws" "$inc"
+    fi
+    [[ "$ws" == "nginx" ]] && _protect_exempt_acme "$work"
+
+    # --- Rollback copies of both files ---
+    local vhost_prev snip_prev="" snip_existed="false"
+    vhost_prev="$(mktemp)"
+    cp "$vhost" "$vhost_prev"
+    backup_config "$vhost"
+    if [[ -f "$snippet_file" ]]; then
+        snip_existed="true"
+        snip_prev="$(mktemp)"
+        cp "$snippet_file" "$snip_prev"
+        backup_config "$snippet_file"
+    fi
+
+    # --- Write both, test once ---
+    mkdir -p "$dir"
+    chmod 755 "$dir"
+    printf '%s\n' "$snippet" > "$snippet_file"
+    chmod 644 "$snippet_file"
+    cp "$work" "$vhost"
+    rm -f "$work"
+
+    if $test_cmd >/dev/null 2>&1; then
+        svc_reload "$reload_svc"
+        sre_success "Protection applied: $snippet_file (included by $vhost)"
+        rm -f "$vhost_prev" "$snip_prev"
+        return 0
+    fi
+
+    sre_error "${ws} config test FAILED after applying protection:"
+    $test_cmd 2>&1 | sed 's/^/    /' || true
+
+    cp "$vhost_prev" "$vhost"
+    if [[ "$snip_existed" == "true" ]]; then
+        cp "$snip_prev" "$snippet_file"
+    else
+        rm -f "$snippet_file"
+    fi
+    rm -f "$vhost_prev" "$snip_prev"
+    sre_info "Rolled back $vhost and $snippet_file"
+
+    if $test_cmd >/dev/null 2>&1; then
+        svc_reload "$reload_svc"
+        sre_success "Reverted to a working config and reloaded ${reload_svc}"
+    else
+        sre_error "Config is STILL broken after rollback - not reloading."
+        sre_error "${reload_svc} keeps running its last-good config; fix before any reload."
+    fi
+    return 1
+}
+
+# protect_verify <domain> <scheme http|https> <ws> [allow-ip...]
+#
+# Ask the local web server what an anonymous visitor gets, and explain any
+# answer other than the login prompt. Returns non-zero when the result is wrong.
+protect_verify() {
+    local domain="$1" scheme="${2:-https}" ws="${3:-nginx}"
+    shift 3
+    local ips=("$@")
+
+    if [[ "$SRE_DRY_RUN" == "true" ]]; then
+        sre_info "[DRY-RUN] Would verify basic auth on ${scheme}://${domain}/"
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        sre_warning "curl not installed - cannot verify protection"
+        return 0
+    fi
+
+    local port=443 code acme rc=0
+    [[ "$scheme" == "http" ]] && port=80
+    code=$( { curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+              --resolve "${domain}:${port}:127.0.0.1" "${scheme}://${domain}/" || true; } )
+    acme=$( { curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+              --resolve "${domain}:80:127.0.0.1" \
+              "http://${domain}/.well-known/acme-challenge/sre-probe" || true; } )
+
+    local loopback_allowed="false" ip
+    for ip in "${ips[@]+"${ips[@]}"}"; do
+        case "$ip" in 127.*|::1|all) loopback_allowed="true" ;; esac
+    done
+
+    if [[ "$code" == "401" ]]; then
+        sre_success "Verified: ${scheme}://${domain}/ asks for a login (401)"
+    elif [[ "$code" == "200" && "$loopback_allowed" == "true" ]]; then
+        sre_info "Loopback is on the allowlist, so the login prompt cannot be checked from this host (got 200)"
+    else
+        rc=1
+        sre_error "Expected 401 from ${scheme}://${domain}/ but got ${code:-no answer}."
+        case "$code" in
+            403) sre_error "  nginx answers 403 when the htpasswd file is MISSING, on an allow/deny rule,"
+                 sre_error "  or when the document root is empty - the log lines below say which." ;;
+            500) sre_error "  The web server cannot READ the htpasswd file (owner/group/mode)." ;;
+            200) sre_error "  Protection is not active: the vhost does not include $(protect_snippet_dir "$domain" "$ws"),"
+                 sre_error "  or the web server was not reloaded." ;;
+            000|"") sre_error "  Nothing answered on 127.0.0.1:${port} for ${domain}." ;;
+        esac
+        _protect_log_hints "$domain" "$ws"
+    fi
+
+    case "$acme" in
+        401|403)
+            rc=1
+            sre_error "ACME challenge path answers ${acme}: certificate renewal will FAIL."
+            sre_error "  Its location must carry 'auth_basic off; allow all;' (nginx)."
+            ;;
+    esac
+    return "$rc"
+}
+
+_protect_log_hints() {
+    local domain="$1" ws="$2" log lines l
+    case "$ws" in
+        apache)
+            case "${SRE_OS_FAMILY:-debian}" in
+                rhel) log="/var/log/httpd/${domain}-error.log" ;;
+                *)    log="/var/log/apache2/${domain}-error.log" ;;
+            esac ;;
+        *) log="/var/log/nginx/${domain}-error.log" ;;
+    esac
+    [[ -r "$log" ]] || return 0
+    lines=$( { tail -n 300 "$log" \
+        | grep -iE 'htpasswd|auth_basic|AuthUserFile|forbidden|denied|directory index|was not found|password mismatch|crypt' \
+        | tail -n 5 || true; } )
+    [[ -n "$lines" ]] || return 0
+    sre_error "  Recent lines from $log:"
+    while IFS= read -r l; do sre_error "    $l"; done <<<"$lines"
 }
 
 ################################################################################

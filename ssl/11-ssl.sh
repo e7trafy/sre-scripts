@@ -770,6 +770,9 @@ case "$web_server" in
         fi
 
         if [[ "$SRE_DRY_RUN" != "true" ]]; then
+            # The template includes <domain>-protect/*.conf; nginx -t fails if that
+            # directory is missing, which it is for sites created before it existed.
+            protect_ensure_dir "$SSL_DOMAIN" nginx
             cat > "$vhost_conf" <<NGINX_CONF
 # HTTP → HTTPS redirect
 server {
@@ -777,8 +780,11 @@ server {
     listen [::]:80;
     server_name ${SSL_DOMAIN};
 
-    # Allow ACME challenge through before redirect
+    # Allow ACME challenge through before redirect - and through basic auth or
+    # an IP allowlist (steps 16/17), or certificate renewal fails.
     location ^~ /.well-known/acme-challenge/ {
+        auth_basic off;
+        allow all;
         root ${acme_webroot};
     }
 
@@ -877,6 +883,7 @@ NGINX_CONF
                 exit 1
             fi
 
+            protect_ensure_dir "$SSL_DOMAIN" apache
             cat > "$vhost_conf" <<APACHE_CONF
 # HTTP → HTTPS redirect
 <VirtualHost *:80>

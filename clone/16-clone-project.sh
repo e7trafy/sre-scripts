@@ -234,154 +234,6 @@ CL_RESUME_MODE="${CL_RESUME_MODE:-auto}"   # auto|yes|no
 CL_RESET="${CL_RESET:-no}"                 # no | yes | dry-run
 CL_PICK_TABLES="${CL_PICK_TABLES:-no}"     # no | yes
 
-################################################################################
-# Staging protection helpers
-#
-#   - Writes an HTTP basic-auth file (apache2-utils / httpd-tools)
-#   - Patches the final vhost (post-Certbot) to add:
-#       * X-Robots-Tag noindex (response header — authoritative for bots)
-#       * auth_basic + auth_basic_user_file (Nginx) or AuthType Basic (Apache)
-#       * allow <ip>/deny all with satisfy any for IP allowlist bypass
-#   - Drops a robots.txt at the doc root as belt-and-suspenders
-################################################################################
-
-# Build a single Nginx snippet to insert inside every server { } block.
-_build_nginx_protect_snippet() {
-    local htpasswd_file="$1"
-    local snippet=""
-
-    snippet+=$'\n    # --- BEGIN sre-helpers staging protection ---\n'
-
-    if [[ "$CL_NOINDEX" == "yes" ]]; then
-        snippet+=$'    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;\n'
-    fi
-
-    if [[ "$CL_HTPASSWD" == "yes" ]]; then
-        if [[ ${#CL_ALLOW_IPS[@]} -gt 0 ]]; then
-            snippet+=$'    satisfy any;\n'
-            local ip
-            for ip in "${CL_ALLOW_IPS[@]}"; do
-                [[ -n "$ip" ]] && snippet+="    allow ${ip};"$'\n'
-            done
-            snippet+=$'    deny all;\n'
-        fi
-        snippet+=$'    auth_basic           "Restricted - Clone";\n'
-        snippet+="    auth_basic_user_file ${htpasswd_file};"$'\n'
-    fi
-
-    snippet+=$'    # --- END sre-helpers staging protection ---\n'
-    printf '%s' "$snippet"
-}
-
-_build_apache_protect_snippet() {
-    local htpasswd_file="$1"
-    local snippet=""
-
-    snippet+=$'\n    # --- BEGIN sre-helpers staging protection ---\n'
-
-    if [[ "$CL_NOINDEX" == "yes" ]]; then
-        snippet+=$'    Header always set X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"\n'
-    fi
-
-    if [[ "$CL_HTPASSWD" == "yes" ]]; then
-        snippet+=$'    <Location "/">\n'
-        snippet+=$'        AuthType Basic\n'
-        snippet+=$'        AuthName "Restricted - Clone"\n'
-        snippet+="        AuthUserFile ${htpasswd_file}"$'\n'
-        if [[ ${#CL_ALLOW_IPS[@]} -gt 0 ]]; then
-            snippet+=$'        <RequireAny>\n'
-            snippet+=$'            Require valid-user\n'
-            local ip
-            for ip in "${CL_ALLOW_IPS[@]}"; do
-                [[ -n "$ip" ]] && snippet+="            Require ip ${ip}"$'\n'
-            done
-            snippet+=$'        </RequireAny>\n'
-        else
-            snippet+=$'        Require valid-user\n'
-        fi
-        snippet+=$'    </Location>\n'
-    fi
-
-    snippet+=$'    # --- END sre-helpers staging protection ---\n'
-    printf '%s' "$snippet"
-}
-
-# Patch a vhost file: insert the snippet immediately before the last `}` of every
-# server block (Nginx) or before each </VirtualHost> (Apache). Idempotent: removes
-# any prior BEGIN/END block first.
-_inject_protection_into_vhost() {
-    local vhost_file="$1" snippet="$2" ws="$3"
-
-    [[ ! -f "$vhost_file" ]] && return 1
-
-    # Strip any prior block (so re-runs don't stack snippets)
-    sed -i '/# --- BEGIN sre-helpers staging protection ---/,/# --- END sre-helpers staging protection ---/d' "$vhost_file"
-
-    # Write snippet to a temp file (multi-line, safer than r-flag with stdin)
-    local tmp; tmp=$(mktemp)
-    printf '%s' "$snippet" > "$tmp"
-
-    case "$ws" in
-        nginx)
-            # Track brace depth char-by-char. Inject snippet just before the
-            # closing brace of any top-level server { ... } block.
-            awk -v snippet_file="$tmp" '
-                BEGIN {
-                    while ((getline ln < snippet_file) > 0) snippet = snippet ln "\n"
-                    close(snippet_file)
-                    in_server = 0
-                    depth = 0
-                    buf = ""
-                }
-                {
-                    buf = $0
-                    out = ""
-                    n = length(buf)
-                    for (i = 1; i <= n; i++) {
-                        c = substr(buf, i, 1)
-                        if (!in_server && c == "{") {
-                            # Check the chars before this { for "server"
-                            tail = substr(buf, 1, i - 1)
-                            if (tail ~ /(^|[^A-Za-z_])server[[:space:]]*$/) {
-                                in_server = 1
-                                depth = 1
-                                out = out c
-                                continue
-                            }
-                        }
-                        if (in_server) {
-                            if (c == "{") depth++
-                            else if (c == "}") {
-                                depth--
-                                if (depth == 0) {
-                                    # Insert snippet before this closing brace
-                                    out = out "\n" snippet
-                                    in_server = 0
-                                }
-                            }
-                        }
-                        out = out c
-                    }
-                    print out
-                }
-            ' "$vhost_file" > "${vhost_file}.tmp" && mv "${vhost_file}.tmp" "$vhost_file"
-            ;;
-        apache)
-            awk -v snippet_file="$tmp" '
-                BEGIN {
-                    while ((getline line < snippet_file) > 0) snippet = snippet line "\n"
-                    close(snippet_file)
-                }
-                /<\/VirtualHost>/ { printf "%s", snippet }
-                { print }
-            ' "$vhost_file" > "${vhost_file}.tmp" && mv "${vhost_file}.tmp" "$vhost_file"
-            ;;
-    esac
-
-    rm -f "$tmp"
-    return 0
-}
-
 require_root
 sre_header "Step 16: Clone Project"
 
@@ -778,7 +630,7 @@ CLONE_STATE="${CLONE_STATE_DIR}/${CL_TARGET_DOMAIN}.conf"
 #   1. Persisted DB + user from any prior run (read from .progress / .conf)
 #   2. /var/www/<target>/  (entire project tree)
 #   3. Vhost in sites-available/ + symlink in sites-enabled/ + any .bak siblings
-#   4. htpasswd file at the standard per-domain path
+#   4. htpasswd file at the standard per-domain path + <target>-protect/ snippet dir
 #   5. SSL: /etc/letsencrypt/live|archive|renewal/<target>* (skipped if cert
 #      is shared by a wildcard — only deletes exact-name dirs)
 #   6. .progress and .conf state files
@@ -829,6 +681,9 @@ if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
     fi
     for _htpd in "/etc/nginx/htpasswd-${CL_TARGET_DOMAIN}" "/etc/apache2/htpasswd-${CL_TARGET_DOMAIN}" "/etc/httpd/htpasswd-${CL_TARGET_DOMAIN}"; do
         if [[ -f "$_htpd" ]]; then sre_info "  htpasswd:     $_htpd"; fi
+    done
+    for _pdir in "$(protect_snippet_dir "$CL_TARGET_DOMAIN" nginx)" "$(protect_snippet_dir "$CL_TARGET_DOMAIN" apache)"; do
+        if [[ -d "$_pdir" ]]; then sre_info "  protection:   $_pdir"; fi
     done
     for _le in "/etc/letsencrypt/live/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/archive/${CL_TARGET_DOMAIN}" "/etc/letsencrypt/renewal/${CL_TARGET_DOMAIN}.conf"; do
         if [[ -e "$_le" ]]; then sre_info "  Let's Encrypt: $_le"; fi
@@ -914,10 +769,16 @@ if [[ "$CL_RESET" == "yes" || "$CL_RESET" == "dry-run" ]]; then
     done
     shopt -u nullglob
 
-    # 4. htpasswd
+    # 4. htpasswd + protection snippet dir (both web servers; only one exists)
     for _htpd in "/etc/nginx/htpasswd-${CL_TARGET_DOMAIN}" "/etc/apache2/htpasswd-${CL_TARGET_DOMAIN}" "/etc/httpd/htpasswd-${CL_TARGET_DOMAIN}"; do
         if [[ -f "$_htpd" ]]; then
             rm -f "$_htpd" && sre_success "Removed: $_htpd"
+        fi
+    done
+    for _pdir in "$(protect_snippet_dir "$CL_TARGET_DOMAIN" nginx)" "$(protect_snippet_dir "$CL_TARGET_DOMAIN" apache)"; do
+        # Guard the rm -rf: only ever a "<target>-protect" dir under snippets/.
+        if [[ -d "$_pdir" && "$_pdir" == */snippets/"${CL_TARGET_DOMAIN}"-protect ]]; then
+            rm -rf "$_pdir" && sre_success "Removed: $_pdir"
         fi
     done
 
@@ -2507,28 +2368,28 @@ elif [[ "$CL_PROTECT" == "yes" ]] && [[ "$CL_NOINDEX" == "yes" || "$CL_HTPASSWD"
                 CL_PROTECT_PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 18)
             fi
 
-            # Per-domain htpasswd file (Nginx-friendly path; Apache reads it too)
-            htpasswd_file="/etc/nginx/htpasswd-${CL_TARGET_DOMAIN}"
-            [[ "$web_server" == "apache" ]] && htpasswd_file="/etc/apache2/htpasswd-${CL_TARGET_DOMAIN}"
-            [[ "$os_family" == "rhel" && "$web_server" == "apache" ]] && htpasswd_file="/etc/httpd/htpasswd-${CL_TARGET_DOMAIN}"
-
-            htpasswd -bc "$htpasswd_file" "$CL_PROTECT_USER" "$CL_PROTECT_PASS" >/dev/null
-            chmod 640 "$htpasswd_file"
-            chown root:www-data "$htpasswd_file" 2>/dev/null || true
-            sre_success "Basic auth credentials written: $htpasswd_file"
+            htpasswd_file="$(protect_htpasswd_path "$CL_TARGET_DOMAIN" "$web_server")"
+            if ! protect_write_htpasswd "$htpasswd_file" "$CL_PROTECT_USER" "$CL_PROTECT_PASS"; then
+                # Never fall back to "no auth": a staging copy of a live site
+                # would go public. PROTECT stays unfinished, so a re-run resumes here.
+                sre_error "Could not write $htpasswd_file. The clone is otherwise complete;"
+                sre_error "fix the error above and re-run to resume at this phase."
+                exit 1
+            fi
         fi
     fi
 
-    # --- Build + inject snippet ---
-    case "$web_server" in
-        nginx)  snippet=$(_build_nginx_protect_snippet  "$htpasswd_file") ;;
-        apache) snippet=$(_build_apache_protect_snippet "$htpasswd_file") ;;
-    esac
-
-    if _inject_protection_into_vhost "$tgt_vhost" "$snippet" "$web_server"; then
-        sre_success "Protection directives injected into $tgt_vhost"
-    else
-        sre_warning "Could not patch vhost — apply manually"
+    # --- Protection snippet, included by the vhost ---
+    # Its own file, not spliced into the vhost, so a later step-11 re-render
+    # keeps it. protect_apply also migrates vhosts from before that change and
+    # rolls BOTH files back if the config test fails.
+    snippet="$(protect_render "$web_server" "Restricted - Clone" "$htpasswd_file" \
+        "$CL_NOINDEX" "$CL_HTPASSWD" ${CL_ALLOW_IPS[@]+"${CL_ALLOW_IPS[@]}"})"
+    snippet_file="$(protect_snippet_dir "$CL_TARGET_DOMAIN" "$web_server")/protect.conf"
+    if ! protect_apply "$tgt_vhost" "$snippet_file" "$web_server" "$snippet"; then
+        sre_error "Protection was NOT applied; ${web_server} is still on its previous config."
+        sre_error "Fix the error above and re-run to resume at this phase."
+        exit 1
     fi
 
     # --- robots.txt (belt-and-suspenders, survives if header gets stripped) ---
@@ -2549,29 +2410,18 @@ ROBOTS
         fi
     fi
 
-    # --- Test config + reload ---
-    case "$web_server" in
-        nginx)
-            if nginx -t 2>&1 | tail -2; then
-                svc_reload nginx && sre_success "Nginx reloaded with protection"
-            else
-                sre_error "Nginx config test failed after injection — review $tgt_vhost"
-            fi
-            ;;
-        apache)
-            test_cmd="apachectl configtest"
-            [[ "$os_family" == "rhel" ]] && test_cmd="httpd -t"
-            if $test_cmd 2>&1 | tail -2; then
-                case "$os_family" in
-                    debian) svc_reload apache2 ;;
-                    rhel)   svc_reload httpd ;;
-                esac
-                sre_success "Apache reloaded with protection"
-            else
-                sre_error "Apache config test failed after injection — review $tgt_vhost"
-            fi
-            ;;
-    esac
+    # --- What does an anonymous visitor actually get? ---
+    # A 403 here used to look like "htpasswd is broken" with no clue why;
+    # protect_verify names the cause from the status code and the error log.
+    if [[ "$CL_HTPASSWD" == "yes" ]]; then
+        _verify_scheme="http"
+        grep -qE 'ssl_certificate|SSLCertificateFile' "$tgt_vhost" && _verify_scheme="https"
+        if ! protect_verify "$CL_TARGET_DOMAIN" "$_verify_scheme" "$web_server" \
+                ${CL_ALLOW_IPS[@]+"${CL_ALLOW_IPS[@]}"}; then
+            sre_warning "Protection is configured but the check above failed."
+            sre_warning "Re-check and repair: sudo bash ${SRE_SCRIPTS_DIR}/fixes/12-fixes.sh  -> staging-protection"
+        fi
+    fi
 
     # --- Append creds to clone state file ---
     if [[ -f "$clone_state" ]]; then
@@ -2580,6 +2430,8 @@ ROBOTS
             printf 'CL_PROTECT_USER=%q\n'   "${CL_PROTECT_USER:-}"
             printf 'CL_PROTECT_PASS=%q\n'   "${CL_PROTECT_PASS:-}"
             printf 'CL_HTPASSWD_FILE=%q\n'  "${htpasswd_file:-}"
+            printf 'CL_HTPASSWD=%q\n'       "$CL_HTPASSWD"
+            printf 'CL_NOINDEX=%q\n'        "$CL_NOINDEX"
             printf 'CL_ALLOW_IPS=%q\n'      "${CL_ALLOW_IPS[*]:-}"
         } >> "$clone_state"
         chmod 600 "$clone_state"

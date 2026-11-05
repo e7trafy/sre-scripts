@@ -2202,6 +2202,123 @@ fix_redis_auth() {
     sre_info "users (with key prefixes) are a follow-up that requires a queue drain."
 }
 
+################################################################################
+# Staging-clone protection (re)apply
+#
+# Clones made before protection moved into its own include file had it spliced
+# into the vhost, where a step-11 re-run silently stripped it. This rewrites
+# the htpasswd file, moves the protection into <domain>-protect/protect.conf,
+# migrates the vhost (include + ACME exemption) and checks the result. Also the
+# repair path for a clone answering 403/500 instead of the login prompt.
+################################################################################
+
+fix_staging_protection() {
+    sre_header "Fix: Staging Clone Basic-Auth Protection"
+
+    local state_dir="/etc/sre-helpers/clones"
+    local web_server
+    web_server=$(config_get "SRE_WEB_SERVER" "nginx")
+
+    local candidates=() f
+    for f in "$state_dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        grep -q '^CL_PROTECT=yes$' "$f" || continue
+        candidates+=("$(basename "$f" .conf)")
+    done
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        sre_error "No protected clones recorded in $state_dir"
+        return 1
+    fi
+
+    local domain state
+    domain=$(prompt_choice "Clone to (re)protect:" "${candidates[@]}")
+    state="${state_dir}/${domain}.conf"
+
+    # It holds the staging password and is sourced below: root-owned, 600 only.
+    local own
+    own=$(stat -c '%u:%a' "$state" 2>/dev/null || true)
+    if [[ "$own" != "0:600" ]]; then
+        sre_error "Refusing to read $state: expected root-owned mode 600, found ${own:-unknown}"
+        return 1
+    fi
+
+    # Values were written with printf %q, so sourcing is the faithful reader.
+    # Subshell: nothing else in the file can touch this shell. NUL-separated
+    # so no value can split into two. Later lines win (step 16 appends).
+    local fields=()
+    mapfile -d '' -t fields < <(
+        CL_PROTECT_USER="" CL_PROTECT_PASS="" CL_HTPASSWD_FILE="" CL_ALLOW_IPS=""
+        CL_NOINDEX="yes" CL_HTPASSWD=""
+        # shellcheck source=/dev/null
+        . "$state" >/dev/null 2>&1
+        printf '%s\0' "$CL_PROTECT_USER" "$CL_PROTECT_PASS" "$CL_HTPASSWD_FILE" \
+                      "$CL_ALLOW_IPS" "$CL_NOINDEX" "$CL_HTPASSWD"
+    )
+    local user="${fields[0]:-}" pass="${fields[1]:-}" old_htfile="${fields[2]:-}"
+    local allow="${fields[3]:-}" noindex="${fields[4]:-yes}" htpw="${fields[5]:-}"
+    # Clones made before CL_HTPASSWD was recorded: an htpasswd path means it was on.
+    if [[ -z "$htpw" ]]; then
+        [[ -n "$old_htfile" ]] && htpw="yes" || htpw="no"
+    fi
+    local ips=()
+    [[ -n "$allow" ]] && read -r -a ips <<<"$allow"
+
+    local vhost
+    vhost="$(get_vhost_dir "$web_server")/${domain}.conf"
+    if [[ ! -f "$vhost" ]]; then
+        sre_error "Vhost not found: $vhost"
+        return 1
+    fi
+
+    sre_info "Clone:     $domain"
+    sre_info "Vhost:     $vhost"
+    sre_info "Auth:      $htpw${user:+ (user $user)}"
+    sre_info "Allowlist: ${allow:-none}"
+    sre_info "Noindex:   $noindex"
+
+    local htfile=""
+    if [[ "$htpw" == "yes" ]]; then
+        if ! command -v htpasswd &>/dev/null; then
+            case "$SRE_OS_FAMILY" in
+                debian) pkg_install apache2-utils ;;
+                rhel)   pkg_install httpd-tools ;;
+            esac
+        fi
+        [[ -z "$user" ]] && user="staging"
+        # Reuse the stored password - people already have it. Only a clone
+        # with none on record gets a new one, saved back to the state file.
+        if [[ -z "$pass" ]]; then
+            pass=$(openssl rand -base64 18 | tr -d '/+=' | head -c 18)
+            {
+                printf 'CL_PROTECT_USER=%q\n' "$user"
+                printf 'CL_PROTECT_PASS=%q\n' "$pass"
+            } >> "$state"
+            sre_warning "No stored password for $domain - generated a new one (saved to $state)."
+        fi
+        htfile="$(protect_htpasswd_path "$domain" "$web_server")"
+        protect_write_htpasswd "$htfile" "$user" "$pass" || return 1
+    fi
+
+    local snippet snippet_file
+    snippet="$(protect_render "$web_server" "Restricted - Clone" "$htfile" \
+        "$noindex" "$htpw" ${ips[@]+"${ips[@]}"})"
+    snippet_file="$(protect_snippet_dir "$domain" "$web_server")/protect.conf"
+    protect_apply "$vhost" "$snippet_file" "$web_server" "$snippet" || return 1
+
+    {
+        printf 'CL_HTPASSWD=%q\n'      "$htpw"
+        printf 'CL_NOINDEX=%q\n'       "$noindex"
+        printf 'CL_HTPASSWD_FILE=%q\n' "$htfile"
+    } >> "$state"
+
+    if [[ "$htpw" == "yes" ]]; then
+        local scheme="http"
+        grep -qE 'ssl_certificate|SSLCertificateFile' "$vhost" && scheme="https"
+        protect_verify "$domain" "$scheme" "$web_server" ${ips[@]+"${ips[@]}"} || return 1
+        sre_info "Login user: $user (password: CL_PROTECT_PASS in $state)"
+    fi
+}
+
 _run_fix_menu() {
     while true; do
         sre_header "Quick Fixes Menu"
@@ -2222,6 +2339,7 @@ _run_fix_menu() {
             "supervisor-queue-workers" \
             "harden-state-opcache" \
             "redis-auth" \
+            "staging-protection" \
             "exit")
 
         case "$fix_choice" in
@@ -2239,6 +2357,7 @@ _run_fix_menu() {
             supervisor-queue-workers)  fix_supervisor ;;
             harden-state-opcache)      fix_harden_state ;;
             redis-auth)                fix_redis_auth ;;
+            staging-protection)        fix_staging_protection ;;
             exit)
                 sre_info "Exiting fixes menu."
                 break
